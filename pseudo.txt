@@ -1,0 +1,237 @@
+Data Structures:
+    lock_mode ∈ {SHARED, EXCLUSIVE}
+
+    LockNode: { mode, holders: set of txn, predecessor, next }
+    // TODO: integrate this data structure
+    locks_map: ConcurrentHashMap<key, LinkedList<LockNode>>
+
+    locks_map: key -> chain (linked list of LockNode)   // one chain per key, generations of holders
+
+    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code }
+    status ∈ {executed, prepared, committed, aborted, must_abort,NULL}
+    // TODO: intermediate states for retry mechanism
+
+    transactions_map: ConcurrentHashMap<txn_id, txn>   
+
+
+procedure execute(code):
+    txn = new txn with txn_id, locks_acquired={}, status=NULL, code=code
+    if !transactions_map.putIfAbsent(txn.txn_id, txn)
+        return FAILED
+
+
+    txn.code calls get(k, txn) or put(k, v, txn) multiple times
+
+    if during execution, return value of get/put is FAILED, then stop execution
+
+    // may block inside a get/put on a predecessor; a FAILED result
+    // requires the handler to stop calling get/put and return immediately
+    CAS(txn.status, NULL, executed)
+    return SUCCEEDED
+
+
+procedure get(k, txn):
+    result = lock(k, SHARED, txn)
+    if result == MUST_ABORT:
+        abort_transaction(txn)
+        return NULL, FAILED
+    return value of k, SUCCEEDED
+
+
+procedure put(k, v, txn):
+    result = lock(k, EXCLUSIVE, txn)
+    if result == MUST_ABORT:
+        abort_transaction(txn)
+        return FAILED
+    set value of k to v
+    return SUCCEEDED
+
+procedure lock(k, mode, txn):
+    if txn.status == aborted || txn.status == must_abort:
+        return MUST_ABORT   // txn was cascade-aborted while running
+
+    target_node = null
+
+    if txn.locks_acquired[k] contains (mode, *):
+        return ALREADY_HELD
+    else if txn.locks_acquired[k] contains (EXCLUSIVE, *):
+        return ALREADY_HELD
+    else if txn.locks_acquired[k] contains (SHARED, *) and mode == EXCLUSIVE:
+        return upgrade(k, txn)
+
+    atomic(locks_map) {
+        if k not in locks_map:
+            locks_map[k] = new chain
+
+        chain = locks_map[k]
+        last_node = chain.last_node()
+
+        if last_node == null:
+            target_node = LockNode{mode, holders={txn}, predecessor=null, next=null}
+            append target_node to chain
+        else if mode == SHARED and last_node.mode == SHARED:
+            last_node.holders.add(txn)
+            target_node = last_node
+        else:
+            target_node = LockNode{mode, holders={txn}, predecessor=last_node, next=null}
+            last_node.next=target_node
+            append target_node to chain
+
+        txn.locks_acquired[k] = (mode, target_node)
+    }
+
+    if target_node.predecessor != null:
+        wait until (∀ t in target_node.predecessor.holders,
+                t.status in {committed, aborted, executed, prepared, must_abort}) 
+                or txn.status == aborted or txn.status == must_abort
+
+        if ∃ t in target_node.predecessor.holders with t.status == aborted or t.status == must_abort:
+            abort_transaction(txn)
+            return MUST_ABORT
+
+        if txn.status in {aborted, must_abort}:
+            return MUST_ABORT
+
+        // TODO: no deadlock detection yet --- this wait is unbounded and
+        // can deadlock against another txn waiting on this one; accepted
+        // for now, to be addressed later
+
+    return LOCK_ACQUIRED
+
+
+procedure upgrade(k, txn):
+    must_wait = false
+    node = null
+    return_value=MUST_ABORT
+
+    atomic(locks_map) {
+        node = txn.locks_acquired[k].target_node
+
+        if node == locks_map[k].last_node() and node.holders == {txn}:
+            locks_map[k].last_node().mode = EXCLUSIVE
+            txn.locks_acquired[k] = (EXCLUSIVE, node)
+            return_value = UPGRADED
+
+        else if node == locks_map[k].last_node() and node.holders ⊇ {txn}:
+            node.holders.remove(txn)
+            new_node = LockNode{EXCLUSIVE, holders={txn}, predecessor=node, next=null}
+            locks_map[k].last_node().next=new_node
+            new_node.predecessor=node
+            node.next = new_node
+            txn.locks_acquired[k] = (EXCLUSIVE, new_node)
+            must_wait = true
+            return_value = UPGRADED
+    }
+
+    if must_wait:
+        wait until (∀ t in node.holders,
+                    t.status in {committed, aborted, executed, prepared, must_abort})
+                    or txn.status == aborted or txn.status == must_abort
+
+        if ∃ t in target_node.predecessor.holders with t.status == aborted or t.status == must_abort:
+            abort_transaction(txn)
+            return MUST_ABORT
+
+        if txn.status in {aborted, must_abort}:
+            return MUST_ABORT
+        // TODO: same unbounded-wait / no-deadlock-detection caveat as in lock()
+
+    return return_value 
+
+
+procedure prepare(txn_id):
+    txn = transactions_map[txn_id]
+    if txn.status not in {executed, prepared}:
+        // covers the already-aborted case too: cascade abort sets
+        // txn.status directly, so no predecessor dereference is needed here
+        send no to 2PC controller
+        abort_transaction(txn)
+        return
+
+    for each (k, mode, node) in txn.locks_acquired:
+        if node.predecessor != null:
+            wait until (∀ t in node.predecessor.holders, t.status in {committed, aborted, must_abort})
+                        or txn.status == aborted or txn.status == must_abort
+            // txn may have been cascade-aborted by a different key's
+            // predecessor while waiting here
+
+            if txn.status in {aborted, must_abort}:
+                send no to 2PC controller
+
+                if txn.status == must_abort:
+                    abort_transaction(txn)
+                return
+
+            if ∃ t in node.predecessor.holders with t.status == aborted or t.status == must_abort:
+                abort_transaction(txn)
+                send no to 2PC controller
+                return
+
+    if not CAS(txn.status, {executed, prepared}, prepared):
+        send no to 2PC controller
+        return
+
+    send yes to 2PC controller
+
+
+procedure commit(txn_id):
+    txn = transactions_map[txn_id]
+    if not CAS(txn.status, prepared, committed):
+        return
+
+    atomic(locks_map) {
+        for each (k, mode, target_node) in txn.locks_acquired:
+
+            remove txn from target_node.holders
+            if target_node.holders is empty:
+                if target_node.predecessor != null:
+                    tartget_node.predecessor.next=target_node.next
+                if target_node.next != null:
+                    target_node.next.predecessor=target_node.predecessor
+                remove target_node from chain
+    }
+    // safe to evict txn from any external txn-id registry after this
+    // point --- nothing in locks_map references it anymore
+
+
+procedure abort_transaction(txn):
+    if not CAS(txn.status, {executed, prepared, NULL, must_abort}, aborted):
+        return
+
+
+    atomic(locks_map) {
+        for each (k, mode, target_node) in txn.locks_acquired:
+            entry = locks_map[k]
+            if entry == null:
+                continue
+
+            if mode == EXCLUSIVE:
+                successor_node = target_node.next
+                while successor_node != null:
+                    for each t in successor_node.holders:
+                        mark_must_abort(t)
+                    successor_node = successor_node.next
+
+            remove txn from target_node.holders
+            if target_node.holders is empty:
+                if target_node.predecessor != null:
+                    tartget_node.predecessor.next=target_node.next
+                if target_node.next != null:
+                    target_node.next.predecessor=target_node.predecessor
+                remove target_node from locks_map[k] 
+    }
+
+
+    // safe to evict txn from any external txn-id registry after this
+    // point --- status is already set for any successor to observe
+    // directly, and a duplicate/late message for an evicted id can be
+    // treated as a no-op abort
+procedure abort(txn_id):
+    txn = transactions_map[txn_id]
+    abort_transaction(txn)
+
+
+procedure mark_must_abort(txn):
+    if not CAS(txn.status, {executed, NULL}, must_abort):
+        return
+
