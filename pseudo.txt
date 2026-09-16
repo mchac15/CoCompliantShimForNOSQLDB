@@ -115,9 +115,8 @@ procedure upgrade(k, txn):
         else if node == locks_map[k].last_node() and node.holders ⊇ {txn}:
             node.holders.remove(txn)
             new_node = LockNode{EXCLUSIVE, holders={txn}, predecessor=node, next=null}
-            locks_map[k].last_node().next=new_node
-            new_node.predecessor=node
             node.next = new_node
+            append new_node to locks_map[k]
             txn.locks_acquired[k] = (EXCLUSIVE, new_node)
             must_wait = true
             return_value = UPGRADED
@@ -128,7 +127,7 @@ procedure upgrade(k, txn):
                     t.status in {committed, aborted, executed, prepared, must_abort})
                     or txn.status == aborted or txn.status == must_abort
 
-        if ∃ t in target_node.predecessor.holders with t.status == aborted or t.status == must_abort:
+        if ∃ t in node.holders with t.status == aborted or t.status == must_abort:
             abort_transaction(txn)
             return MUST_ABORT
 
