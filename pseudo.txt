@@ -84,21 +84,37 @@ procedure lock(k, mode, txn):
         txn.locks_acquired[k] = (mode, target_node)
     }
 
-    if target_node.predecessor != null:
-        wait until (∀ t in target_node.predecessor.holders,
-                t.status in {committed, aborted, executed, prepared, must_abort}) 
-                or txn.status == aborted or txn.status == must_abort
+    loop:
+        atomic(locks_map) {
+            pred = target_node.predecessor
+        }
+        if pred == null:
+            break
 
-        if ∃ t in target_node.predecessor.holders with t.status == aborted or t.status == must_abort:
+        // pred can be spliced out from under us (by commit()/abort_transaction()
+        // on one of its holders) while we wait; re-read target_node.predecessor
+        // under the latch on every iteration instead of trusting this captured
+        // reference once resolved
+        wait until (∀ t in pred.holders,
+                t.status in {committed, aborted, executed, prepared, must_abort})
+                or txn.status == aborted or txn.status == must_abort
+                or pred != target_node.predecessor
+
+        if pred != target_node.predecessor:
+            continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
+
+        if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
             abort_transaction(txn)
             return MUST_ABORT
 
         if txn.status in {aborted, must_abort}:
             return MUST_ABORT
 
-        // TODO: no deadlock detection yet --- this wait is unbounded and
-        // can deadlock against another txn waiting on this one; accepted
-        // for now, to be addressed later
+        break   // pred fully resolved with no abort among its holders
+
+    // TODO: no deadlock detection yet --- this wait is unbounded and
+    // can deadlock against another txn waiting on this one; accepted
+    // for now, to be addressed later
 
     return LOCK_ACQUIRED
 
@@ -135,19 +151,37 @@ procedure upgrade(k, txn):
     }
 
     if must_wait:
-        wait until (∀ t in node.holders,
-                    t.status in {committed, aborted, executed, prepared, must_abort})
-                    or txn.status == aborted or txn.status == must_abort
+        loop:
+            atomic(locks_map) {
+                pred = new_node.predecessor
+            }
+            if pred == null:
+                break
 
-        if ∃ t in target_node.predecessor.holders with t.status == aborted or t.status == must_abort:
-            abort_transaction(txn)
-            return MUST_ABORT
+            // pred (== node, the remaining SHARED holders we're queued behind)
+            // can be spliced out from under us while we wait; re-read
+            // new_node.predecessor under the latch on every iteration instead
+            // of trusting a captured reference once resolved
+            wait until (∀ t in pred.holders,
+                        t.status in {committed, aborted, executed, prepared, must_abort})
+                        or txn.status == aborted or txn.status == must_abort
+                        or pred != new_node.predecessor
 
-        if txn.status in {aborted, must_abort}:
-            return MUST_ABORT
+            if pred != new_node.predecessor:
+                continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
+
+            if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
+                abort_transaction(txn)
+                return MUST_ABORT
+
+            if txn.status in {aborted, must_abort}:
+                return MUST_ABORT
+
+            break   // pred fully resolved with no abort among its holders
+
         // TODO: same unbounded-wait / no-deadlock-detection caveat as in lock()
 
-    return return_value 
+    return return_value
 
 
 procedure prepare(txn_id):
@@ -172,9 +206,19 @@ procedure prepare(txn_id):
         return
 
     for each (k, mode, node) in txn.locks_acquired:
-        if node.predecessor != null:
-            wait until (∀ t in node.predecessor.holders, t.status in {committed, aborted, must_abort})
+        loop:
+            atomic(locks_map) {
+                pred = node.predecessor
+            }
+            if pred == null:
+                break
+
+            // pred can be spliced out from under us while we wait; re-read
+            // node.predecessor under the latch on every iteration instead of
+            // trusting this captured reference once resolved
+            wait until (∀ t in pred.holders, t.status in {committed, aborted, must_abort})
                         or txn.status == aborted or txn.status == must_abort
+                        or pred != node.predecessor
             // txn may have been cascade-aborted by a different key's
             // predecessor while waiting here
 
@@ -185,10 +229,15 @@ procedure prepare(txn_id):
                     abort_transaction(txn)
                 return
 
-            if ∃ t in node.predecessor.holders with t.status == aborted or t.status == must_abort:
+            if pred != node.predecessor:
+                continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
+
+            if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
                 abort_transaction(txn)
                 send no to 2PC controller
                 return
+
+            break   // pred fully resolved with no abort among its holders
 
     if not CAS(txn.status, {executed, prepared}, prepared):
         // status moved out from under us (e.g. a late cascade mark_must_abort
