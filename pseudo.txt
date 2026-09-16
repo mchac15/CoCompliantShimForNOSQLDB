@@ -168,7 +168,12 @@ procedure prepare(txn_id):
                 return
 
     if not CAS(txn.status, {executed, prepared}, prepared):
+        // status moved out from under us (e.g. a late cascade mark_must_abort
+        // landed after the wait loop finished) --- the txn never became
+        // prepared, so it is always safe to abort it here and release its
+        // locks rather than leaking them
         send no to 2PC controller
+        abort_transaction(txn)
         return
 
     send yes to 2PC controller
