@@ -16,17 +16,21 @@ Data Structures:
 
 procedure execute(code):
     txn = new txn with txn_id, locks_acquired={}, status=NULL, code=code
-    if !transactions_map.putIfAbsent(txn.txn_id, txn)
-        return FAILED
+    if transactions_map.putIfAbsent(txn.txn_id, txn) != null
+        return FAILED   // txn_id already registered (collision / duplicate)
 
 
+    execution_failed = false
     txn.code calls get(k, txn) or put(k, v, txn) multiple times
 
     if during execution, return value of get/put is FAILED, then stop execution
+        and set execution_failed = true
 
     // may block inside a get/put on a predecessor; a FAILED result
     // requires the handler to stop calling get/put and return immediately
-    CAS(txn.status, NULL, executed)
+    if execution_failed or not CAS(txn.status, NULL, executed):
+        return FAILED
+
     return SUCCEEDED
 
 
@@ -80,21 +84,37 @@ procedure lock(k, mode, txn):
         txn.locks_acquired[k] = (mode, target_node)
     }
 
-    if target_node.predecessor != null:
-        wait until (∀ t in target_node.predecessor.holders,
-                t.status in {committed, aborted, executed, prepared, must_abort}) 
-                or txn.status == aborted or txn.status == must_abort
+    loop:
+        atomic(locks_map) {
+            pred = target_node.predecessor
+        }
+        if pred == null:
+            break
 
-        if ∃ t in target_node.predecessor.holders with t.status == aborted or t.status == must_abort:
+        // pred can be spliced out from under us (by commit()/abort_transaction()
+        // on one of its holders) while we wait; re-read target_node.predecessor
+        // under the latch on every iteration instead of trusting this captured
+        // reference once resolved
+        wait until (∀ t in pred.holders,
+                t.status in {committed, aborted, executed, prepared, must_abort})
+                or txn.status == aborted or txn.status == must_abort
+                or pred != target_node.predecessor
+
+        if pred != target_node.predecessor:
+            continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
+
+        if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
             abort_transaction(txn)
             return MUST_ABORT
 
         if txn.status in {aborted, must_abort}:
             return MUST_ABORT
 
-        // TODO: no deadlock detection yet --- this wait is unbounded and
-        // can deadlock against another txn waiting on this one; accepted
-        // for now, to be addressed later
+        break   // pred fully resolved with no abort among its holders
+
+    // TODO: no deadlock detection yet --- this wait is unbounded and
+    // can deadlock against another txn waiting on this one; accepted
+    // for now, to be addressed later
 
     return LOCK_ACQUIRED
 
@@ -120,26 +140,63 @@ procedure upgrade(k, txn):
             txn.locks_acquired[k] = (EXCLUSIVE, new_node)
             must_wait = true
             return_value = UPGRADED
+
+        else:
+            // case 3: something newer is already queued behind this txn's
+            // shared node (it's no longer the tail). Deliberately aborts
+            // ordinary read-modify-write patterns for now; a known, accepted
+            // limitation (no lock-conversion/queue-jumping support yet),
+            // not a bug in this control flow. return_value stays MUST_ABORT.
     }
 
     if must_wait:
-        wait until (∀ t in node.holders,
-                    t.status in {committed, aborted, executed, prepared, must_abort})
-                    or txn.status == aborted or txn.status == must_abort
+        loop:
+            atomic(locks_map) {
+                pred = new_node.predecessor
+            }
+            if pred == null:
+                break
 
-        if ∃ t in node.holders with t.status == aborted or t.status == must_abort:
-            abort_transaction(txn)
-            return MUST_ABORT
+            // pred (== node, the remaining SHARED holders we're queued behind)
+            // can be spliced out from under us while we wait; re-read
+            // new_node.predecessor under the latch on every iteration instead
+            // of trusting a captured reference once resolved
+            wait until (∀ t in pred.holders,
+                        t.status in {committed, aborted, executed, prepared, must_abort})
+                        or txn.status == aborted or txn.status == must_abort
+                        or pred != new_node.predecessor
 
-        if txn.status in {aborted, must_abort}:
-            return MUST_ABORT
+            if pred != new_node.predecessor:
+                continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
+
+            if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
+                abort_transaction(txn)
+                return MUST_ABORT
+
+            if txn.status in {aborted, must_abort}:
+                return MUST_ABORT
+
+            break   // pred fully resolved with no abort among its holders
+
         // TODO: same unbounded-wait / no-deadlock-detection caveat as in lock()
 
-    return return_value 
+    return return_value
 
 
 procedure prepare(txn_id):
     txn = transactions_map[txn_id]
+    if txn == null:
+        // unknown/already-evicted txn_id: treat as a duplicate/late
+        // prepare for a txn that was already resolved and cleaned up
+        send no to 2PC controller
+        return
+
+    if txn.status == committed:
+        // duplicate/late prepare after commit already happened: nothing
+        // to abort, txn is already resolved the other way
+        send no to 2PC controller
+        return
+
     if txn.status not in {executed, prepared}:
         // covers the already-aborted case too: cascade abort sets
         // txn.status directly, so no predecessor dereference is needed here
@@ -148,9 +205,19 @@ procedure prepare(txn_id):
         return
 
     for each (k, mode, node) in txn.locks_acquired:
-        if node.predecessor != null:
-            wait until (∀ t in node.predecessor.holders, t.status in {committed, aborted, must_abort})
+        loop:
+            atomic(locks_map) {
+                pred = node.predecessor
+            }
+            if pred == null:
+                break
+
+            // pred can be spliced out from under us while we wait; re-read
+            // node.predecessor under the latch on every iteration instead of
+            // trusting this captured reference once resolved
+            wait until (∀ t in pred.holders, t.status in {committed, aborted, must_abort})
                         or txn.status == aborted or txn.status == must_abort
+                        or pred != node.predecessor
             // txn may have been cascade-aborted by a different key's
             // predecessor while waiting here
 
@@ -161,13 +228,23 @@ procedure prepare(txn_id):
                     abort_transaction(txn)
                 return
 
-            if ∃ t in node.predecessor.holders with t.status == aborted or t.status == must_abort:
+            if pred != node.predecessor:
+                continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
+
+            if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
                 abort_transaction(txn)
                 send no to 2PC controller
                 return
 
+            break   // pred fully resolved with no abort among its holders
+
     if not CAS(txn.status, {executed, prepared}, prepared):
+        // status moved out from under us (e.g. a late cascade mark_must_abort
+        // landed after the wait loop finished) --- the txn never became
+        // prepared, so it is always safe to abort it here and release its
+        // locks rather than leaking them
         send no to 2PC controller
+        abort_transaction(txn)
         return
 
     send yes to 2PC controller
@@ -175,6 +252,9 @@ procedure prepare(txn_id):
 
 procedure commit(txn_id):
     txn = transactions_map[txn_id]
+    if txn == null:
+        return   // unknown/already-evicted txn_id: no-op
+
     if not CAS(txn.status, prepared, committed):
         return
 
@@ -184,7 +264,7 @@ procedure commit(txn_id):
             remove txn from target_node.holders
             if target_node.holders is empty:
                 if target_node.predecessor != null:
-                    tartget_node.predecessor.next=target_node.next
+                    target_node.predecessor.next=target_node.next
                 if target_node.next != null:
                     target_node.next.predecessor=target_node.predecessor
                 remove target_node from chain
@@ -214,10 +294,10 @@ procedure abort_transaction(txn):
             remove txn from target_node.holders
             if target_node.holders is empty:
                 if target_node.predecessor != null:
-                    tartget_node.predecessor.next=target_node.next
+                    target_node.predecessor.next=target_node.next
                 if target_node.next != null:
                     target_node.next.predecessor=target_node.predecessor
-                remove target_node from locks_map[k] 
+                remove target_node from locks_map[k]
     }
 
 
@@ -227,6 +307,9 @@ procedure abort_transaction(txn):
     // treated as a no-op abort
 procedure abort(txn_id):
     txn = transactions_map[txn_id]
+    if txn == null:
+        return   // unknown/already-evicted txn_id: no-op, per the
+                 // evicted-id convention documented in abort_transaction()
     abort_transaction(txn)
 
 
