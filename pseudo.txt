@@ -16,17 +16,21 @@ Data Structures:
 
 procedure execute(code):
     txn = new txn with txn_id, locks_acquired={}, status=NULL, code=code
-    if !transactions_map.putIfAbsent(txn.txn_id, txn)
-        return FAILED
+    if transactions_map.putIfAbsent(txn.txn_id, txn) != null
+        return FAILED   // txn_id already registered (collision / duplicate)
 
 
+    execution_failed = false
     txn.code calls get(k, txn) or put(k, v, txn) multiple times
 
     if during execution, return value of get/put is FAILED, then stop execution
+        and set execution_failed = true
 
     // may block inside a get/put on a predecessor; a FAILED result
     // requires the handler to stop calling get/put and return immediately
-    CAS(txn.status, NULL, executed)
+    if execution_failed or not CAS(txn.status, NULL, executed):
+        return FAILED
+
     return SUCCEEDED
 
 
@@ -121,6 +125,13 @@ procedure upgrade(k, txn):
             txn.locks_acquired[k] = (EXCLUSIVE, new_node)
             must_wait = true
             return_value = UPGRADED
+
+        else:
+            // case 3: something newer is already queued behind this txn's
+            // shared node (it's no longer the tail). Deliberately aborts
+            // ordinary read-modify-write patterns for now; a known, accepted
+            // limitation (no lock-conversion/queue-jumping support yet),
+            // not a bug in this control flow. return_value stays MUST_ABORT.
     }
 
     if must_wait:
@@ -141,6 +152,18 @@ procedure upgrade(k, txn):
 
 procedure prepare(txn_id):
     txn = transactions_map[txn_id]
+    if txn == null:
+        // unknown/already-evicted txn_id: treat as a duplicate/late
+        // prepare for a txn that was already resolved and cleaned up
+        send no to 2PC controller
+        return
+
+    if txn.status == committed:
+        // duplicate/late prepare after commit already happened: nothing
+        // to abort, txn is already resolved the other way
+        send no to 2PC controller
+        return
+
     if txn.status not in {executed, prepared}:
         // covers the already-aborted case too: cascade abort sets
         // txn.status directly, so no predecessor dereference is needed here
@@ -181,6 +204,9 @@ procedure prepare(txn_id):
 
 procedure commit(txn_id):
     txn = transactions_map[txn_id]
+    if txn == null:
+        return   // unknown/already-evicted txn_id: no-op
+
     if not CAS(txn.status, prepared, committed):
         return
 
@@ -233,6 +259,9 @@ procedure abort_transaction(txn):
     // treated as a no-op abort
 procedure abort(txn_id):
     txn = transactions_map[txn_id]
+    if txn == null:
+        return   // unknown/already-evicted txn_id: no-op, per the
+                 // evicted-id convention documented in abort_transaction()
     abort_transaction(txn)
 
 
