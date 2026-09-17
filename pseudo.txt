@@ -8,14 +8,14 @@ Data Structures:
     locks_map: key -> chain (linked list of LockNode)   // one chain per key, generations of holders
 
     txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code }
-    status ∈ {executed, prepared, committed, aborted, must_abort,NULL}
+    status ∈ {started, executed, prepared, committed, aborted, must_abort,NULL}
     // TODO: intermediate states for retry mechanism
 
     transactions_map: ConcurrentHashMap<txn_id, txn>   
 
 
 procedure execute(code):
-    txn = new txn with txn_id, locks_acquired={}, status=NULL, code=code
+    txn = new txn with txn_id, locks_acquired={}, status=started, code=code
     if transactions_map.putIfAbsent(txn.txn_id, txn) != null
         return FAILED   // txn_id already registered (collision / duplicate)
 
@@ -28,7 +28,7 @@ procedure execute(code):
 
     // may block inside a get/put on a predecessor; a FAILED result
     // requires the handler to stop calling get/put and return immediately
-    if execution_failed or not CAS(txn.status, NULL, executed):
+    if execution_failed or not CAS(txn.status, started, executed):
         return FAILED
 
     return SUCCEEDED
@@ -274,7 +274,7 @@ procedure commit(txn_id):
 
 
 procedure abort_transaction(txn):
-    if not CAS(txn.status, {executed, prepared, NULL, must_abort}, aborted):
+    if not CAS(txn.status, {executed, prepared, NULL, must_abort, started}, aborted):
         return
 
 
@@ -305,6 +305,7 @@ procedure abort_transaction(txn):
     // point --- status is already set for any successor to observe
     // directly, and a duplicate/late message for an evicted id can be
     // treated as a no-op abort
+
 procedure abort(txn_id):
     txn = transactions_map[txn_id]
     if txn == null:
@@ -314,6 +315,6 @@ procedure abort(txn_id):
 
 
 procedure mark_must_abort(txn):
-    if not CAS(txn.status, {executed, NULL}, must_abort):
+    if not CAS(txn.status, {started, executed, NULL}, must_abort):
         return
 
