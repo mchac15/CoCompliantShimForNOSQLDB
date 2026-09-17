@@ -7,7 +7,7 @@ Data Structures:
 
     locks_map: key -> chain (linked list of LockNode)   // one chain per key, generations of holders
 
-    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code }
+    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
     status ∈ {started, executed, prepared, committed, aborted, must_abort,NULL}
     // TODO: intermediate states for retry mechanism
 
@@ -39,6 +39,8 @@ procedure get(k, txn):
     if result == MUST_ABORT:
         abort_transaction(txn)
         return NULL, FAILED
+    if k in txn.write_buffer:
+        return txn.write_buffer[k], SUCCEEDED
     return value of k, SUCCEEDED
 
 
@@ -47,7 +49,9 @@ procedure put(k, v, txn):
     if result == MUST_ABORT:
         abort_transaction(txn)
         return FAILED
-    set value of k to v
+
+    txn.write_bufffer[k]=v
+    //set value of k to v
     return SUCCEEDED
 
 procedure lock(k, mode, txn):
@@ -258,9 +262,11 @@ procedure commit(txn_id):
     if not CAS(txn.status, prepared, committed):
         return
 
+    for (key,value) in txn.write_buffer:
+        set value of key to value (data base operation)
+
     atomic(locks_map) {
         for each (k, mode, target_node) in txn.locks_acquired:
-
             remove txn from target_node.holders
             if target_node.holders is empty:
                 if target_node.predecessor != null:
