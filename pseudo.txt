@@ -8,7 +8,7 @@ Data Structures:
     locks_map: key -> chain (linked list of LockNode)   // one chain per key, generations of holders
 
     txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
-    status ∈ {started, executed, prepared, committed, aborted, must_abort,NULL}
+    status ∈ {started, executed, prepared, commiting, committed, aborted, must_abort,NULL}
     // TODO: intermediate states for retry mechanism
 
     transactions_map: ConcurrentHashMap<txn_id, txn>   
@@ -39,8 +39,20 @@ procedure get(k, txn):
     if result == MUST_ABORT:
         abort_transaction(txn)
         return NULL, FAILED
+    actual_value=null
+    atomic(locks_map) {
+        if k in locks_map:
+            current_node=locks_map[k].last_node()
+            while current_node.mode!=EXCLUSIVE and current_node!=null:
+                current_node=current_node.predecessor
+            if current_node!=null:
+                actual_value=current_node.holders[0].write_buffer[k]
+
+    }
     if k in txn.write_buffer:
         return txn.write_buffer[k], SUCCEEDED
+    elif actual_value!=null:
+        return actual_value, SUCCEEDED
     return value of k, SUCCEEDED
 
 
@@ -259,7 +271,7 @@ procedure commit(txn_id):
     if txn == null:
         return   // unknown/already-evicted txn_id: no-op
 
-    if not CAS(txn.status, prepared, committed):
+    if not CAS(txn.status, prepared, commiting):
         return
 
     for (key,value) in txn.write_buffer:
@@ -275,6 +287,7 @@ procedure commit(txn_id):
                     target_node.next.predecessor=target_node.predecessor
                 remove target_node from chain
     }
+    txn.status=committed
     // safe to evict txn from any external txn-id registry after this
     // point --- nothing in locks_map references it anymore
 
