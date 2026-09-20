@@ -12,10 +12,12 @@ Data Structures:
     // TODO: intermediate states for retry mechanism
 
     transactions_map: ConcurrentHashMap<txn_id, txn>   
-    recovering: boolean   // true from restart until recover() has resolved every in-doubt txn; gates execute()
-    loaded: boolean       // false from restart until recover() has finished step (c) (all in-doubt txns are back in
-                          // transactions_map); gates prepare/commit/abort. true in normal operation: recover() runs on
-                          // every startup and on a fresh empty log sets loaded = true right after step (c) immediately
+    recovering: boolean = true    // true from process start until recover() has resolved every in-doubt txn; gates execute()
+    loaded: boolean = false       // false from process start until recover() has finished step (c) (all in-doubt txns are
+                                  // back in transactions_map); gates prepare/commit/abort
+    // Both flags are initialised to their closed values at process start, before any message handler can run, so
+    // there is no window in which a call sees an open gate on an empty transactions_map. recover() only opens
+    // them: on a fresh empty log it sets loaded = true right after step (c) and recovering = false immediately.
 
 
 Durability Interfaces:
@@ -435,10 +437,10 @@ procedure recover():
     // loaded is false. execute() is gated by recovering until the very end;
     // prepare/commit/abort are gated by loaded: they are held until step (c)
     // has put every in-doubt txn back in transactions_map, and are served
-    // from then on, while recover() waits for the coordinator's decisions
-    recovering = true
-    loaded = false
-
+    // from then on, while recover() waits for the coordinator's decisions.
+    // recovering = true and loaded = false already hold from process start
+    // (see Data Structures), so they are not set here: setting them at this
+    // point would leave a window where a call arrives before they are closed
     prepared = {}    // txn_id -> write_buffer, from PREPARED records
     committed = {}   // txn_ids with a COMMIT record
     resolved = {}    // txn_ids with a DONE or ABORT record
