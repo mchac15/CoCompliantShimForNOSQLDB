@@ -41,6 +41,28 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
 
 \Statex
+\State \textbf{Durability Interfaces:}
+\State \Comment{the log record set is the only durable state; transactions\_map and locks\_map are volatile and lost on a crash. Only prepared transactions are ever logged (presumed abort)}
+\State \textbf{Log:} single append-only file
+\State \Call{log.append}{record, force}
+\Comment{force = true: returns only once the record is on stable storage (earlier records are then durable too); force = false: may be lost on a crash}
+\State \Call{log.scan}{} $\to$ ordered list of records \Comment{in append order, up to the last durable record}
+\State \Comment{TODO: log.truncate() --- checkpointing / dropping records of finished txns}
+\State $\text{record} \in \{$
+\State \quad PREPARED$\{\text{txn\_id}, \text{write\_buffer}\}$ \Comment{forced, before sending YES}
+\State \quad COMMIT$\{\text{txn\_id}\}$ \Comment{forced, before applying write\_buffer to the store}
+\State \quad DONE$\{\text{txn\_id}\}$ \Comment{forced, after the store writes and \Call{store.sync}{}, before locks are released}
+\State \quad ABORT$\{\text{txn\_id}\}$ \Comment{NOT forced, only for txns that were prepared}
+\State $\}$
+\State \Comment{no records for started / executed / aborting txns: they are aborted implicitly on a crash. A lost ABORT only makes the txn in-doubt again, the coordinator re-sends abort}
+\State \Comment{DONE is forced before lock release: a successor cannot prepare until its predecessor is committed, so after a crash the txns with COMMIT but no DONE never conflict with each other and their redo order does not matter}
+\State \textbf{Store:} black box NoSQL store, nothing more is assumed than the following
+\State \Call{store.read}{k} $\to$ value
+\State \Call{store.write}{k, v} \Comment{blind put: idempotent, so safe to redo; no atomicity across keys assumed}
+\State \Call{store.sync}{} \Comment{returns once all previous writes are durable; no-op if the store is durable on return}
+\State \Comment{the coordinator is out of scope: after recovery, in-doubt txns (prepared, undecided) wait for an external commit(txn\_id) / abort(txn\_id) call}
+
+\Statex
 \Procedure{execute}{code}
     \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{code}=code$
     \If{$\Call{transactions\_map.putIfAbsent}{txn.\text{txn\_id}, txn} \neq \text{null}$}
