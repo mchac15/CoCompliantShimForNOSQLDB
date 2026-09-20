@@ -51,6 +51,23 @@ Durability Interfaces:
     // The coordinator is out of scope: after recovery, in-doubt txns (prepared, undecided)
     // wait for an external commit(txn_id) / abort(txn_id) call.
 
+    Assumptions:
+        // 1. Blocking semantics: log.append, store.write and store.sync are blocking. If one fails
+        //    it is simply retried / blocked until it succeeds, so the protocol has no error path for
+        //    log or store failures. A txn that cannot force PREPARED just blocks: it never votes YES
+        //    without a durable record.
+        // 2. Torn records: an incomplete or corrupt record at the tail of the log (crash mid-append)
+        //    is discarded entirely by log.scan(), as if it had never been written (records are
+        //    self-delimiting / checksummed). Since only forced records are ever relied on,
+        //    discarding a torn tail is safe.
+        // 3. Log truncation is out of scope for now: the log only grows and recover() scans all of
+        //    it (see the TODO: log.truncate() above).
+        // 4. txn_ids are never reused: a txn_id that appears in the log (or was ever executed) is
+        //    never sent to execute() again, so a re-executed finished txn cannot occur after recovery.
+        // 5. Duplicate PREPARED records: a txn_id may have more than one PREPARED record in the log
+        //    (a retried / duplicate prepare forces the record again). All copies carry the identical
+        //    write_buffer (final once the txn is executed), so recovery treats them as one.
+
 
 procedure execute(code):
     if recovering:
