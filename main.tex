@@ -39,9 +39,14 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committed}, \text{aborted}, \text{must\_abort}, \text{NULL}\}$
 \State \Comment{TODO: intermediate states for retry mechanism}
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
+\State $\text{recovering}: \text{boolean}$ \Comment{true from restart until \Call{recover}{} has resolved every in-doubt txn; gates \Call{execute}{}}
 
 \Statex
 \Procedure{execute}{code}
+    \If{$\text{recovering}$}
+        \State \Comment{block-mode recovery: no new work is accepted until every in-doubt txn has been resolved (see \Call{recover}{}); the coordinator will retry/abort this subtransaction}
+        \State \textbf{return} FAILED
+    \EndIf
     \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{code}=code$
     \If{$\Call{transactions\_map.putIfAbsent}{txn.\text{txn\_id}, txn} \neq \text{null}$}
         \State \textbf{return} FAILED \Comment{txn\_id already registered (collision / duplicate)}
@@ -327,6 +332,60 @@ The shim locks at the granularity of a single record, identified by its primary 
     \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{started}, \text{executed}, \text{NULL}\}, \text{must\_abort}}}
         \State \textbf{return}
     \EndIf
+\EndProcedure
+
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Two-Phase Commit Transactional Lock Manager (Part 4: Crash Recovery)}
+\small
+\begin{algorithmic}[1]
+
+\Procedure{recover}{}
+    \State \Comment{runs once on restart, before serving anything: transactions\_map and locks\_map are empty (volatile state was lost) and recovering is true. prepare/commit/abort may be served concurrently while \Call{recover}{} waits at its end; only \Call{execute}{} is gated}
+    \State $\text{recovering} \gets \text{true}$
+    \State $prepared \gets \{\}$ \Comment{txn\_id $\to$ write\_buffer, from PREPARED records}
+    \State $committed \gets \{\}$ \Comment{txn\_ids with a COMMIT record}
+    \State $resolved \gets \{\}$ \Comment{txn\_ids with a DONE or ABORT record}
+    \For{\textbf{each} $record \in \Call{log.scan}{}$} \Comment{in log order}
+        \If{$record$ is PREPARED}
+            \State $prepared[record.\text{txn\_id}] \gets record.\text{write\_buffer}$
+        \EndIf
+        \If{$record$ is COMMIT}
+            \State $committed.\text{add}(record.\text{txn\_id})$
+        \EndIf
+        \If{$record$ is DONE \textbf{or} ABORT}
+            \State $resolved.\text{add}(record.\text{txn\_id})$
+        \EndIf
+    \EndFor
+    \State \Comment{a COMMIT record is only ever appended after a forced PREPARED for the same txn\_id, so a COMMIT without a PREPARED cannot be found in the log}
+    \State \Comment{(a) resolved (DONE or ABORT): nothing to do, ignored below. Presumed abort: txns that never prepared (started/executed/aborting) wrote no log record, are absent from $prepared$, and are implicitly aborted}
+    \State \Comment{(b) committed-not-done (COMMIT, no DONE): redo. These txns are pairwise conflict-free: \Call{commit}{} forces DONE before it releases its locks, and a successor on a shared key can only pass its prepare-time wait (predecessor committed) after that release, so it cannot have a COMMIT record while its predecessor lacks DONE. Hence redo order does not matter. Redo is safe to repeat (also if we crash again during recovery) because store.write is an idempotent blind put and DONE is only appended after the writes are synced}
+    \For{\textbf{each} $txn\_id \in committed$}
+        \If{$txn\_id \in resolved$}
+            \State \textbf{continue}
+        \EndIf
+        \For{\textbf{each} $(k, v) \in prepared[txn\_id]$}
+            \State \Call{store.write}{k, v}
+        \EndFor
+        \State \Call{store.sync}{}
+        \State \Call{log.append}{\text{DONE}\{txn\_id\}, \text{force}=\text{true}}
+        \State $resolved.\text{add}(txn\_id)$
+    \EndFor
+    \State \Comment{(c) in-doubt (PREPARED, no COMMIT, no ABORT): keep waiting for the coordinator's decision. Recreated as prepared txns; locks\_map is NOT rebuilt (block mode: no other txn runs meanwhile) and the read set was never logged}
+    \State $in\_doubt \gets \{\}$
+    \For{\textbf{each} $(txn\_id, wb) \in prepared$}
+        \If{$txn\_id \in committed$ \textbf{or} $txn\_id \in resolved$}
+            \State \textbf{continue}
+        \EndIf
+        \State $txn \gets$ new txn with $\text{txn\_id}=txn\_id$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{prepared}$, $\text{write\_buffer}=wb$
+        \State $\text{transactions\_map}[txn\_id] \gets txn$
+        \State $in\_doubt.\text{add}(txn)$
+    \EndFor
+    \State \Comment{\Call{commit}{txn\_id}/\Call{abort}{txn\_id} from the coordinator work unchanged on a recovered txn: locks\_acquired is empty, so their lock-release loops are no-ops (there are no nodes, hence no successors to cascade to), and the CAS from prepared and the write\_buffer apply behave as before. A duplicate \Call{prepare}{txn\_id} just re-votes yes (status is already prepared). Unknown txn\_id conventions after recovery: prepare votes NO (see prepare), commit/abort are no-ops (see their bodies); a commit for a txn\_id that has DONE is an already-applied no-op}
+    \State \textbf{wait until} $(\forall t \in in\_doubt,\ t.\text{status} \in \{\text{committed}, \text{aborted}\})$
+    \State $\text{recovering} \gets \text{false}$ \Comment{open for new work}
 \EndProcedure
 
 \end{algorithmic}

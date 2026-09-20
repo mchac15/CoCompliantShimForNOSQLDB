@@ -12,9 +12,16 @@ Data Structures:
     // TODO: intermediate states for retry mechanism
 
     transactions_map: ConcurrentHashMap<txn_id, txn>   
+    recovering: boolean   // true from restart until recover() has resolved every in-doubt txn; gates execute()
 
 
 procedure execute(code):
+    if recovering:
+        // block-mode recovery: no new work is accepted until every in-doubt
+        // txn has been resolved (see recover()); the coordinator will
+        // retry/abort this subtransaction
+        return FAILED
+
     txn = new txn with txn_id, locks_acquired={}, status=started, code=code
     if transactions_map.putIfAbsent(txn.txn_id, txn) != null
         return FAILED   // txn_id already registered (collision / duplicate)
@@ -337,3 +344,66 @@ procedure mark_must_abort(txn):
     if not CAS(txn.status, {started, executed, NULL}, must_abort):
         return
 
+
+procedure recover():
+    // runs once on restart, before serving anything: transactions_map and
+    // locks_map are empty (volatile state was lost) and recovering is true.
+    // prepare/commit/abort may be served concurrently while recover() waits at
+    // its end; only execute() is gated
+    recovering = true
+
+    prepared = {}    // txn_id -> write_buffer, from PREPARED records
+    committed = {}   // txn_ids with a COMMIT record
+    resolved = {}    // txn_ids with a DONE or ABORT record
+
+    for each record in log.scan():   // in log order
+        if record is PREPARED:  prepared[record.txn_id] = record.write_buffer
+        if record is COMMIT:    committed.add(record.txn_id)
+        if record is DONE or ABORT:  resolved.add(record.txn_id)
+    // a COMMIT record is only ever appended after a forced PREPARED for the
+    // same txn_id, so a COMMIT without a PREPARED cannot be found in the log
+
+    // (a) resolved (DONE or ABORT): nothing to do, ignored below
+    // Presumed abort: txns that never prepared (started/executed/aborting)
+    // wrote no log record, are absent from prepared, and are implicitly aborted
+
+    // (b) committed-not-done (COMMIT, no DONE): redo
+    // These txns are pairwise conflict-free: commit() forces DONE before it
+    // releases its locks, and a successor on a shared key can only pass its
+    // prepare-time wait (predecessor committed) after that release, so it
+    // cannot have a COMMIT record while its predecessor lacks DONE. Hence
+    // redo order does not matter. Redo is safe to repeat (also if we crash
+    // again during recovery) because store.write is an idempotent blind put
+    // and DONE is only appended after the writes are synced.
+    for each txn_id in committed:
+        if txn_id in resolved:
+            continue
+        for (k, v) in prepared[txn_id]:
+            store.write(k, v)
+        store.sync()
+        log.append(DONE{txn_id}, force=true)
+        resolved.add(txn_id)
+
+    // (c) in-doubt (PREPARED, no COMMIT, no ABORT): keep waiting for the
+    // coordinator's decision. Recreated as prepared txns; locks_map is NOT
+    // rebuilt (block mode: no other txn runs meanwhile) and the read set was
+    // never logged
+    in_doubt = {}
+    for each (txn_id, wb) in prepared:
+        if txn_id in committed or txn_id in resolved:
+            continue
+        txn = new txn with txn_id, locks_acquired={}, status=prepared, write_buffer=wb
+        transactions_map[txn_id] = txn
+        in_doubt.add(txn)
+
+    // commit(txn_id)/abort(txn_id) from the coordinator work unchanged on a
+    // recovered txn: locks_acquired is empty, so their lock-release loops are
+    // no-ops (there are no nodes, hence no successors to cascade to), and the
+    // CAS from prepared and the write_buffer apply behave as before. A
+    // duplicate prepare(txn_id) just re-votes yes (status is already prepared).
+    // Unknown txn_id conventions after recovery: prepare votes NO (see
+    // prepare), commit/abort are no-ops (see their bodies); a commit for a
+    // txn_id that has DONE is an already-applied no-op
+
+    wait until (∀ t in in_doubt, t.status in {committed, aborted})
+    recovering = false   // open for new work
