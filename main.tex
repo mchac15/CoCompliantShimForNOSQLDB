@@ -1,0 +1,236 @@
+\documentclass{article}
+\usepackage[margin=1in]{geometry} % Widens the page margins
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\begin{document}
+
+\section*{System Model}
+
+\paragraph{Failure Model.} 
+Crash-recovery; no Byzantine/permanent failures. A crash wipes the node's in-memory \texttt{locks\_map}. Any subtransaction not yet prepared is treated as aborted (matches DB's own recovery behavior --- no reconciliation needed). A prepared subtransaction is recovered by asking the 2PC coordinator for its outcome and applying commit/abort directly --- no predecessor re-check needed. Network is asynchronous: messages may be delayed, lost, duplicated, reordered, not corrupted. Partitions eventually heal.
+
+\paragraph{Execution Model.} 
+A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade in place, or off the shared node if other readers joined it; if the chain has already moved on past that point, the upgrade cannot be safely spliced in and the subtransaction aborts. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}.
+
+\paragraph{Architecture.} 
+Each participant runs one shim, colocated with its own database. A subtransaction is bound to a single participant's database by definition --- cross-database access is expressed as multiple subtransactions within one Sonata global transaction, coordinated by Sonata's outer 2PC, not by any single subtransaction spanning stores. The shim's \texttt{locks\_map} is therefore scoped to one participant, with a single point of serialization; no cross-node lock coordination is needed within the shim itself. 
+
+\paragraph{Data Model.} 
+The shim locks at the granularity of a single record, identified by its primary key $k$; this is the unit \texttt{get}/\texttt{put} and the \texttt{locks\_map} chains operate on. Values are treated as opaque --- the shim does not interpret or type-check them, only serializes access to them via SHARED/EXCLUSIVE locks.
+
+\vspace{1em}
+
+\begin{algorithm}
+\caption{Two-Phase Commit Transactional Lock Manager (Part 1: Data Structures \& Execution)}
+\small
+\begin{algorithmic}[1]
+ 
+\State \textbf{Data Structures:}
+\State $\text{lock\_mode} \in \{\text{SHARED}, \text{EXCLUSIVE}\}$
+\State $\text{LockNode}: \{\text{mode}, \text{holders}: \text{set of txn}, \text{predecessor}, \text{next}\}$
+//TODO: integrate this data structure
+\State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, LinkedList<LockNode>>}$
+
+\State $\text{locks\_map}: \text{key} \to \text{chain (linked list of LockNode)}$ \Comment{one chain per key, generations of holders}
+\State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}\}$
+\State $\text{status} \in \{\text{executed}, \text{prepared}, \text{committed}, \text{aborted}\}$
+\State \Comment{TODO: intermediate states for retry mechanism}
+ 
+\Statex
+\Procedure{execute}{txn}
+    \State $txn.\text{code}$ calls \Call{get}{k, txn} or \Call{put}{k, v, txn} multiple times
+    \State \Comment{may block inside a get/put on a predecessor; a FAILED result requires the handler to stop calling get/put and return immediately}
+    \State \Call{CAS}{\text{txn.status}, \text{NULL}, \text{executed}}
+\EndProcedure
+ 
+\Statex
+\Procedure{get}{k, txn}
+    \State $result \gets$ \Call{lock}{k, \text{SHARED}, txn}
+    \If{$result == \text{MUST\_ABORT}$}
+        \State \Call{abort}{txn}
+        \State \textbf{return NULL, FAILED}
+    \EndIf
+    \State \textbf{return} value of $k$, SUCCEEDED
+\EndProcedure
+ 
+\Statex
+\Procedure{put}{k, v, txn}
+    \State $result \gets$ \Call{lock}{k, \text{EXCLUSIVE}, txn}
+    \If{$result == \text{MUST\_ABORT}$}
+        \State \Call{abort}{txn}
+        \State \textbf{return FAILED}
+    \EndIf
+    \State set value of $k$ to $v$
+    \State \textbf{return SUCCEEDED}
+\EndProcedure
+ 
+\end{algorithmic}
+\end{algorithm}
+ 
+\begin{algorithm}
+\caption{Two-Phase Commit Transactional Lock Manager (Part 2: Access \& Locking)}
+\small
+\begin{algorithmic}[1]
+ 
+ 
+\Statex
+\Procedure{lock}{k, mode, txn}
+    \If{$\text{txn.status} == \text{aborted}$}
+        \State \textbf{return} MUST\_ABORT \Comment{txn was cascade-aborted while running}
+    \EndIf
+    \State $target\_node \gets \text{null}$
+    \If{$\text{txn.locks\_acquired}[k]$ contains $(mode, *)$}
+        \State \textbf{return} ALREADY\_HELD
+    \ElsIf{$\text{txn.locks\_acquired}[k]$ contains $(\text{EXCLUSIVE}, *)$}
+        \State \textbf{return} ALREADY\_HELD
+    \ElsIf{$\text{txn.locks\_acquired}[k]$ contains $(\text{SHARED}, *)$ \textbf{and} $mode == \text{EXCLUSIVE}$}
+        \State \textbf{return} \Call{upgrade}{k, txn}
+    \EndIf
+    \State \textbf{atomic}(locks\_map) \{
+        \If{$k \notin \text{locks\_map}$}
+            \State \indent $\text{locks\_map}[k] = \text{new chain}$
+        \EndIf
+        \State \indent $chain \gets \text{locks\_map}[k]$
+        \State \indent $last\_node \gets chain.\text{last\_node}$
+        \If{$last\_node == \text{null}$}
+            \State \indent $target\_node \gets \text{LockNode}\{mode, \text{holders}=\{txn\}, \text{predecessor}=\text{null}, \text{next}=\text{null}\}$
+            \State \indent append $target\_node$ to $chain$
+        \ElsIf{$mode == \text{SHARED}$ \textbf{and} $last\_node.\text{mode} == \text{SHARED}$}
+            \State \indent $last\_node.\text{holders.add}(txn)$
+            \State \indent $target\_node \gets last\_node$
+        \Else
+            \State \indent $target\_node \gets \text{LockNode}\{mode, \text{holders}=\{txn\}, \text{predecessor}=last\_node, \text{next}=\text{null}\}$
+            \State \indent append $target\_node$ to $chain$
+        \EndIf
+        \State \indent $\text{txn.locks\_acquired}[k] = (mode, target\_node)$
+    \}
+    \If{$target\_node.\text{predecessor} \neq \text{null}$}
+        \State \textbf{wait until} $\forall t \in target\_node.\text{predecessor.holders}$, $t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}\}$
+        \State \Comment{TODO: no deadlock detection yet --- this wait is unbounded and can deadlock against another txn waiting on this one; accepted for now, to be addressed later}
+    \EndIf
+    \State \textbf{return} LOCK\_ACQUIRED
+\EndProcedure
+ 
+\Statex
+\Procedure{upgrade}{k, txn}
+    \State $must\_wait \gets \text{false}$
+    \State $node \gets \text{null}$
+    \State \textbf{atomic}(locks\_map) \{
+        \State \indent $node \gets \text{txn.locks\_acquired}[k].\text{target\_node}$
+        \If{$node == \text{locks\_map}[k].\text{last\_node}$ \textbf{and} $node.\text{holders} == \{txn\}$}
+            \State \indent $node.\text{mode} = \text{EXCLUSIVE}$ \Comment{case 1: pure in-place upgrade}
+            \State \indent $\text{locks\_map}[k].\text{last\_node} = node$
+            \State \indent \textbf{return} UPGRADED
+               \State \indent \Comment{TODO: Concurrent transactions cannot stack TBD}
+        \ElsIf{$node == \text{locks\_map}[k].\text{last\_node}$ \textbf{and} $node.\text{holders} \supseteq \{txn\}$}
+            \State \indent $node.\text{holders.remove}(txn)$
+            \State \indent $new\_node \gets \text{LockNode}\{\text{EXCLUSIVE}, \text{holders}=\{txn\}, \text{predecessor}=node, \text{next}=\text{null}\}$
+            \State \indent append $new\_node$ to chain
+            \State \indent $\text{txn.locks\_acquired}[k] = (\text{EXCLUSIVE}, new\_node)$
+            \State \indent $must\_wait \gets \text{true}$
+        \Else
+            \State \indent \Comment{TODO: to be discussed whether there is another solution to this}
+            \State \indent \textbf{return} MUST\_ABORT \Comment{case 3: something newer already appended}
+        \EndIf
+    \}
+    \If{$must\_wait$}
+        \State \textbf{wait until} $\forall t \in node.\text{holders}$, $t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}\}$
+        \State \Comment{TODO: same unbounded-wait / no-deadlock-detection caveat as in \Call{lock}{}}
+    \EndIf
+    \State \textbf{return} UPGRADED
+\EndProcedure
+ 
+\end{algorithmic}
+\end{algorithm}
+ 
+\begin{algorithm}
+\caption{Two-Phase Commit Transactional Lock Manager (Part 3: Commit Protocol)}
+\small
+\begin{algorithmic}[1]
+ 
+\Procedure{prepare}{txn}
+    \If{$\text{txn.status} \notin \{\text{executed}, \text{prepared}\}$}
+        \State \Comment{covers the already-aborted case too: cascade abort sets txn.status directly, so no predecessor dereference is needed here}
+        \State \textbf{Send no to 2PC controller}
+        \State \textbf{return}
+    \EndIf
+ 
+    \For{\textbf{each} $(k, mode, node) \in \text{txn.locks\_acquired}$}
+    \If{$node.\text{predecessor} \neq \text{null}$}
+        \State \textbf{wait until} $\big(\forall t \in node.\text{predecessor.holders}, t.\text{status} \in \{\text{committed}, \text{aborted}\}\big)$ \textbf{or} $\text{txn.status} == \text{aborted}$
+        \State \Comment{txn may have been cascade-aborted by a different key's predecessor while waiting here}
+        \If{$\text{txn.status} == \text{aborted}$}
+         \State \textbf{Send no to 2PC controller} 
+            \State \textbf{return}
+        \EndIf
+        \If{$\exists t \in node.\text{predecessor.holders}$ with $t.\text{status} == \text{aborted}$}
+            \State \Call{abort}{txn}
+            \State \textbf{return}
+        \EndIf
+    \EndIf
+\EndFor
+ 
+  \If{not \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared}}
+  \State \textbf{Send no to 2PC controller} 
+  
+    return
+\EndIf
+   \State \textbf{Send yes to 2PC controller}
+\EndProcedure
+ 
+\Statex
+\Procedure{commit}{txn}
+    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \text{prepared}, \text{committed}}}
+        \State \textbf{return}
+    \EndIf
+    \State \textbf{atomic}(locks\_map) \{
+        \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
+            \State \indent remove $txn$ from $target\_node.\text{holders}$
+            \If{$target\_node.\text{holders}$ is empty}
+                \State \indent\indent remove $target\_node$ from chain
+            \EndIf
+        \EndFor
+    \}
+    \State \Comment{safe to evict txn from any external txn-id registry after this point --- nothing in locks\_map references it anymore}
+\EndProcedure
+ 
+\Statex
+\Procedure{abort}{txn}
+    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{executed},
+    \text{prepared},\text{NULL}\}, \text{aborted}}}
+        \State \textbf{return}
+    \EndIf
+ 
+    \State $to\_cascade \gets \text{set of txn}$
+    \State \textbf{atomic}(locks\_map) \{
+        \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
+            \State \indent $entry \gets \text{locks\_map}[k]$
+            \If{$entry == \text{null}$}
+                \State \indent\indent \textbf{continue}
+            \EndIf
+            \If{$mode == \text{EXCLUSIVE}$}
+                \State \indent\indent $successor\_node \gets target\_node.\text{next}$
+                \While{$successor\_node \neq \text{null}$}
+                    \State \indent\indent\indent $to\_cascade.\text{update}(successor\_node.\text{holders})$
+                    \State \indent\indent\indent $successor\_node \gets successor\_node.\text{next}$
+                \EndWhile
+            \EndIf
+            \State \indent remove $txn$ from $target\_node.\text{holders}$
+            \If{$target\_node.\text{holders}$ is empty}
+                \State \indent\indent remove $target\_node$ from chain
+            \EndIf
+        \EndFor
+    \}
+    \For{\textbf{each} $t \in to\_cascade$}
+        \State \Call{abort}{t} \Comment{recursive; CAS makes this idempotent if $t$ already resolved}
+    \EndFor
+    \State \Comment{safe to evict txn from any external txn-id registry after this point --- status is already set for any successor to observe directly, and a duplicate/late message for an evicted id can be treated as a no-op abort}
+\EndProcedure
+ 
+\end{algorithmic}
+\end{algorithm}
+ 
+\end{document}
