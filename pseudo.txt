@@ -40,10 +40,17 @@ procedure get(k, txn):
         abort_transaction(txn)
         return NULL, FAILED
     actual_value=null
+    // speculative read: find the nearest EXCLUSIVE node at or before this txn's
+    // own node (never a successor's), i.e. the latest predecessor write that
+    // this txn is ordered after. Reading that holder's write_buffer is safe:
+    // lock() only returns after every predecessor holder is at least
+    // executed, so its buffer is final. If the writer already committed, its
+    // buffer was applied to the store before its node was spliced out of the
+    // chain, so no such node is found and reading the store is correct.
     atomic(locks_map) {
         if k in locks_map:
-            current_node=locks_map[k].last_node()
-            while current_node.mode!=EXCLUSIVE and current_node!=null:
+            current_node=txn.locks_acquired[k].target_node
+            while current_node!=null and current_node.mode!=EXCLUSIVE:
                 current_node=current_node.predecessor
             if current_node!=null:
                 actual_value=current_node.holders[0].write_buffer[k]
@@ -62,7 +69,7 @@ procedure put(k, v, txn):
         abort_transaction(txn)
         return FAILED
 
-    txn.write_bufffer[k]=v
+    txn.write_buffer[k]=v
     //set value of k to v
     return SUCCEEDED
 
@@ -112,7 +119,7 @@ procedure lock(k, mode, txn):
         // under the latch on every iteration instead of trusting this captured
         // reference once resolved
         wait until (∀ t in pred.holders,
-                t.status in {committed, aborted, executed, prepared, must_abort})
+                t.status in {committed, aborted, executed, prepared, committing, must_abort})
                 or txn.status == aborted or txn.status == must_abort
                 or pred != target_node.predecessor
 
@@ -178,7 +185,7 @@ procedure upgrade(k, txn):
             // new_node.predecessor under the latch on every iteration instead
             // of trusting a captured reference once resolved
             wait until (∀ t in pred.holders,
-                        t.status in {committed, aborted, executed, prepared, must_abort})
+                        t.status in {committed, aborted, executed, prepared, committing, must_abort})
                         or txn.status == aborted or txn.status == must_abort
                         or pred != new_node.predecessor
 

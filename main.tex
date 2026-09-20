@@ -65,8 +65,23 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return NULL, FAILED}
     \EndIf
+    \State $actual\_value \gets \text{null}$
+    \Statex \Comment{speculative read: nearest EXCLUSIVE node at or before txn's own node (never a successor's). Safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}, so its buffer is final; if the writer already committed, its buffer was applied to the store before its node was spliced out, so reading the store is correct}
+    \State \textbf{atomic}(locks\_map) \{
+    \If{$k \in \text{locks\_map}$}
+        \State $current\_node \gets txn.\text{locks\_acquired}[k].\text{target\_node}$
+        \While{$current\_node \neq \text{null}$ \textbf{and} $current\_node.\text{mode} \neq \text{EXCLUSIVE}$}
+            \State $current\_node \gets current\_node.\text{predecessor}$
+        \EndWhile
+        \If{$current\_node \neq \text{null}$}
+            \State $actual\_value \gets current\_node.\text{holders}[0].\text{write\_buffer}[k]$
+        \EndIf
+    \EndIf
+    \}
     \If{$k \in txn.\text{write\_buffer}$}
         \State \textbf{return} $txn.\text{write\_buffer}[k]$, SUCCEEDED
+    \ElsIf{$actual\_value \neq \text{null}$}
+        \State \textbf{return} $actual\_value$, SUCCEEDED
     \EndIf
     \State \textbf{return} value of $k$, SUCCEEDED
 \EndProcedure
@@ -129,7 +144,7 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State \textbf{break}
         \EndIf
         \State \Comment{pred can be spliced out from under us (by commit()/abort\_transaction() on one of its holders) while we wait; re-read target\_node.predecessor under the latch on every iteration instead of trusting this captured reference once resolved}
-        \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq target\_node.\text{predecessor}$
+        \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq target\_node.\text{predecessor}$
         \If{$pred \neq target\_node.\text{predecessor}$}
             \State \textbf{continue} \Comment{pred was spliced out mid-wait; loop back and re-read fresh under the latch}
         \EndIf
@@ -176,7 +191,7 @@ The shim locks at the granularity of a single record, identified by its primary 
                 \State \textbf{break}
             \EndIf
             \State \Comment{pred (== node, the remaining SHARED holders we're queued behind) can be spliced out from under us while we wait; re-read new\_node.predecessor under the latch on every iteration instead of trusting a captured reference once resolved}
-            \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq new\_node.\text{predecessor}$
+            \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq new\_node.\text{predecessor}$
             \If{$pred \neq new\_node.\text{predecessor}$}
                 \State \textbf{continue} \Comment{pred was spliced out mid-wait; loop back and re-read fresh under the latch}
             \EndIf
