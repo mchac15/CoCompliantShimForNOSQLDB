@@ -14,6 +14,38 @@ Data Structures:
     transactions_map: ConcurrentHashMap<txn_id, txn>   
 
 
+Durability Interfaces:
+    // The log record set is the only durable state. transactions_map and locks_map are volatile
+    // and are lost on a crash. Only prepared transactions are ever logged (presumed abort).
+
+    Log: single append-only file
+        log.append(record, force: bool)
+            // force=true: returns only once the record is on stable storage
+            // (records appended earlier are then durable too); force=false: may be lost on a crash
+        log.scan() -> ordered list of records   // in append order, up to the last durable record
+        // TODO: log.truncate()   // checkpointing / dropping records of finished txns
+
+        record ∈ {
+            PREPARED{txn_id, write_buffer}   // forced, before sending YES
+            COMMIT{txn_id}                   // forced, before applying write_buffer to the store
+            DONE{txn_id}                     // forced, after the store writes + store.sync(), before locks are released
+            ABORT{txn_id}                    // NOT forced, only for txns that were prepared
+        }
+        // no records for started / executed / aborting txns: they are aborted implicitly on a crash.
+        // A lost ABORT only makes the txn in-doubt again, the coordinator re-sends abort.
+        // DONE is forced before lock release: a successor cannot prepare until its predecessor is
+        // committed, so after a crash the txns with COMMIT but no DONE never conflict with each
+        // other and the order in which they are redone does not matter.
+
+    Store: black box NoSQL store, nothing more is assumed than the following
+        store.read(k) -> value
+        store.write(k, v)    // blind put: idempotent, so safe to redo. No atomicity across keys assumed
+        store.sync()         // returns once all previous writes are durable; no-op if the store is durable on return
+
+    // The coordinator is out of scope: after recovery, in-doubt txns (prepared, undecided)
+    // wait for an external commit(txn_id) / abort(txn_id) call.
+
+
 procedure execute(code):
     txn = new txn with txn_id, locks_acquired={}, status=started, code=code
     if transactions_map.putIfAbsent(txn.txn_id, txn) != null
