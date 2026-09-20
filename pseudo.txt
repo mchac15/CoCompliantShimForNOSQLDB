@@ -13,6 +13,9 @@ Data Structures:
 
     transactions_map: ConcurrentHashMap<txn_id, txn>   
     recovering: boolean   // true from restart until recover() has resolved every in-doubt txn; gates execute()
+    loaded: boolean       // false from restart until recover() has finished step (c) (all in-doubt txns are back in
+                          // transactions_map); gates prepare/commit/abort. true in normal operation: recover() runs on
+                          // every startup and on a fresh empty log sets loaded = true right after step (c) immediately
 
 
 Durability Interfaces:
@@ -246,6 +249,9 @@ procedure upgrade(k, txn):
 
 
 procedure prepare(txn_id):
+    wait until loaded
+    // 2PC messages from the coordinator are held back until the recovered state is in
+    // transactions_map, so an in-doubt txn is never mistaken for an unknown/evicted id
     txn = transactions_map[txn_id]
     if txn == null:
         // unknown/already-evicted txn_id: treat as a duplicate/late
@@ -324,6 +330,9 @@ procedure prepare(txn_id):
 
 
 procedure commit(txn_id):
+    wait until loaded
+    // 2PC messages from the coordinator are held back until the recovered state is in
+    // transactions_map, so an in-doubt txn is never mistaken for an unknown/evicted id
     txn = transactions_map[txn_id]
     if txn == null:
         return   // unknown/already-evicted txn_id: no-op
@@ -405,6 +414,9 @@ procedure abort_transaction(txn):
     // treated as a no-op abort
 
 procedure abort(txn_id):
+    wait until loaded
+    // 2PC messages from the coordinator are held back until the recovered state is in
+    // transactions_map, so an in-doubt txn is never mistaken for an unknown/evicted id
     txn = transactions_map[txn_id]
     if txn == null:
         return   // unknown/already-evicted txn_id: no-op, per the
@@ -419,10 +431,13 @@ procedure mark_must_abort(txn):
 
 procedure recover():
     // runs once on restart, before serving anything: transactions_map and
-    // locks_map are empty (volatile state was lost) and recovering is true.
-    // prepare/commit/abort may be served concurrently while recover() waits at
-    // its end; only execute() is gated
+    // locks_map are empty (volatile state was lost), recovering is true and
+    // loaded is false. execute() is gated by recovering until the very end;
+    // prepare/commit/abort are gated by loaded: they are held until step (c)
+    // has put every in-doubt txn back in transactions_map, and are served
+    // from then on, while recover() waits for the coordinator's decisions
     recovering = true
+    loaded = false
 
     prepared = {}    // txn_id -> write_buffer, from PREPARED records
     committed = {}   // txn_ids with a COMMIT record
@@ -467,8 +482,16 @@ procedure recover():
         txn = new txn with txn_id, locks_acquired={}, status=prepared, write_buffer=wb
         transactions_map[txn_id] = txn
         in_doubt.add(txn)
+    // all in-doubt txns are now in transactions_map: release the 2PC entry
+    // points held at `wait until loaded`. This must precede the wait below,
+    // which needs the coordinator's commit/abort calls to get through (no
+    // deadlock: the wait depends only on commit/abort being served, and they
+    // are served once loaded == true). On a fresh empty log in_doubt is empty
+    // and loaded becomes true immediately
+    loaded = true
 
-    // commit(txn_id)/abort(txn_id) from the coordinator work unchanged on a
+    // commit(txn_id)/abort(txn_id) from the coordinator (served now that loaded
+    // is true) work unchanged on a
     // recovered txn: locks_acquired is empty, so their lock-release loops are
     // no-ops (there are no nodes, hence no successors to cascade to), and the
     // CAS from prepared and the write_buffer apply behave as before. A

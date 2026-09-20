@@ -40,6 +40,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State \Comment{TODO: intermediate states for retry mechanism}
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
 \State $\text{recovering}: \text{boolean}$ \Comment{true from restart until \Call{recover}{} has resolved every in-doubt txn; gates \Call{execute}{}}
+\State $\text{loaded}: \text{boolean}$ \Comment{false from restart until \Call{recover}{} has finished step (c) (all in-doubt txns are back in transactions\_map); gates prepare/commit/abort. true in normal operation: \Call{recover}{} runs on every startup and on a fresh empty log sets loaded = true right after step (c) immediately}
 
 \Statex
 \State \textbf{Durability Interfaces:}
@@ -245,6 +246,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 \begin{algorithmic}[1]
 
 \Procedure{prepare}{txn\_id}
+    \State \textbf{wait until} $\text{loaded}$ \Comment{2PC messages from the coordinator are held back until the recovered state is in transactions\_map, so an in-doubt txn is never mistaken for an unknown/evicted id}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
         \State \Comment{unknown/already-evicted txn\_id: treat as a duplicate/late prepare for a txn that was already resolved and cleaned up}
@@ -308,6 +310,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \Statex
 \Procedure{commit}{txn\_id}
+    \State \textbf{wait until} $\text{loaded}$ \Comment{2PC messages from the coordinator are held back until the recovered state is in transactions\_map, so an in-doubt txn is never mistaken for an unknown/evicted id}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
         \State \textbf{return} \Comment{unknown/already-evicted txn\_id: no-op}
@@ -375,6 +378,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \Statex
 \Procedure{abort}{txn\_id}
+    \State \textbf{wait until} $\text{loaded}$ \Comment{2PC messages from the coordinator are held back until the recovered state is in transactions\_map, so an in-doubt txn is never mistaken for an unknown/evicted id}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
         \State \textbf{return} \Comment{unknown/already-evicted txn\_id: no-op, per the evicted-id convention documented in \Call{abort\_transaction}{}}
@@ -398,8 +402,9 @@ The shim locks at the granularity of a single record, identified by its primary 
 \begin{algorithmic}[1]
 
 \Procedure{recover}{}
-    \State \Comment{runs once on restart, before serving anything: transactions\_map and locks\_map are empty (volatile state was lost) and recovering is true. prepare/commit/abort may be served concurrently while \Call{recover}{} waits at its end; only \Call{execute}{} is gated}
+    \State \Comment{runs once on restart, before serving anything: transactions\_map and locks\_map are empty (volatile state was lost) recovering is true and loaded is false. \Call{execute}{} is gated by recovering until the very end; prepare/commit/abort are gated by loaded: they are held until step (c) has put every in-doubt txn back in transactions\_map, and are served from then on, while \Call{recover}{} waits for the coordinator's decisions}
     \State $\text{recovering} \gets \text{true}$
+    \State $\text{loaded} \gets \text{false}$
     \State $prepared \gets \{\}$ \Comment{txn\_id $\to$ write\_buffer, from PREPARED records}
     \State $committed \gets \{\}$ \Comment{txn\_ids with a COMMIT record}
     \State $resolved \gets \{\}$ \Comment{txn\_ids with a DONE or ABORT record}
@@ -438,7 +443,9 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State $\text{transactions\_map}[txn\_id] \gets txn$
         \State $in\_doubt.\text{add}(txn)$
     \EndFor
-    \State \Comment{\Call{commit}{txn\_id}/\Call{abort}{txn\_id} from the coordinator work unchanged on a recovered txn: locks\_acquired is empty, so their lock-release loops are no-ops (there are no nodes, hence no successors to cascade to), and the CAS from prepared and the write\_buffer apply behave as before. A duplicate \Call{prepare}{txn\_id} just re-votes yes (status is already prepared). Unknown txn\_id conventions after recovery: prepare votes NO (see prepare), commit/abort are no-ops (see their bodies); a commit for a txn\_id that has DONE is an already-applied no-op}
+    \State \Comment{all in-doubt txns are now in transactions\_map: release the 2PC entry points held at \textbf{wait until} loaded. This must precede the wait below, which needs the coordinator's commit/abort calls to get through (no deadlock: the wait depends only on commit/abort being served, and they are served once loaded $=$ true). On a fresh empty log $in\_doubt$ is empty and loaded becomes true immediately}
+    \State $\text{loaded} \gets \text{true}$
+    \State \Comment{\Call{commit}{txn\_id}/\Call{abort}{txn\_id} from the coordinator (served now that loaded is true) work unchanged on a recovered txn: locks\_acquired is empty, so their lock-release loops are no-ops (there are no nodes, hence no successors to cascade to), and the CAS from prepared and the write\_buffer apply behave as before. A duplicate \Call{prepare}{txn\_id} just re-votes yes (status is already prepared). Unknown txn\_id conventions after recovery: prepare votes NO (see prepare), commit/abort are no-ops (see their bodies); a commit for a txn\_id that has DONE is an already-applied no-op}
     \State \textbf{wait until} $(\forall t \in in\_doubt,\ t.\text{status} \in \{\text{committed}, \text{aborted}\})$
     \State $\text{recovering} \gets \text{false}$ \Comment{open for new work}
 \EndProcedure
