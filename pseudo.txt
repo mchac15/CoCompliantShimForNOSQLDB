@@ -300,8 +300,7 @@ procedure prepare(txn_id):
 
             break   // pred fully resolved with no abort among its holders
 
-    (ok, prev_status) = CAS(txn.status, {executed, prepared}, prepared)   // also yields the status it replaced
-    if not ok:
+    if not CAS(txn.status, {executed, prepared}, prepared):
         // status moved out from under us (e.g. a late cascade mark_must_abort
         // landed after the wait loop finished) --- the txn never became
         // prepared, so it is always safe to abort it here and release its
@@ -310,15 +309,15 @@ procedure prepare(txn_id):
         abort_transaction(txn)
         return
 
-    if prev_status == executed:
-        // CAS to prepared BEFORE forcing the record: a crash between the CAS
-        // and the force leaves no PREPARED record, so recovery presumes abort,
-        // and that is safe because the coordinator never saw a YES. The force
-        // must complete before the YES leaves, so a YES always has a durable
-        // PREPARED record behind it.
-        log.append(PREPARED{txn_id, txn.write_buffer}, force=true)
-    // else duplicate prepare of an already prepared txn: its PREPARED record
-    // is already durable, do not re-log, just vote YES again
+    // CAS to prepared BEFORE forcing the record: a crash between the CAS and
+    // the force leaves no PREPARED record, so recovery presumes abort, and that
+    // is safe because the coordinator never saw a YES. Every call forces,
+    // including duplicate/concurrent prepares: a duplicate may arrive while the
+    // first call's force is still in flight, and a YES must never leave before
+    // a durable PREPARED record. Re-forcing a durable record is cheap and a
+    // second identical PREPARED record for the same txn_id is harmless
+    // (write_buffer is final once executed; recover() keys records by txn_id).
+    log.append(PREPARED{txn_id, txn.write_buffer}, force=true)
 
     send yes to 2PC controller
 
