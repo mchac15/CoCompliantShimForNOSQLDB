@@ -36,7 +36,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \State $\text{locks\_map}: \text{key} \to \text{chain (linked list of LockNode)}$ \Comment{one chain per key, generations of holders}
 \State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}\}$
-\State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committed}, \text{aborted}, \text{must\_abort}, \text{NULL}\}$
+\State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}, \text{NULL}\}$
 \State \Comment{TODO: intermediate states for retry mechanism}
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
 
@@ -249,12 +249,18 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndLoop
     \EndFor
 
-    \If{not \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared}}
+    \State $(ok, prev\_status) \gets$ \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared} \Comment{also yields the status it replaced}
+    \If{\textbf{not} $ok$}
         \State \Comment{status moved out from under us (e.g. a late cascade mark\_must\_abort landed after the wait loop finished) --- the txn never became prepared, so it is always safe to abort it here and release its locks rather than leaking them}
         \State \textbf{Send no to 2PC controller}
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return}
     \EndIf
+    \If{$prev\_status == \text{executed}$}
+        \State \Comment{CAS to prepared BEFORE forcing the record: a crash between the CAS and the force leaves no PREPARED record, so recovery presumes abort, and that is safe because the coordinator never saw a YES. The force must complete before the YES leaves, so a YES always has a durable PREPARED record behind it.}
+        \State \indent $\text{log.append}(\text{PREPARED}\{txn\_id, txn.\text{write\_buffer}\}, \text{force}=\text{true})$
+    \EndIf
+    \State \Comment{else duplicate prepare of an already prepared txn: its PREPARED record is already durable, do not re-log, just vote YES again}
     \State \textbf{Send yes to 2PC controller}
 \EndProcedure
 
@@ -264,12 +270,18 @@ The shim locks at the granularity of a single record, identified by its primary 
     \If{$txn == \text{null}$}
         \State \textbf{return} \Comment{unknown/already-evicted txn\_id: no-op}
     \EndIf
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \text{prepared}, \text{committed}}}
+    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \text{prepared}, \text{committing}}}
         \State \textbf{return}
     \EndIf
+    \State $\text{log.append}(\text{COMMIT}\{txn\_id\}, \text{force}=\text{true})$ \Comment{the decision is durable before anything touches the store}
+    \State \Comment{redo: blind puts, idempotent, so recovery may safely repeat them}
     \For{\textbf{each} $(key, value) \in txn.\text{write\_buffer}$}
-        \State set value of $key$ to $value$ (database operation)
+        \State $\text{store.write}(key, value)$
     \EndFor
+    \State $\text{store.sync}()$
+    \State \Comment{DONE is forced BEFORE the locks are released: a successor on any of these keys cannot prepare until this txn has left the chain, i.e. until its DONE is durable. So after a crash the txns with COMMIT but no DONE never conflict with each other, and redo order does not matter (redoing this txn can never overwrite the value of a later committed successor).}
+    \State $\text{log.append}(\text{DONE}\{txn\_id\}, \text{force}=\text{true})$
+    \State \Comment{a txn recovered as in-doubt has locks\_acquired = \{\}, so this block is a no-op for it}
     \State \textbf{atomic}(locks\_map) \{
         \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
             \State \indent remove $txn$ from $target\_node.\text{holders}$
@@ -280,13 +292,19 @@ The shim locks at the granularity of a single record, identified by its primary 
             \EndIf
         \EndFor
     \}
+    \State $\text{txn.status} \gets \text{committed}$
     \State \Comment{safe to evict txn from any external txn-id registry after this point --- nothing in locks\_map references it anymore}
 \EndProcedure
 
 \Statex
 \Procedure{abort\_transaction}{txn}
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{executed}, \text{prepared}, \text{NULL}, \text{must\_abort}, \text{started}\}, \text{aborted}}}
+    \State $(ok, prev\_status) \gets$ \Call{CAS}{\text{txn.status}, \{\text{executed}, \text{prepared}, \text{NULL}, \text{must\_abort}, \text{started}\}, \text{aborted}} \Comment{also yields the status it replaced}
+    \If{\textbf{not} $ok$}
         \State \textbf{return}
+    \EndIf
+    \If{$prev\_status == \text{prepared}$}
+        \State \Comment{presumed abort: only a txn that voted YES has a PREPARED record, so only then is there anything to record; every other txn leaves no trace. Not forced: if this record is lost the txn is in-doubt again after recovery and the coordinator re-sends abort. Its locks are already gone by then (recovery does not rebuild locks\_map), so the retry costs nothing.}
+        \State \indent $\text{log.append}(\text{ABORT}\{txn.\text{txn\_id}\}, \text{force}=\text{false})$
     \EndIf
 
     \State \textbf{atomic}(locks\_map) \{
