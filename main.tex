@@ -291,18 +291,14 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndLoop
     \EndFor
 
-    \State $(ok, prev\_status) \gets$ \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared} \Comment{also yields the status it replaced}
-    \If{\textbf{not} $ok$}
+    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared}}
         \State \Comment{status moved out from under us (e.g. a late cascade mark\_must\_abort landed after the wait loop finished) --- the txn never became prepared, so it is always safe to abort it here and release its locks rather than leaking them}
         \State \textbf{Send no to 2PC controller}
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return}
     \EndIf
-    \If{$prev\_status == \text{executed}$}
-        \State \Comment{CAS to prepared BEFORE forcing the record: a crash between the CAS and the force leaves no PREPARED record, so recovery presumes abort, and that is safe because the coordinator never saw a YES. The force must complete before the YES leaves, so a YES always has a durable PREPARED record behind it.}
-        \State \indent $\text{log.append}(\text{PREPARED}\{txn\_id, txn.\text{write\_buffer}\}, \text{force}=\text{true})$
-    \EndIf
-    \State \Comment{else duplicate prepare of an already prepared txn: its PREPARED record is already durable, do not re-log, just vote YES again}
+    \State \Comment{CAS to prepared BEFORE forcing the record: a crash between the CAS and the force leaves no PREPARED record, so recovery presumes abort, and that is safe because the coordinator never saw a YES. Every call forces, including duplicate/concurrent prepares: a duplicate may arrive while the first call's force is still in flight, and a YES must never leave before a durable PREPARED record. Re-forcing a durable record is cheap and a second identical PREPARED record for the same txn\_id is harmless (write\_buffer is final once executed; recover() keys records by txn\_id).}
+    \State $\text{log.append}(\text{PREPARED}\{txn\_id, txn.\text{write\_buffer}\}, \text{force}=\text{true})$
     \State \textbf{Send yes to 2PC controller}
 \EndProcedure
 
