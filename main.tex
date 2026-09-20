@@ -62,6 +62,12 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State \Call{store.write}{k, v} \Comment{blind put: idempotent, so safe to redo; no atomicity across keys assumed}
 \State \Call{store.sync}{} \Comment{returns once all previous writes are durable; no-op if the store is durable on return}
 \State \Comment{the coordinator is out of scope: after recovery, in-doubt txns (prepared, undecided) wait for an external commit(txn\_id) / abort(txn\_id) call}
+\State \textbf{Assumptions:}
+\State \Comment{1. Blocking semantics: \Call{log.append}{}, \Call{store.write}{} and \Call{store.sync}{} are blocking. If one fails it is simply retried / blocked until it succeeds, so the protocol has no error path for log or store failures. A txn that cannot force PREPARED just blocks: it never votes YES without a durable record}
+\State \Comment{2. Torn records: an incomplete or corrupt record at the tail of the log (crash mid-append) is discarded entirely by \Call{log.scan}{}, as if it had never been written (records are self-delimiting / checksummed). Since only forced records are ever relied on, discarding a torn tail is safe}
+\State \Comment{3. Log truncation is out of scope for now: the log only grows and \Call{recover}{} scans all of it (see the TODO: log.truncate() above)}
+\State \Comment{4. txn\_ids are never reused: a txn\_id that appears in the log (or was ever executed) is never sent to \Call{execute}{} again, so a re-executed finished txn cannot occur after recovery}
+\State \Comment{5. Duplicate PREPARED records: a txn\_id may have more than one PREPARED record in the log (a retried / duplicate prepare forces the record again). All copies carry the identical write\_buffer (final once the txn is executed), so recovery treats them as one}
 
 \Statex
 \Procedure{execute}{code}
