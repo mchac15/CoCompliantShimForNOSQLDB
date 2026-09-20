@@ -8,7 +8,7 @@ Data Structures:
     locks_map: key -> chain (linked list of LockNode)   // one chain per key, generations of holders
 
     txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
-    status ∈ {started, executed, prepared, commiting, committed, aborted, must_abort,NULL}
+    status ∈ {started, executed, prepared, committing, committed, aborted, must_abort,NULL}
     // TODO: intermediate states for retry mechanism
 
     transactions_map: ConcurrentHashMap<txn_id, txn>   
@@ -300,7 +300,8 @@ procedure prepare(txn_id):
 
             break   // pred fully resolved with no abort among its holders
 
-    if not CAS(txn.status, {executed, prepared}, prepared):
+    (ok, prev_status) = CAS(txn.status, {executed, prepared}, prepared)   // also yields the status it replaced
+    if not ok:
         // status moved out from under us (e.g. a late cascade mark_must_abort
         // landed after the wait loop finished) --- the txn never became
         // prepared, so it is always safe to abort it here and release its
@@ -308,6 +309,16 @@ procedure prepare(txn_id):
         send no to 2PC controller
         abort_transaction(txn)
         return
+
+    if prev_status == executed:
+        // CAS to prepared BEFORE forcing the record: a crash between the CAS
+        // and the force leaves no PREPARED record, so recovery presumes abort,
+        // and that is safe because the coordinator never saw a YES. The force
+        // must complete before the YES leaves, so a YES always has a durable
+        // PREPARED record behind it.
+        log.append(PREPARED{txn_id, txn.write_buffer}, force=true)
+    // else duplicate prepare of an already prepared txn: its PREPARED record
+    // is already durable, do not re-log, just vote YES again
 
     send yes to 2PC controller
 
@@ -317,12 +328,25 @@ procedure commit(txn_id):
     if txn == null:
         return   // unknown/already-evicted txn_id: no-op
 
-    if not CAS(txn.status, prepared, commiting):
+    if not CAS(txn.status, prepared, committing):
         return
 
-    for (key,value) in txn.write_buffer:
-        set value of key to value (data base operation)
+    log.append(COMMIT{txn_id}, force=true)   // the decision is durable before anything touches the store
 
+    // redo: blind puts, idempotent, so recovery may safely repeat them
+    for (key,value) in txn.write_buffer:
+        store.write(key, value)
+    store.sync()
+
+    // DONE is forced BEFORE the locks are released: a successor on any of
+    // these keys cannot prepare until this txn has left the chain, i.e. until
+    // its DONE is durable. So after a crash the txns with COMMIT but no DONE
+    // never conflict with each other, and redo order does not matter (redoing
+    // this txn can never overwrite the value of a later committed successor).
+    log.append(DONE{txn_id}, force=true)
+
+    // a txn recovered as in-doubt has locks_acquired = {}, so this block is
+    // a no-op for it
     atomic(locks_map) {
         for each (k, mode, target_node) in txn.locks_acquired:
             remove txn from target_node.holders
@@ -339,9 +363,18 @@ procedure commit(txn_id):
 
 
 procedure abort_transaction(txn):
-    if not CAS(txn.status, {executed, prepared, NULL, must_abort, started}, aborted):
+    (ok, prev_status) = CAS(txn.status, {executed, prepared, NULL, must_abort, started}, aborted)   // also yields the status it replaced
+    if not ok:
         return
 
+    if prev_status == prepared:
+        // presumed abort: only a txn that voted YES has a PREPARED record, so
+        // only then is there anything to record; every other txn leaves no
+        // trace. Not forced: if this record is lost the txn is in-doubt again
+        // after recovery and the coordinator re-sends abort. Its locks are
+        // already gone by then (recovery does not rebuild locks_map), so the
+        // retry costs nothing.
+        log.append(ABORT{txn.txn_id}, force=false)
 
     atomic(locks_map) {
         for each (k, mode, target_node) in txn.locks_acquired:
