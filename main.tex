@@ -362,13 +362,14 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \textbf{return}
     \EndIf
 
+    \State $doomed\_finished \gets \{\}$ \Comment{cascade victims that had already finished executing}
     \State \textbf{atomic}(locks\_map) \{
         \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
             \State \indent $chain \gets \text{locks\_map}[k]$
             \If{$mode == \text{EXCLUSIVE}$}
                 \State \indent\indent $successor\_node \gets target\_node.\text{next}$
                 \While{$successor\_node \neq \text{null}$}
-                    \State \indent\indent\indent \textbf{for each} $t \in successor\_node.\text{holders}$\textbf{:} \Call{mark\_must\_abort}{t}
+                    \State \indent\indent\indent \textbf{for each} $t \in successor\_node.\text{holders}$\textbf{:} \textbf{if} \Call{mark\_must\_abort}{t}\textbf{:} $doomed\_finished.\text{add}(t)$
                     \State \indent\indent\indent $successor\_node \gets successor\_node.\text{next}$
                 \EndWhile
             \EndIf
@@ -382,6 +383,10 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndFor
     \}
     \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: evicted like in \Call{commit}{}}
+    \State \Comment{eager cleanup, outside the latch: a doomed txn that already finished executing has no thread that would abort it; waiting for the coordinator would leave its nodes in the chain and delay the cascade to its own successors. Its later prepare/commit/abort hit the unknown-id branches (prepare votes NO)}
+    \For{\textbf{each} $t \in doomed\_finished$}
+        \State \Call{abort\_transaction}{t}
+    \EndFor
 \EndProcedure
 
 \Statex
@@ -395,9 +400,12 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \Statex
 \Procedure{mark\_must\_abort}{txn}
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{started}, \text{executed}\}, \text{must\_abort}}}
-        \State \textbf{return}
+    \State \Comment{returns true iff txn was already executed: nobody runs it anymore, so the caller cleans it up (see \Call{abort\_transaction}{}); never touches prepared}
+    \If{\Call{CAS}{\text{txn.status}, \text{executed}, \text{must\_abort}}}
+        \State \textbf{return} true
     \EndIf
+    \State \Call{CAS}{\text{txn.status}, \text{started}, \text{must\_abort}} \Comment{still running: its own thread aborts it at its next lock or at the CAS in execute}
+    \State \textbf{return} false
 \EndProcedure
 
 \end{algorithmic}
