@@ -2,14 +2,13 @@ Data Structures:
     lock_mode ∈ {SHARED, EXCLUSIVE}
 
     LockNode: { mode, holders: set of txn, predecessor, next }
-    // TODO: integrate this data structure
-    locks_map: ConcurrentHashMap<key, LinkedList<LockNode>>
-
-    locks_map: key -> chain (linked list of LockNode)   // one chain per key, generations of holders
+    chain: { head, tail: LockNode }   // doubly linked through predecessor/next; arrival order = required commit order
+        // chain.last_node() = tail. "append n" makes n the new tail (and the head if the chain was empty);
+        // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers
+    locks_map: ConcurrentHashMap<key, chain>   // one chain per key, generations of holders
 
     txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
-    status ∈ {started, executed, prepared, committing, committed, aborted, must_abort,NULL}
-    // TODO: intermediate states for retry mechanism
+    status ∈ {started, executed, prepared, committing, committed, aborted, must_abort}
 
     transactions_map: ConcurrentHashMap<txn_id, txn>
     // atomic(locks_map) { ... } is one critical section over the chains. An implementation may use
@@ -36,7 +35,7 @@ Store:
         //    that id take the unknown-id branches (prepare votes NO, commit/abort are no-ops).
 
 
-procedure execute(code):
+procedure execute(txn_id, code):
     txn = new txn with txn_id, locks_acquired={}, status=started, code=code
     if transactions_map.putIfAbsent(txn.txn_id, txn) != null
         return FAILED   // txn_id already registered (collision / duplicate)
@@ -66,7 +65,9 @@ procedure get(k, txn):
     if result == MUST_ABORT:
         abort_transaction(txn)
         return NULL, FAILED
-    actual_value=null
+    if k in txn.write_buffer:
+        return txn.write_buffer[k], SUCCEEDED   // own write first, no need to look at the chain
+    actual_value=null   // null = "no predecessor version", so values are assumed to be non-null
     // speculative read: find the nearest EXCLUSIVE node at or before this txn's
     // own node (never a successor's), i.e. the latest predecessor write that
     // this txn is ordered after. Reading that holder's write_buffer is safe:
@@ -80,14 +81,11 @@ procedure get(k, txn):
             while current_node!=null and current_node.mode!=EXCLUSIVE:
                 current_node=current_node.predecessor
             if current_node!=null:
-                actual_value=current_node.holders[0].write_buffer[k]
-
+                actual_value=(the sole holder of current_node).write_buffer[k]   // an EXCLUSIVE node has one holder
     }
-    if k in txn.write_buffer:
-        return txn.write_buffer[k], SUCCEEDED
-    elif actual_value!=null:
+    if actual_value!=null:
         return actual_value, SUCCEEDED
-    return value of k, SUCCEEDED
+    return store.read(k), SUCCEEDED
 
 
 procedure put(k, v, txn):
@@ -325,6 +323,7 @@ procedure commit(txn_id):
 
     atomic(locks_map) {
         for each (k, mode, target_node) in txn.locks_acquired:
+            chain = locks_map[k]
             remove txn from target_node.holders
             if target_node.holders is empty:
                 if target_node.predecessor != null:
@@ -332,6 +331,8 @@ procedure commit(txn_id):
                 if target_node.next != null:
                     target_node.next.predecessor=target_node.predecessor
                 remove target_node from chain
+                if chain is empty:
+                    remove k from locks_map   // under the latch: a concurrent lock(k) sees the chain or none
     }
     txn.status=committed
     transactions_map.remove(txn.txn_id)
@@ -341,14 +342,12 @@ procedure commit(txn_id):
 
 
 procedure abort_transaction(txn):
-    if not CAS(txn.status, {executed, prepared, NULL, must_abort, started}, aborted):
+    if not CAS(txn.status, {executed, prepared, must_abort, started}, aborted):
         return
 
     atomic(locks_map) {
         for each (k, mode, target_node) in txn.locks_acquired:
-            entry = locks_map[k]
-            if entry == null:
-                continue
+            chain = locks_map[k]
 
             if mode == EXCLUSIVE:
                 successor_node = target_node.next
@@ -363,7 +362,9 @@ procedure abort_transaction(txn):
                     target_node.predecessor.next=target_node.next
                 if target_node.next != null:
                     target_node.next.predecessor=target_node.predecessor
-                remove target_node from locks_map[k]
+                remove target_node from chain
+                if chain is empty:
+                    remove k from locks_map   // same conditional removal as in commit()
     }
 
 
@@ -380,5 +381,5 @@ procedure abort(txn_id):
 
 
 procedure mark_must_abort(txn):
-    if not CAS(txn.status, {started, executed, NULL}, must_abort):
+    if not CAS(txn.status, {started, executed}, must_abort):
         return

@@ -39,10 +39,10 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State $\text{lock\_mode} \in \{\text{SHARED}, \text{EXCLUSIVE}\}$
 \State $\text{LockNode}: \{\text{mode}, \text{holders}: \text{set of txn}, \text{predecessor}, \text{next}\}$
 
-\State $\text{locks\_map}: \text{key} \to \text{chain (linked list of LockNode)}$ \Comment{one chain per key, generations of holders}
+\State $\text{chain}: \{\text{head}, \text{tail}\}$ \Comment{doubly linked through predecessor/next, arrival order $=$ required commit order; last\_node() $=$ tail}
+\State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, chain>}$ \Comment{one chain per key, generations of holders}
 \State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}\}$
-\State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}, \text{NULL}\}$
-\State \Comment{TODO: intermediate states for retry mechanism}
+\State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}\}$
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
 \State \Comment{atomic(locks\_map) is one critical section; per-key latches are fine if the status re-check and the update of locks\_acquired stay atomic w.r.t. \Call{abort\_transaction}{} reading locks\_acquired}
 
@@ -53,7 +53,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State \Comment{store.write is blocking and retried until it succeeds; crash recovery is out of scope (the shim is assumed not to crash between voting YES and the decision)}
 
 \Statex
-\Procedure{execute}{code}
+\Procedure{execute}{txn\_id, code}
     \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{code}=code$
     \If{$\Call{transactions\_map.putIfAbsent}{txn.\text{txn\_id}, txn} \neq \text{null}$}
         \State \textbf{return} FAILED \Comment{txn\_id already registered (collision / duplicate)}
@@ -77,7 +77,10 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return NULL, FAILED}
     \EndIf
-    \State $actual\_value \gets \text{null}$
+    \If{$k \in txn.\text{write\_buffer}$}
+        \State \textbf{return} $txn.\text{write\_buffer}[k]$, SUCCEEDED \Comment{own write first}
+    \EndIf
+    \State $actual\_value \gets \text{null}$ \Comment{null $=$ no predecessor version; values are assumed non-null}
     \Statex \Comment{speculative read: nearest EXCLUSIVE node at or before own node; its buffer is final since \Call{lock}{} waits for \texttt{executed}. If none, the writer committed and the store is correct}
     \State \textbf{atomic}(locks\_map) \{
     \If{$k \in \text{locks\_map}$}
@@ -86,16 +89,14 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State $current\_node \gets current\_node.\text{predecessor}$
         \EndWhile
         \If{$current\_node \neq \text{null}$}
-            \State $actual\_value \gets current\_node.\text{holders}[0].\text{write\_buffer}[k]$
+            \State $actual\_value \gets (\text{sole holder of } current\_node).\text{write\_buffer}[k]$
         \EndIf
     \EndIf
     \}
-    \If{$k \in txn.\text{write\_buffer}$}
-        \State \textbf{return} $txn.\text{write\_buffer}[k]$, SUCCEEDED
-    \ElsIf{$actual\_value \neq \text{null}$}
+    \If{$actual\_value \neq \text{null}$}
         \State \textbf{return} $actual\_value$, SUCCEEDED
     \EndIf
-    \State \textbf{return} value of $k$, SUCCEEDED
+    \State \textbf{return} \Call{store.read}{k}, SUCCEEDED
 \EndProcedure
 
 \Statex
@@ -311,11 +312,13 @@ The shim locks at the granularity of a single record, identified by its primary 
     \EndFor
     \State \textbf{atomic}(locks\_map) \{
         \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
+            \State \indent $chain \gets \text{locks\_map}[k]$
             \State \indent remove $txn$ from $target\_node.\text{holders}$
             \If{$target\_node.\text{holders}$ is empty}
                 \State \indent\indent \textbf{if} $target\_node.\text{predecessor} \neq \text{null}$\textbf{:} $target\_node.\text{predecessor.next} \gets target\_node.\text{next}$
                 \State \indent\indent \textbf{if} $target\_node.\text{next} \neq \text{null}$\textbf{:} $target\_node.\text{next.predecessor} \gets target\_node.\text{predecessor}$
-                \State \indent\indent remove $target\_node$ from chain
+                \State \indent\indent remove $target\_node$ from $chain$
+                \State \indent\indent \textbf{if} $chain$ is empty\textbf{:} remove $k$ from $\text{locks\_map}$ \Comment{under the latch}
             \EndIf
         \EndFor
     \}
@@ -325,16 +328,13 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \Statex
 \Procedure{abort\_transaction}{txn}
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{executed}, \text{prepared}, \text{NULL}, \text{must\_abort}, \text{started}\}, \text{aborted}}}
+    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{executed}, \text{prepared}, \text{must\_abort}, \text{started}\}, \text{aborted}}}
         \State \textbf{return}
     \EndIf
 
     \State \textbf{atomic}(locks\_map) \{
         \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
-            \State \indent $entry \gets \text{locks\_map}[k]$
-            \If{$entry == \text{null}$}
-                \State \indent\indent \textbf{continue}
-            \EndIf
+            \State \indent $chain \gets \text{locks\_map}[k]$
             \If{$mode == \text{EXCLUSIVE}$}
                 \State \indent\indent $successor\_node \gets target\_node.\text{next}$
                 \While{$successor\_node \neq \text{null}$}
@@ -346,7 +346,8 @@ The shim locks at the granularity of a single record, identified by its primary 
             \If{$target\_node.\text{holders}$ is empty}
                 \State \indent\indent \textbf{if} $target\_node.\text{predecessor} \neq \text{null}$\textbf{:} $target\_node.\text{predecessor.next} \gets target\_node.\text{next}$
                 \State \indent\indent \textbf{if} $target\_node.\text{next} \neq \text{null}$\textbf{:} $target\_node.\text{next.predecessor} \gets target\_node.\text{predecessor}$
-                \State \indent\indent remove $target\_node$ from $\text{locks\_map}[k]$
+                \State \indent\indent remove $target\_node$ from $chain$
+                \State \indent\indent \textbf{if} $chain$ is empty\textbf{:} remove $k$ from $\text{locks\_map}$
             \EndIf
         \EndFor
     \}
@@ -364,7 +365,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \Statex
 \Procedure{mark\_must\_abort}{txn}
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{started}, \text{executed}, \text{NULL}\}, \text{must\_abort}}}
+    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{started}, \text{executed}\}, \text{must\_abort}}}
         \State \textbf{return}
     \EndIf
 \EndProcedure
