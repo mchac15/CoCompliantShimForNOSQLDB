@@ -22,7 +22,7 @@ The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) are bounde
 \texttt{txn\_id}s are assigned by the coordinator. It calls \texttt{execute} at most once per \texttt{txn\_id} and sends no \texttt{prepare}/\texttt{commit}/\texttt{abort} for a \texttt{txn\_id} before its \texttt{execute} has been delivered. Garbage collection of transaction state is its responsibility as well: the shim drops a subtransaction from \texttt{transactions\_map} once it is committed or aborted, and later or duplicate messages for that \texttt{txn\_id} find no entry (\texttt{prepare} votes NO, \texttt{commit} and \texttt{abort} are no-ops).
 
 \paragraph{Execution Model.}
-A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade in place, or off the shared node if other readers joined it; if the chain has already moved on past that point, the upgrade cannot be safely spliced in and the subtransaction aborts. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
+A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade: in place if the subtransaction is the sole reader, otherwise onto a new exclusive node behind the readers. An upgrade may move a subtransaction only across readers, never across a writer, since the value it read would be stale by the time its own write takes effect. If a blind writer (one that never read the key) is already queued behind, the new node goes in front of it; if the node behind is itself an upgrade, i.e.\ its holder read the key too, exactly one of the two read-modify-write subtransactions must abort, and it is the later upgrader. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
 
 \paragraph{Architecture.}
 Each participant runs one shim, colocated with its own database. A subtransaction is bound to a single participant's database by definition --- cross-database access is expressed as multiple subtransactions within one Sonata global transaction, coordinated by Sonata's outer 2PC, not by any single subtransaction spanning stores. The shim's \texttt{locks\_map} is therefore scoped to one participant, with a single point of serialization; no cross-node lock coordination is needed within the shim itself.
@@ -40,7 +40,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \State \textbf{Data Structures:}
 \State $\text{lock\_mode} \in \{\text{SHARED}, \text{EXCLUSIVE}\}$
-\State $\text{LockNode}: \{\text{mode}, \text{holders}: \text{set of txn}, \text{predecessor}, \text{next}\}$
+\State $\text{LockNode}: \{\text{mode}, \text{holders}: \text{set of txn}, \text{predecessor}, \text{next}, \text{upgraded}\}$ \Comment{upgraded (default false): the holder read $k$ before writing it; set by \Call{upgrade}{}}
 
 \State $\text{chain}: \{\text{head}, \text{tail}\}$ \Comment{doubly linked through predecessor/next, arrival order $=$ required commit order; last\_node() $=$ tail}
 \State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, chain>}$ \Comment{one chain per key, generations of holders}
@@ -199,20 +199,36 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the latch, as in \Call{lock}{}}
         \EndIf
         \State \indent $node \gets \text{txn.locks\_acquired}[k].\text{target\_node}$
-        \If{$node == \text{locks\_map}[k].\text{last\_node}()$ \textbf{and} $node.\text{holders} == \{txn\}$}
-            \State \indent $\text{locks\_map}[k].\text{last\_node}().\text{mode} = \text{EXCLUSIVE}$ \Comment{case 1: pure in-place upgrade}
+        \State \indent $chain \gets \text{locks\_map}[k]$
+        \State \indent \Comment{an upgrade may move this txn only across readers, never across a writer; what is queued behind node is blocked in \Call{lock}{} until node's holders (this txn included) are executed}
+        \State \indent $p \gets node$
+        \While{$p.\text{next} \neq \text{null}$ \textbf{and} $p.\text{next}.\text{mode} == \text{SHARED}$}
+            \State \indent $p \gets p.\text{next}$ \Comment{readers left by a spliced-out aborted writer}
+        \EndWhile
+        \State \indent $after \gets p.\text{next}$ \Comment{EXCLUSIVE or null}
+        \If{$after \neq \text{null}$ \textbf{and} $after.\text{upgraded}$}
+            \State \indent \Comment{case 3b: its holder read $k$ too (read-modify-write vs read-modify-write): this txn loses, return\_value stays MUST\_ABORT}
+        \ElsIf{$p == node$ \textbf{and} $node.\text{holders} == \{txn\}$}
+            \State \indent $node.\text{mode} \gets \text{EXCLUSIVE}$; $node.\text{upgraded} \gets \text{true}$ \Comment{case 1: in place, at most a blind writer behind}
             \State \indent $\text{txn.locks\_acquired}[k] = (\text{EXCLUSIVE}, node)$
             \State \indent $return\_value \gets \text{UPGRADED}$
-        \ElsIf{$node == \text{locks\_map}[k].\text{last\_node}()$ \textbf{and} $node.\text{holders} \supseteq \{txn\}$}
-            \State \indent $node.\text{holders.remove}(txn)$
-            \State \indent $new\_node \gets \text{LockNode}\{\text{EXCLUSIVE}, \text{holders}=\{txn\}, \text{predecessor}=node, \text{next}=\text{null}\}$
-            \State \indent $node.\text{next} \gets new\_node$
-            \State \indent append $new\_node$ to $\text{locks\_map}[k]$
+        \Else
+            \State \indent $node.\text{holders.remove}(txn)$ \Comment{cases 2, 3a: new node right behind $p$, at the tail or in front of the blind writer $after$}
+            \State \indent $new\_node \gets \text{LockNode}\{\text{EXCLUSIVE}, \text{holders}=\{txn\}, \text{predecessor}=p, \text{next}=after, \text{upgraded}=\text{true}\}$
+            \State \indent $p.\text{next} \gets new\_node$
+            \If{$after \neq \text{null}$}
+                \State \indent $after.\text{predecessor} \gets new\_node$ \Comment{it now also waits for this txn}
+            \Else
+                \State \indent append $new\_node$ to $chain$
+            \EndIf
+            \If{$node.\text{holders}$ is empty} \Comment{only possible when $p \neq node$}
+                \State \indent \textbf{if} $node.\text{predecessor} \neq \text{null}$\textbf{:} $node.\text{predecessor.next} \gets node.\text{next}$
+                \State \indent \textbf{if} $node.\text{next} \neq \text{null}$\textbf{:} $node.\text{next.predecessor} \gets node.\text{predecessor}$
+                \State \indent remove $node$ from $chain$
+            \EndIf
             \State \indent $\text{txn.locks\_acquired}[k] = (\text{EXCLUSIVE}, new\_node)$
             \State \indent $must\_wait \gets \text{true}$
             \State \indent $return\_value \gets \text{UPGRADED}$
-        \Else
-            \State \indent \Comment{case 3: a newer node is queued behind, abort (known limitation)}
         \EndIf
     \}
     \If{$must\_wait$}

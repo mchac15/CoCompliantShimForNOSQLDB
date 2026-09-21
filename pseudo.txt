@@ -1,7 +1,9 @@
 Data Structures:
     lock_mode ∈ {SHARED, EXCLUSIVE}
 
-    LockNode: { mode, holders: set of txn, predecessor, next }
+    LockNode: { mode, holders: set of txn, predecessor, next, upgraded }
+        // upgraded (default false): the holder read k before writing it, i.e. the node was created or
+        // flipped to EXCLUSIVE by upgrade(). A node created by a direct put(k) is a blind write
     chain: { head, tail: LockNode }   // doubly linked through predecessor/next; arrival order = required commit order
         // chain.last_node() = tail. "append n" makes n the new tail (and the head if the chain was empty);
         // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers
@@ -197,27 +199,54 @@ procedure upgrade(k, txn):
             return MUST_ABORT   // re-check under the latch, same reason as in lock()
 
         node = txn.locks_acquired[k].target_node
+        chain = locks_map[k]
 
-        if node == locks_map[k].last_node() and node.holders == {txn}:
-            locks_map[k].last_node().mode = EXCLUSIVE
+        // Invariant: an upgrade may move this txn's position only across readers, never across a writer
+        // (otherwise the value this txn read is stale by the time its own write takes effect).
+        // Everything queued behind node is blocked, not running: its holders wait in lock() until every
+        // holder of node, this txn included, is executed. So what is behind node is either
+        //   - SHARED nodes: only possible after an aborted writer was spliced out of the chain. Their readers
+        //     are crossed: the new node goes behind them (skipped by the loop below);
+        //   - an EXCLUSIVE node with upgraded == false: a blind write that never read k. Ordering it after our
+        //     write is what it wanted anyway, so we go in front of it (it will also wait for us);
+        //   - an EXCLUSIVE node with upgraded == true: its holder read k as well. Going in front of it would
+        //     make it write a value computed from a stale read (lost update): this txn aborts.
+        p = node
+        while p.next != null and p.next.mode == SHARED:
+            p = p.next
+        after = p.next   // EXCLUSIVE or null
+
+        if after != null and after.upgraded:
+            // case 3b: read-modify-write against read-modify-write on k: exactly one of the two upgraders
+            // has to abort, this one loses. return_value stays MUST_ABORT
+            pass
+
+        else if p == node and node.holders == {txn}:
+            // case 1: sole holder, at most a blind writer behind: upgrade in place
+            node.mode = EXCLUSIVE
+            node.upgraded = true
             txn.locks_acquired[k] = (EXCLUSIVE, node)
             return_value = UPGRADED
 
-        else if node == locks_map[k].last_node() and node.holders ⊇ {txn}:
+        else:
+            // cases 2 and 3a: leave node and take a new EXCLUSIVE node right behind p: at the tail if nothing
+            // is behind p (case 2), otherwise in front of the blind writer `after` (case 3a)
             node.holders.remove(txn)
-            new_node = LockNode{EXCLUSIVE, holders={txn}, predecessor=node, next=null}
-            node.next = new_node
-            append new_node to locks_map[k]
+            new_node = LockNode{EXCLUSIVE, holders={txn}, predecessor=p, next=after, upgraded=true}
+            p.next = new_node
+            if after != null:
+                after.predecessor = new_node   // its wait loops re-read predecessor, so it now also waits for us
+            else:
+                append new_node to chain
+            if node.holders is empty:   // only possible when p != node
+                if node.predecessor != null:
+                    node.predecessor.next=node.next
+                if node.next != null:
+                    node.next.predecessor=node.predecessor
+                remove node from chain
             txn.locks_acquired[k] = (EXCLUSIVE, new_node)
             must_wait = true
             return_value = UPGRADED
-
-        else:
-            // case 3: something newer is already queued behind this txn's
-            // shared node (it's no longer the tail). Deliberately aborts
-            // ordinary read-modify-write patterns for now; a known, accepted
-            // limitation (no lock-conversion/queue-jumping support yet),
-            // not a bug in this control flow. return_value stays MUST_ABORT.
     }
 
     if must_wait:
@@ -229,8 +258,8 @@ procedure upgrade(k, txn):
             if pred == null:
                 break
 
-            // pred (== node, the remaining SHARED holders we're queued behind)
-            // can be spliced out from under us while we wait; re-read
+            // pred (the readers we are queued behind) can be spliced out from
+            // under us while we wait; re-read
             // new_node.predecessor under the latch on every iteration instead
             // of trusting a captured reference once resolved
             wait until (∀ t in pred.holders,
