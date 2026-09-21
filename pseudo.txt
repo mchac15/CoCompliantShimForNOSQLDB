@@ -9,7 +9,9 @@ Data Structures:
         // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers
     locks_map: ConcurrentHashMap<key, chain>   // one chain per key, generations of holders
 
-    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
+    txn: { txn_id, ts, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
+        // ts: priority given by the coordinator, smaller = older, kept across retries of the same global txn.
+        // older(a, b) = (a.ts, a.txn_id) < (b.ts, b.txn_id), a total order
     status ∈ {started, executed, prepared, committing, committed, aborted, must_abort}
 
     transactions_map: ConcurrentHashMap<txn_id, txn>
@@ -17,7 +19,8 @@ Data Structures:
     // per-key latches (one at a time) as long as the status re-check in lock()/upgrade() and the update of
     // txn.locks_acquired stay atomic with respect to abort_transaction() reading locks_acquired (e.g. both
     // under a per-txn guard); otherwise a foreign abort_transaction() can miss a node appended concurrently
-    lock_timeout: duration   // bounds every wait of the execution phase (lock(), upgrade()); prepare() has none
+    lock_timeout: duration   // period after which a waiting txn of the execution phase (lock(), upgrade()) checks whether
+                             // it has to give up (deadlock victim, see lock()); prepare() has none
 
 
 Store:
@@ -31,19 +34,22 @@ Store:
         // 2. No crashes: crash recovery is out of scope. The shim is assumed not to crash between
         //    voting YES and the coordinator's decision (nothing is logged, so a crash there would
         //    lose a prepared txn and break 2PC atomicity).
-        // 3. Coordinator: txn_ids are assigned by the coordinator. It calls execute at most once per
+        // 3. Coordinator: txn_ids are assigned by the coordinator, together with a priority ts that it
+        //    keeps when it retries an aborted global txn under a fresh txn_id (so a retried txn only
+        //    gets older). It calls execute at most once per
         //    txn_id and sends no prepare/commit/abort for a txn_id before its execute has been
         //    delivered. Garbage collection of txn state is its responsibility too: the shim drops a txn
         //    from transactions_map once it is committed or aborted, and later or duplicate messages for
         //    that id take the unknown-id branches (prepare votes NO, commit/abort are no-ops).
-        // 4. Deadlocks: only the execution-phase waits (lock(), upgrade()) are bounded, by lock_timeout.
+        // 4. Deadlocks: only the execution-phase waits (lock(), upgrade()) are handled: when a wait exceeds
+        //    lock_timeout, the txn gives up only if it is younger than a txn it is blocked on (see lock()).
         //    The waits in prepare() have no timeout: a cross-shim cycle at prepare (T1 before T2 on one
         //    shim, T2 before T1 on another) is a 2PC-level deadlock, left to the coordinator (e.g. its
         //    vote timeout) and not handled by the shim.
 
 
-procedure execute(txn_id, code):
-    txn = new txn with txn_id, locks_acquired={}, status=started, code=code
+procedure execute(txn_id, ts, code):
+    txn = new txn with txn_id, ts=ts, locks_acquired={}, status=started, code=code
     if transactions_map.putIfAbsent(txn.txn_id, txn) != null
         return FAILED   // txn_id already registered (collision / duplicate)
 
@@ -145,7 +151,7 @@ procedure lock(k, mode, txn):
         txn.locks_acquired[k] = (mode, target_node)
     }
 
-    deadline = now() + lock_timeout   // one deadline for the whole acquisition, not reset by the re-read iterations
+    deadline = now() + lock_timeout   // not reset by the re-read iterations, only renewed when this txn is the oldest it waits for
     loop:
         atomic(locks_map) {
             pred = target_node.predecessor
@@ -175,16 +181,24 @@ procedure lock(k, mode, txn):
 
         if not (∀ t in pred.holders,
                 t.status in {committed, aborted, executed, prepared, committing, must_abort}):
-            // the wait ended on the deadline: assume a deadlock (or a predecessor that never
-            // finishes executing). Always safe: this txn has not executed and voted nothing, so it
-            // just aborts. Costs liveness only, never CO or 2PC atomicity
-            abort_transaction(txn)
-            return MUST_ABORT
+            // the wait ended on the deadline: some holder of pred is still running. Either a deadlock or
+            // just a slow predecessor. Victim policy (wait-die on the timeout): this txn gives up only if it
+            // is younger than a still-running holder it waits for. Always safe: it has not executed and
+            // voted nothing, so it just aborts. Costs liveness only, never CO or 2PC atomicity.
+            // Around a wait-for cycle at least one txn waits for an older one, so a cycle always loses one
+            // member, the youngest waiter, and the oldest txn of the cycle is never the victim (no starvation
+            // as the coordinator keeps ts across retries), instead of every member timing out at once
+            // (and, through the cascade of an EXCLUSIVE holder, dooming each other)
+            if ∃ t in pred.holders with t.status == started and older(t, txn):
+                abort_transaction(txn)
+                return MUST_ABORT
+            deadline = now() + lock_timeout   // oldest of what it waits for: keep waiting
+            continue
 
         break   // pred fully resolved with no abort among its holders
 
     // Deadlocks between running txns (T1 holds X and waits for Y while T2 holds Y and waits for X) are
-    // broken by lock_timeout above; no wait-for graph is kept
+    // broken by the age-based give-up above; no wait-for graph is kept
 
     return LOCK_ACQUIRED
 
@@ -280,12 +294,16 @@ procedure upgrade(k, txn):
 
             if not (∀ t in pred.holders,
                         t.status in {committed, aborted, executed, prepared, committing, must_abort}):
-                abort_transaction(txn)   // deadline reached: same reasoning as in lock()
-                return MUST_ABORT
+                // deadline reached: same victim policy as in lock()
+                if ∃ t in pred.holders with t.status == started and older(t, txn):
+                    abort_transaction(txn)
+                    return MUST_ABORT
+                deadline = now() + lock_timeout
+                continue
 
             break   // pred fully resolved with no abort among its holders
 
-        // the wait above is bounded by lock_timeout, like in lock(): e.g. two readers of the same
+        // the wait above uses the same give-up rule as lock(): e.g. two readers of the same
         // shared node, one upgrading and waiting for the other, which waits on this txn via another key
 
     return return_value
