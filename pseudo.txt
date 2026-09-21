@@ -9,7 +9,9 @@ Data Structures:
         // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers
     locks_map: ConcurrentHashMap<key, chain>   // one chain per key, generations of holders
 
-    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
+    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value, abort_reason }
+        // abort_reason ∈ {NONE, CASCADE, DEADLOCK, RMW_CONFLICT, COORDINATOR, DUPLICATE_ID, UNKNOWN_TXN}, default NONE, set at
+        // most once by set_reason(); NONE on an aborted txn means "unspecified" (e.g. a racing cascade has not written it yet)
     status ∈ {started, executed, prepared, committing, committed, aborted, must_abort}
 
     transactions_map: ConcurrentHashMap<txn_id, txn>
@@ -35,17 +37,28 @@ Store:
         //    txn_id and sends no prepare/commit/abort for a txn_id before its execute has been
         //    delivered. Garbage collection of txn state is its responsibility too: the shim drops a txn
         //    from transactions_map once it is committed or aborted, and later or duplicate messages for
-        //    that id take the unknown-id branches (prepare votes NO, commit/abort are no-ops).
+        //    that id take the unknown-id branches (prepare votes NO, commit/abort are no-ops that are still
+        //    acknowledged, so the coordinator can garbage-collect on the ack).
         // 4. Deadlocks: only the execution-phase waits (lock(), upgrade()) are bounded, by lock_timeout.
         //    The waits in prepare() have no timeout: a cross-shim cycle at prepare (T1 before T2 on one
         //    shim, T2 before T1 on another) is a 2PC-level deadlock, left to the coordinator (e.g. its
         //    vote timeout) and not handled by the shim.
+        // 5. Operations: a subtransaction only issues get(k)/put(k, v) on single records. Not supported: delete
+        //    (an application may put a tombstone value, which the shim treats as any other opaque value), range
+        //    scans / predicate reads (the lock unit is one record, so there is no phantom protection), and null
+        //    values (null is the "no predecessor version" marker in get). There is no read-only vote: a
+        //    read-only subtransaction keeps its SHARED nodes until commit, since CO orders readers against
+        //    writers too.
+
+
+procedure set_reason(txn, reason):
+    CAS(txn.abort_reason, NONE, reason)   // the first reason wins; informational, never read by the protocol itself
 
 
 procedure execute(txn_id, code):
     txn = new txn with txn_id, locks_acquired={}, status=started, code=code
     if transactions_map.putIfAbsent(txn.txn_id, txn) != null
-        return FAILED   // txn_id already registered (collision / duplicate)
+        return FAILED, DUPLICATE_ID   // txn_id already registered (collision / duplicate)
 
 
     execution_failed = false
@@ -62,7 +75,7 @@ procedure execute(txn_id, code):
         // released the locks yet. abort_transaction is idempotent (its CAS fails on an already
         // aborted txn), so always call it here
         abort_transaction(txn)
-        return FAILED
+        return FAILED, txn.abort_reason   // lets the coordinator pick a retry policy (e.g. back off on DEADLOCK)
 
     return SUCCEEDED
 
@@ -167,6 +180,7 @@ procedure lock(k, mode, txn):
             continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
 
         if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
+            set_reason(txn, CASCADE)
             abort_transaction(txn)
             return MUST_ABORT
 
@@ -178,6 +192,7 @@ procedure lock(k, mode, txn):
             // the wait ended on the deadline: assume a deadlock (or a predecessor that never
             // finishes executing). Always safe: this txn has not executed and voted nothing, so it
             // just aborts. Costs liveness only, never CO or 2PC atomicity
+            set_reason(txn, DEADLOCK)
             abort_transaction(txn)
             return MUST_ABORT
 
@@ -219,7 +234,7 @@ procedure upgrade(k, txn):
         if after != null and after.upgraded:
             // case 3b: read-modify-write against read-modify-write on k: exactly one of the two upgraders
             // has to abort, this one loses. return_value stays MUST_ABORT
-            pass
+            set_reason(txn, RMW_CONFLICT)
 
         else if p == node and node.holders == {txn}:
             // case 1: sole holder, at most a blind writer behind: upgrade in place
@@ -272,6 +287,7 @@ procedure upgrade(k, txn):
                 continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
 
             if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
+                set_reason(txn, CASCADE)
                 abort_transaction(txn)
                 return MUST_ABORT
 
@@ -280,6 +296,7 @@ procedure upgrade(k, txn):
 
             if not (∀ t in pred.holders,
                         t.status in {committed, aborted, executed, prepared, committing, must_abort}):
+                set_reason(txn, DEADLOCK)
                 abort_transaction(txn)   // deadline reached: same reasoning as in lock()
                 return MUST_ABORT
 
@@ -296,7 +313,7 @@ procedure prepare(txn_id):
     if txn == null:
         // unknown/already-evicted txn_id: treat as a duplicate/late
         // prepare for a txn that was already resolved and cleaned up
-        send no to 2PC controller
+        send no(UNKNOWN_TXN) to 2PC controller
         return
 
     if txn.status in {prepared, committing, committed}:
@@ -308,7 +325,7 @@ procedure prepare(txn_id):
     if txn.status not in {executed, prepared}:
         // covers the already-aborted case too: cascade abort sets
         // txn.status directly, so no predecessor dereference is needed here
-        send no to 2PC controller
+        send no(txn.abort_reason) to 2PC controller
         abort_transaction(txn)
         return
 
@@ -330,7 +347,7 @@ procedure prepare(txn_id):
             // predecessor while waiting here
 
             if txn.status in {aborted, must_abort}:
-                send no to 2PC controller
+                send no(txn.abort_reason) to 2PC controller
 
                 if txn.status == must_abort:
                     abort_transaction(txn)
@@ -340,8 +357,9 @@ procedure prepare(txn_id):
                 continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
 
             if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
+                set_reason(txn, CASCADE)
                 abort_transaction(txn)
-                send no to 2PC controller
+                send no(txn.abort_reason) to 2PC controller
                 return
 
             break   // pred fully resolved with no abort among its holders
@@ -351,7 +369,7 @@ procedure prepare(txn_id):
         // landed after the wait loop finished) --- the txn never became
         // prepared, so it is always safe to abort it here and release its
         // locks rather than leaking them
-        send no to 2PC controller
+        send no(txn.abort_reason) to 2PC controller
         abort_transaction(txn)
         return
 
@@ -361,7 +379,8 @@ procedure prepare(txn_id):
 procedure commit(txn_id):
     txn = transactions_map[txn_id]
     if txn == null:
-        return   // unknown/already-evicted txn_id: no-op
+        send commit_ack to 2PC controller   // unknown/already-evicted txn_id: nothing to do, but ack (idempotent)
+        return
 
     // committing (not committed) while the store is being written: a coordinator abort can no
     // longer take the txn (abort_transaction's CAS excludes it), and a successor's prepare cannot
@@ -387,6 +406,7 @@ procedure commit(txn_id):
     }
     txn.status=committed
     transactions_map.remove(txn.txn_id)
+    send commit_ack to 2PC controller   // the coordinator may now forget the txn
     // resolved: the volatile state is dropped, nothing in locks_map references the txn anymore.
     // Whatever comes for this txn_id afterwards is handled by the unknown-id branches
     // (assumption 3: the coordinator owns the txn_id lifecycle)
@@ -426,11 +446,16 @@ procedure abort_transaction(txn):
 procedure abort(txn_id):
     txn = transactions_map[txn_id]
     if txn == null:
-        return   // unknown/already-evicted txn_id: no-op, per the
-                 // evicted-id convention documented in abort_transaction()
+        send abort_ack to 2PC controller   // unknown/already-evicted txn_id: no-op, per the
+                                           // evicted-id convention documented in abort_transaction(); still acked
+        return
+    set_reason(txn, COORDINATOR)
     abort_transaction(txn)
+    if txn.status == aborted:
+        send abort_ack to 2PC controller   // no ack if the abort lost against a commit already in progress
 
 
 procedure mark_must_abort(txn):
     if not CAS(txn.status, {started, executed}, must_abort):
         return
+    set_reason(txn, CASCADE)
