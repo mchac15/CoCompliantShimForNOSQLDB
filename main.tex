@@ -25,7 +25,7 @@ The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) are bounde
 A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade: in place if the subtransaction is the sole reader, otherwise onto a new exclusive node behind the readers. An upgrade may move a subtransaction only across readers, never across a writer, since the value it read would be stale by the time its own write takes effect. If a blind writer (one that never read the key) is already queued behind, the new node goes in front of it; if the node behind is itself an upgrade, i.e.\ its holder read the key too, exactly one of the two read-modify-write subtransactions must abort, and it is the later upgrader. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
 
 \paragraph{Architecture.}
-Each participant runs one shim, colocated with its own database. A subtransaction is bound to a single participant's database by definition --- cross-database access is expressed as multiple subtransactions within one Sonata global transaction, coordinated by Sonata's outer 2PC, not by any single subtransaction spanning stores. The shim's \texttt{locks\_map} is therefore scoped to one participant, with a single point of serialization; no cross-node lock coordination is needed within the shim itself.
+Each participant runs one shim, colocated with its own database. A subtransaction is bound to a single participant's database by definition --- cross-database access is expressed as multiple subtransactions within one Sonata global transaction, coordinated by Sonata's outer 2PC, not by any single subtransaction spanning stores. The shim's \texttt{locks\_map} is therefore scoped to one participant, no cross-node lock coordination is needed within the shim itself. Inside the shim there is no global latch: each key's chain has its own latch, a thread holds at most one at a time, and the multi-key procedures (\texttt{commit}, \texttt{abort\_transaction}, \texttt{prepare}) proceed key by key.
 
 \paragraph{Data Model.}
 The shim locks at the granularity of a single record, identified by its primary key $k$; this is the unit \texttt{get}/\texttt{put} and the \texttt{locks\_map} chains operate on. Values are treated as opaque --- the shim does not interpret or type-check them, only serializes access to them via SHARED/EXCLUSIVE locks.
@@ -42,13 +42,15 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State $\text{lock\_mode} \in \{\text{SHARED}, \text{EXCLUSIVE}\}$
 \State $\text{LockNode}: \{\text{mode}, \text{holders}: \text{set of txn}, \text{predecessor}, \text{next}, \text{upgraded}\}$ \Comment{upgraded (default false): the holder read $k$ before writing it; set by \Call{upgrade}{}}
 
-\State $\text{chain}: \{\text{head}, \text{tail}\}$ \Comment{doubly linked through predecessor/next, arrival order $=$ required commit order; last\_node() $=$ tail}
+\State $\text{chain}: \{\text{head}, \text{tail}, \text{latch}, \text{dead}\}$ \Comment{doubly linked through predecessor/next, arrival order $=$ required commit order; last\_node() $=$ tail; latch protects the chain and its nodes; dead is set, under the latch, when the emptied chain is removed from locks\_map}
 \State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, chain>}$ \Comment{one chain per key, generations of holders}
-\State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}\}$
+\State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}, \text{guard}\}$
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}\}$
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
 \State $\text{lock\_timeout}$: duration \Comment{bounds every wait of the execution phase (\Call{lock}{}, \Call{upgrade}{}); prepare has none}
-\State \Comment{atomic(locks\_map) is one critical section; per-key latches are fine if the status re-check and the update of locks\_acquired stay atomic w.r.t. \Call{abort\_transaction}{} reading locks\_acquired}
+\State \Comment{Latching, no global latch: atomic(k) $=$ latch\_chain(k), run the block, release; atomic(txn.guard, k) $=$ take txn.guard, then latch\_chain(k), used where the status re-check and the update of locks\_acquired must be atomic w.r.t. \Call{abort\_transaction}{}}
+\State \Comment{latch\_chain(k): \textbf{loop} $chain \gets \text{locks\_map.computeIfAbsent}(k, \text{new chain})$; latch it; \textbf{if not} $chain.\text{dead}$ return it; else unlatch and retry (the chain was emptied and removed between the lookup and the latch)}
+\State \Comment{Rules: (1) at most one chain latch held at a time; commit, abort\_transaction and prepare's per-key loop go key by key. (2) txn.guard is taken only before a chain latch, and nothing waits for a status while holding a latch or a guard. (3) \Call{mark\_must\_abort}{} only CASes a status and takes no latch, so the cascade may run under a chain latch. (4) an emptied chain is marked dead and removed from locks\_map under its own latch. (5) wait predicates read holders and statuses without a latch: holders is a concurrent set (or read as a snapshot), and every wait re-reads the pointers under the latch. (6) a cascade walks the suffix of one chain under its latch, $O$(chain length) on a hot key}
 
 \Statex
 \State \textbf{Store:} black box NoSQL store, nothing more is assumed than the following
@@ -86,15 +88,13 @@ The shim locks at the granularity of a single record, identified by its primary 
     \EndIf
     \State $actual\_value \gets \text{null}$ \Comment{null $=$ no predecessor version; values are assumed non-null}
     \Statex \Comment{speculative read: nearest EXCLUSIVE node at or before own node; its buffer is final since \Call{lock}{} waits for \texttt{executed}. If none, the writer committed and the store is correct}
-    \State \textbf{atomic}(locks\_map) \{
-    \If{$k \in \text{locks\_map}$}
-        \State $current\_node \gets txn.\text{locks\_acquired}[k].\text{target\_node}$
-        \While{$current\_node \neq \text{null}$ \textbf{and} $current\_node.\text{mode} \neq \text{EXCLUSIVE}$}
-            \State $current\_node \gets current\_node.\text{predecessor}$
-        \EndWhile
-        \If{$current\_node \neq \text{null}$}
-            \State $actual\_value \gets (\text{sole holder of } current\_node).\text{write\_buffer}[k]$
-        \EndIf
+    \State \textbf{atomic}($k$) \{ \Comment{the txn holds a node on $k$, so the chain exists}
+    \State $current\_node \gets txn.\text{locks\_acquired}[k].\text{target\_node}$
+    \While{$current\_node \neq \text{null}$ \textbf{and} $current\_node.\text{mode} \neq \text{EXCLUSIVE}$}
+        \State $current\_node \gets current\_node.\text{predecessor}$
+    \EndWhile
+    \If{$current\_node \neq \text{null}$}
+        \State $actual\_value \gets (\text{sole holder of } current\_node).\text{write\_buffer}[k]$
     \EndIf
     \}
     \If{$actual\_value \neq \text{null}$}
@@ -139,14 +139,11 @@ The shim locks at the granularity of a single record, identified by its primary 
     \ElsIf{$\text{txn.locks\_acquired}[k]$ contains $(\text{SHARED}, *)$ \textbf{and} $mode == \text{EXCLUSIVE}$}
         \State \textbf{return} \Call{upgrade}{k, txn}
     \EndIf
-    \State \textbf{atomic}(locks\_map) \{
+    \State \textbf{atomic}(txn.guard, k) \{
         \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
-            \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the latch: a foreign \Call{abort\_transaction}{} may have released our locks after the check above}
+            \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the guard: a foreign \Call{abort\_transaction}{} may have released our locks after the check above; it snapshots locks\_acquired under the same guard after its CAS, so it sees the node appended below or this check sees the aborted status}
         \EndIf
-        \If{$k \notin \text{locks\_map}$}
-            \State \indent $\text{locks\_map}[k] = \text{new chain}$
-        \EndIf
-        \State \indent $chain \gets \text{locks\_map}[k]$
+        \State \indent $chain \gets \text{locks\_map}[k]$ \Comment{created and latched by latch\_chain(k)}
         \State \indent $last\_node \gets chain.\text{last\_node}()$
         \If{$last\_node == \text{null}$}
             \State \indent $target\_node \gets \text{LockNode}\{mode, \text{holders}=\{txn\}, \text{predecessor}=\text{null}, \text{next}=\text{null}\}$
@@ -163,7 +160,7 @@ The shim locks at the granularity of a single record, identified by its primary 
     \}
     \State $deadline \gets \text{now}() + \text{lock\_timeout}$
     \Loop
-        \State \textbf{atomic}(locks\_map) \{ $pred \gets target\_node.\text{predecessor}$ \}
+        \State \textbf{atomic}($k$) \{ $pred \gets target\_node.\text{predecessor}$ \}
         \If{$pred == \text{null}$}
             \State \textbf{break}
         \EndIf
@@ -194,9 +191,9 @@ The shim locks at the granularity of a single record, identified by its primary 
     \State $must\_wait \gets \text{false}$
     \State $node \gets \text{null}$
     \State $return\_value \gets \text{MUST\_ABORT}$
-    \State \textbf{atomic}(locks\_map) \{
+    \State \textbf{atomic}(txn.guard, k) \{
         \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
-            \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the latch, as in \Call{lock}{}}
+            \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the guard, as in \Call{lock}{}}
         \EndIf
         \State \indent $node \gets \text{txn.locks\_acquired}[k].\text{target\_node}$
         \State \indent $chain \gets \text{locks\_map}[k]$
@@ -234,7 +231,7 @@ The shim locks at the granularity of a single record, identified by its primary 
     \If{$must\_wait$}
         \State $deadline \gets \text{now}() + \text{lock\_timeout}$
         \Loop
-            \State \textbf{atomic}(locks\_map) \{ $pred \gets new\_node.\text{predecessor}$ \}
+            \State \textbf{atomic}($k$) \{ $pred \gets new\_node.\text{predecessor}$ \}
             \If{$pred == \text{null}$}
                 \State \textbf{break}
             \EndIf
@@ -293,7 +290,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 
     \For{\textbf{each} $(k, mode, node) \in \text{txn.locks\_acquired}$}
         \Loop
-            \State \textbf{atomic}(locks\_map) \{ $pred \gets node.\text{predecessor}$ \}
+            \State \textbf{atomic}($k$) \{ $pred \gets node.\text{predecessor}$ \}
             \If{$pred == \text{null}$}
                 \State \textbf{break}
             \EndIf
@@ -340,18 +337,19 @@ The shim locks at the granularity of a single record, identified by its primary 
     \For{\textbf{each} $(key, value) \in txn.\text{write\_buffer}$}
         \State $\text{store.write}(key, value)$
     \EndFor
-    \State \textbf{atomic}(locks\_map) \{
-        \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
+    \State \Comment{key by key, one chain latch at a time: every store.write above is already applied, so a successor that sees this txn gone from one key's chain reads correct data, and it still waits for this txn on the keys where it is still queued}
+    \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
+        \State \textbf{atomic}($k$) \{
             \State \indent $chain \gets \text{locks\_map}[k]$
             \State \indent remove $txn$ from $target\_node.\text{holders}$
             \If{$target\_node.\text{holders}$ is empty}
                 \State \indent\indent \textbf{if} $target\_node.\text{predecessor} \neq \text{null}$\textbf{:} $target\_node.\text{predecessor.next} \gets target\_node.\text{next}$
                 \State \indent\indent \textbf{if} $target\_node.\text{next} \neq \text{null}$\textbf{:} $target\_node.\text{next.predecessor} \gets target\_node.\text{predecessor}$
                 \State \indent\indent remove $target\_node$ from $chain$
-                \State \indent\indent \textbf{if} $chain$ is empty\textbf{:} remove $k$ from $\text{locks\_map}$ \Comment{under the latch}
+                \State \indent\indent \textbf{if} $chain$ is empty\textbf{:} $chain.\text{dead} \gets \text{true}$; remove $k$ from $\text{locks\_map}$ \Comment{under the latch: a concurrent lock sees the chain, or retries in latch\_chain}
             \EndIf
-        \EndFor
-    \}
+        \State \}
+    \EndFor
     \State $\text{txn.status} \gets \text{committed}$
     \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: volatile state dropped; the coordinator owns the txn\_id lifecycle}
 \EndProcedure
@@ -362,8 +360,11 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \textbf{return}
     \EndIf
 
-    \State \textbf{atomic}(locks\_map) \{
-        \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
+    \State \Comment{snapshot under the guard, after the CAS: a concurrent lock/upgrade either finished updating locks\_acquired before (and is in the snapshot) or sees the aborted status under the guard and appends nothing}
+    \State \textbf{atomic}(txn.guard) \{ $held \gets$ copy of $\text{txn.locks\_acquired}$ \}
+    \State \Comment{key by key, one chain latch at a time; the cascade of a key still runs before this txn is spliced out of that key's chain}
+    \For{\textbf{each} $(k, mode, target\_node) \in held$}
+        \State \textbf{atomic}($k$) \{
             \State \indent $chain \gets \text{locks\_map}[k]$
             \If{$mode == \text{EXCLUSIVE}$}
                 \State \indent\indent $successor\_node \gets target\_node.\text{next}$
@@ -377,10 +378,10 @@ The shim locks at the granularity of a single record, identified by its primary 
                 \State \indent\indent \textbf{if} $target\_node.\text{predecessor} \neq \text{null}$\textbf{:} $target\_node.\text{predecessor.next} \gets target\_node.\text{next}$
                 \State \indent\indent \textbf{if} $target\_node.\text{next} \neq \text{null}$\textbf{:} $target\_node.\text{next.predecessor} \gets target\_node.\text{predecessor}$
                 \State \indent\indent remove $target\_node$ from $chain$
-                \State \indent\indent \textbf{if} $chain$ is empty\textbf{:} remove $k$ from $\text{locks\_map}$
+                \State \indent\indent \textbf{if} $chain$ is empty\textbf{:} $chain.\text{dead} \gets \text{true}$; remove $k$ from $\text{locks\_map}$
             \EndIf
-        \EndFor
-    \}
+        \State \}
+    \EndFor
     \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: evicted like in \Call{commit}{}}
 \EndProcedure
 

@@ -4,19 +4,32 @@ Data Structures:
     LockNode: { mode, holders: set of txn, predecessor, next, upgraded }
         // upgraded (default false): the holder read k before writing it, i.e. the node was created or
         // flipped to EXCLUSIVE by upgrade(). A node created by a direct put(k) is a blind write
-    chain: { head, tail: LockNode }   // doubly linked through predecessor/next; arrival order = required commit order
+    chain: { head, tail: LockNode, latch, dead }   // doubly linked through predecessor/next; arrival order = required commit order
         // chain.last_node() = tail. "append n" makes n the new tail (and the head if the chain was empty);
-        // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers
+        // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers.
+        // latch protects the chain and the fields of its nodes; dead (default false) is set, under the latch, when
+        // the emptied chain is removed from locks_map
     locks_map: ConcurrentHashMap<key, chain>   // one chain per key, generations of holders
 
-    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
+    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value, guard }
     status ∈ {started, executed, prepared, committing, committed, aborted, must_abort}
 
     transactions_map: ConcurrentHashMap<txn_id, txn>
-    // atomic(locks_map) { ... } is one critical section over the chains. An implementation may use
-    // per-key latches (one at a time) as long as the status re-check in lock()/upgrade() and the update of
-    // txn.locks_acquired stay atomic with respect to abort_transaction() reading locks_acquired (e.g. both
-    // under a per-txn guard); otherwise a foreign abort_transaction() can miss a node appended concurrently
+    // Latching. There is no global latch:
+    //   atomic(k) { ... }          = latch_chain(k), run the block, release the chain latch of key k
+    //   atomic(txn.guard, k) { ... } = take txn.guard, then latch_chain(k); used where the status re-check and the
+    //                                update of txn.locks_acquired must be atomic w.r.t. abort_transaction()
+    //   latch_chain(k): loop { chain = locks_map.computeIfAbsent(k, new chain); latch chain;
+    //                          if not chain.dead: return chain; else unlatch (the chain was emptied and removed
+    //                          between the map lookup and the latch: retry) }
+    // Rules: (1) a thread holds at most one chain latch at a time; multi-key work (commit, abort_transaction, the
+    // per-key loop of prepare) goes key by key and releases in between. (2) txn.guard is only ever taken before a
+    // chain latch, never while holding one, and nothing waits for a status while holding a latch or a guard.
+    // (3) mark_must_abort only CASes a status and takes no latch, so the cascade may run under a chain latch.
+    // (4) a chain is removed from locks_map, and marked dead, under its own latch when it becomes empty.
+    // (5) the wait predicates read pred.holders and statuses without a latch: holders must be a concurrent set
+    // (or be read as a snapshot), and every wait re-reads the pointers under the latch as it already does.
+    // (6) a cascade walks the suffix of one chain under that chain's latch, so it is O(chain length) on a hot key
     lock_timeout: duration   // bounds every wait of the execution phase (lock(), upgrade()); prepare() has none
 
 
@@ -82,13 +95,12 @@ procedure get(k, txn):
     // executed, so its buffer is final. If the writer already committed, its
     // buffer was applied to the store before its node was spliced out of the
     // chain, so no such node is found and reading the store is correct.
-    atomic(locks_map) {
-        if k in locks_map:
-            current_node=txn.locks_acquired[k].target_node
-            while current_node!=null and current_node.mode!=EXCLUSIVE:
-                current_node=current_node.predecessor
-            if current_node!=null:
-                actual_value=(the sole holder of current_node).write_buffer[k]   // an EXCLUSIVE node has one holder
+    atomic(k) {   // the txn holds a node on k, so the chain exists
+        current_node=txn.locks_acquired[k].target_node
+        while current_node!=null and current_node.mode!=EXCLUSIVE:
+            current_node=current_node.predecessor
+        if current_node!=null:
+            actual_value=(the sole holder of current_node).write_buffer[k]   // an EXCLUSIVE node has one holder
     }
     if actual_value!=null:
         return actual_value, SUCCEEDED
@@ -118,17 +130,16 @@ procedure lock(k, mode, txn):
     else if txn.locks_acquired[k] contains (SHARED, *) and mode == EXCLUSIVE:
         return upgrade(k, txn)
 
-    atomic(locks_map) {
+    atomic(txn.guard, k) {
         if txn.status in {aborted, must_abort}:
-            // re-check under the latch: a foreign abort_transaction() (coordinator abort(), or
+            // re-check under the guard: a foreign abort_transaction() (coordinator abort(), or
             // prepare() on a txn that is still started) may have released this txn's locks after
-            // the check at the top. Appending a node now would leave one nobody ever removes
+            // the check at the top. Appending a node now would leave one nobody ever removes.
+            // abort_transaction() snapshots locks_acquired under the same guard after its CAS, so it
+            // either sees the node appended below or this check sees the aborted status
             return MUST_ABORT
 
-        if k not in locks_map:
-            locks_map[k] = new chain
-
-        chain = locks_map[k]
+        chain = locks_map[k]   // created and latched by latch_chain(k)
         last_node = chain.last_node()
 
         if last_node == null:
@@ -147,7 +158,7 @@ procedure lock(k, mode, txn):
 
     deadline = now() + lock_timeout   // one deadline for the whole acquisition, not reset by the re-read iterations
     loop:
-        atomic(locks_map) {
+        atomic(k) {
             pred = target_node.predecessor
         }
         if pred == null:
@@ -194,9 +205,9 @@ procedure upgrade(k, txn):
     node = null
     return_value=MUST_ABORT
 
-    atomic(locks_map) {
+    atomic(txn.guard, k) {
         if txn.status in {aborted, must_abort}:
-            return MUST_ABORT   // re-check under the latch, same reason as in lock()
+            return MUST_ABORT   // re-check under the guard, same reason as in lock()
 
         node = txn.locks_acquired[k].target_node
         chain = locks_map[k]
@@ -252,7 +263,7 @@ procedure upgrade(k, txn):
     if must_wait:
         deadline = now() + lock_timeout
         loop:
-            atomic(locks_map) {
+            atomic(k) {
                 pred = new_node.predecessor
             }
             if pred == null:
@@ -314,7 +325,7 @@ procedure prepare(txn_id):
 
     for each (k, mode, node) in txn.locks_acquired:
         loop:
-            atomic(locks_map) {
+            atomic(k) {
                 pred = node.predecessor
             }
             if pred == null:
@@ -372,8 +383,11 @@ procedure commit(txn_id):
     for (key,value) in txn.write_buffer:
         store.write(key, value)
 
-    atomic(locks_map) {
-        for each (k, mode, target_node) in txn.locks_acquired:
+    // key by key, one chain latch at a time. Every store.write above is already applied, so a successor
+    // that sees this txn gone from one key's chain reads correct data, and it still waits for this txn on
+    // the keys where it is still queued
+    for each (k, mode, target_node) in txn.locks_acquired:
+        atomic(k) {
             chain = locks_map[k]
             remove txn from target_node.holders
             if target_node.holders is empty:
@@ -383,8 +397,9 @@ procedure commit(txn_id):
                     target_node.next.predecessor=target_node.predecessor
                 remove target_node from chain
                 if chain is empty:
-                    remove k from locks_map   // under the latch: a concurrent lock(k) sees the chain or none
-    }
+                    chain.dead = true
+                    remove k from locks_map   // under the latch: a concurrent lock(k) sees the chain, or retries in latch_chain
+        }
     txn.status=committed
     transactions_map.remove(txn.txn_id)
     // resolved: the volatile state is dropped, nothing in locks_map references the txn anymore.
@@ -396,8 +411,15 @@ procedure abort_transaction(txn):
     if not CAS(txn.status, {executed, prepared, must_abort, started}, aborted):
         return
 
-    atomic(locks_map) {
-        for each (k, mode, target_node) in txn.locks_acquired:
+    // snapshot under the guard, after the CAS above: a concurrent lock()/upgrade() either finished updating
+    // locks_acquired before (and is in the snapshot) or sees the aborted status under the guard and appends nothing
+    atomic(txn.guard) {
+        held = copy of txn.locks_acquired
+    }
+    // key by key, one chain latch at a time. The cascade of a key still runs before this txn is spliced
+    // out of that key's chain, which is what the cascade-before-splice invariant needs
+    for each (k, mode, target_node) in held:
+        atomic(k) {
             chain = locks_map[k]
 
             if mode == EXCLUSIVE:
@@ -415,9 +437,9 @@ procedure abort_transaction(txn):
                     target_node.next.predecessor=target_node.predecessor
                 remove target_node from chain
                 if chain is empty:
+                    chain.dead = true
                     remove k from locks_map   // same conditional removal as in commit()
-    }
-
+        }
 
     transactions_map.remove(txn.txn_id)
     // resolved: evicted like in commit(). Successors observe txn.status directly (they hold a
