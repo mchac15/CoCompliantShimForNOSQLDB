@@ -23,7 +23,7 @@ Each participant runs one shim, colocated with its own database. A subtransactio
 
 \paragraph{Data Model.}
 The shim locks at the granularity of a single record, identified by its primary key $k$; this is the unit \texttt{get}/\texttt{put} and the \texttt{locks\_map} chains operate on. Values are treated as opaque --- the shim does not interpret or type-check them, only serializes access to them via SHARED/EXCLUSIVE locks.
-
+\newpage
 \vspace{1em}
 
 \begingroup
@@ -35,50 +35,38 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State \textbf{Data Structures:}
 \State $\text{lock\_mode} \in \{\text{SHARED}, \text{EXCLUSIVE}\}$
 \State $\text{LockNode}: \{\text{mode}, \text{holders}: \text{set of txn}, \text{predecessor}, \text{next}\}$
-\Comment{TODO: integrate this data structure}
-\State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, LinkedList<LockNode>>}$
 
 \State $\text{locks\_map}: \text{key} \to \text{chain (linked list of LockNode)}$ \Comment{one chain per key, generations of holders}
 \State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}\}$
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}, \text{NULL}\}$
 \State \Comment{TODO: intermediate states for retry mechanism}
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
-\State $\text{recovering}: \text{boolean} = \text{true}$ \Comment{true from process start until \Call{recover}{} has resolved every in-doubt txn; gates \Call{execute}{}}
-\State $\text{loaded}: \text{boolean} = \text{false}$ \Comment{false from process start until \Call{recover}{} has finished step (c) (all in-doubt txns are back in transactions\_map); gates prepare/commit/abort}
-\State \Comment{Both flags are initialised to their closed values at process start, before any message handler can run, so there is no window in which a call sees an open gate on an empty transactions\_map. \Call{recover}{} only opens them: on a fresh empty log it sets loaded = true right after step (c) and recovering = false immediately.}
+\State $\text{recovering}: \text{boolean} = \text{true}$ \Comment{true until \Call{recover}{} has resolved every in-doubt txn; gates \Call{execute}{}}
+\State $\text{loaded}: \text{boolean} = \text{false}$ \Comment{false until \Call{recover}{} has restored the in-doubt txns; gates prepare/commit/abort}
 
 \Statex
 \State \textbf{Durability Interfaces:}
-\State \Comment{the log record set is the only durable state; transactions\_map and locks\_map are volatile and lost on a crash. Only prepared transactions are ever logged (presumed abort)}
+\State \Comment{the log is the only durable state (volatile maps are lost on a crash); only prepared txns are logged (presumed abort)}
 \State \textbf{Log:} single append-only file
 \State \Call{log.append}{record, force}
-\Comment{force = true: returns only once the record is on stable storage (earlier records are then durable too); force = false: may be lost on a crash}
-\State \Call{log.scan}{} $\to$ ordered list of records \Comment{in append order, up to the last durable record}
+\Comment{force = true: durable on return}
+\State \Call{log.scan}{} $\to$ ordered list of records
 \State \Comment{TODO: log.truncate() --- checkpointing / dropping records of finished txns}
 \State $\text{record} \in \{$
 \State \quad PREPARED$\{\text{txn\_id}, \text{write\_buffer}\}$ \Comment{forced, before sending YES}
 \State \quad COMMIT$\{\text{txn\_id}\}$ \Comment{forced, before applying write\_buffer to the store}
-\State \quad DONE$\{\text{txn\_id}\}$ \Comment{forced, after the store writes and \Call{store.sync}{}, before locks are released}
-\State \quad ABORT$\{\text{txn\_id}\}$ \Comment{NOT forced, only for txns that were prepared}
+\State \quad DONE$\{\text{txn\_id}\}$ \Comment{forced, after \Call{store.sync}{}, before locks are released}
+\State \quad ABORT$\{\text{txn\_id}\}$ \Comment{NOT forced, only for prepared txns; a lost ABORT leaves the txn in-doubt}
 \State $\}$
-\State \Comment{no records for started / executed / aborting txns: they are aborted implicitly on a crash. A lost ABORT only makes the txn in-doubt again, the coordinator re-sends abort}
-\State \Comment{DONE is forced before lock release: a successor cannot prepare until its predecessor is committed, so after a crash the txns with COMMIT but no DONE never conflict with each other and their redo order does not matter}
+\State \Comment{DONE is forced before lock release, so txns with COMMIT but no DONE never conflict and their redo order is irrelevant}
 \State \textbf{Store:} black box NoSQL store, nothing more is assumed than the following
 \State \Call{store.read}{k} $\to$ value
-\State \Call{store.write}{k, v} \Comment{blind put: idempotent, so safe to redo; no atomicity across keys assumed}
-\State \Call{store.sync}{} \Comment{returns once all previous writes are durable; no-op if the store is durable on return}
-\State \Comment{the coordinator is out of scope: after recovery, in-doubt txns (prepared, undecided) wait for an external commit(txn\_id) / abort(txn\_id) call}
-\State \textbf{Assumptions:}
-\State \Comment{1. Blocking semantics: \Call{log.append}{}, \Call{store.write}{} and \Call{store.sync}{} are blocking. If one fails it is simply retried / blocked until it succeeds, so the protocol has no error path for log or store failures. A txn that cannot force PREPARED just blocks: it never votes YES without a durable record}
-\State \Comment{2. Torn records: an incomplete or corrupt record at the tail of the log (crash mid-append) is discarded entirely by \Call{log.scan}{}, as if it had never been written (records are self-delimiting / checksummed). Since only forced records are ever relied on, discarding a torn tail is safe}
-\State \Comment{3. Log truncation is out of scope for now: the log only grows and \Call{recover}{} scans all of it (see the TODO: log.truncate() above)}
-\State \Comment{4. txn\_ids are never reused: a txn\_id that appears in the log (or was ever executed) is never sent to \Call{execute}{} again, so a re-executed finished txn cannot occur after recovery}
-\State \Comment{5. Duplicate PREPARED records: a txn\_id may have more than one PREPARED record in the log (a retried / duplicate prepare forces the record again). All copies carry the identical write\_buffer (final once the txn is executed), so recovery treats them as one}
+\State \Call{store.write}{k, v} \Comment{blind put: idempotent, safe to redo}
+\State \Call{store.sync}{} \Comment{returns once all previous writes are durable}
 
 \Statex
 \Procedure{execute}{code}
     \If{$\text{recovering}$}
-        \State \Comment{block-mode recovery: no new work is accepted until every in-doubt txn has been resolved (see \Call{recover}{}); the coordinator will retry/abort this subtransaction}
         \State \textbf{return} FAILED
     \EndIf
     \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{code}=code$
@@ -90,7 +78,6 @@ The shim locks at the granularity of a single record, identified by its primary 
     \If{during execution, return value of get/put is FAILED}
         \State stop execution and set $execution\_failed \gets \text{true}$
     \EndIf
-    \State \Comment{may block inside a get/put on a predecessor; a FAILED result requires the handler to stop calling get/put and return immediately}
     \If{$execution\_failed$ \textbf{or not} \Call{CAS}{txn.\text{status}, \text{started}, \text{executed}}}
         \State \textbf{return} FAILED
     \EndIf
@@ -105,7 +92,7 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \textbf{return NULL, FAILED}
     \EndIf
     \State $actual\_value \gets \text{null}$
-    \Statex \Comment{speculative read: nearest EXCLUSIVE node at or before txn's own node (never a successor's). Safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}, so its buffer is final; if the writer already committed, its buffer was applied to the store before its node was spliced out, so reading the store is correct}
+    \Statex \Comment{speculative read: nearest EXCLUSIVE node at or before own node; its buffer is final since \Call{lock}{} waits for \texttt{executed}. If none, the writer committed and the store is correct}
     \State \textbf{atomic}(locks\_map) \{
     \If{$k \in \text{locks\_map}$}
         \State $current\_node \gets txn.\text{locks\_acquired}[k].\text{target\_node}$
@@ -140,7 +127,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 \vspace{2pt}\hrule
 \endgroup
 \bigskip
-
+\newpage
 \begingroup
 \refstepcounter{algorithm}
 \noindent\textbf{Algorithm~\thealgorithm}\ \ Two-Phase Commit Transactional Lock Manager (Part 2: Access \& Locking)\par\nopagebreak\vspace{2pt}\hrule\vspace{2pt}
@@ -185,10 +172,10 @@ The shim locks at the granularity of a single record, identified by its primary 
         \If{$pred == \text{null}$}
             \State \textbf{break}
         \EndIf
-        \State \Comment{pred can be spliced out from under us (by commit()/abort\_transaction() on one of its holders) while we wait; re-read target\_node.predecessor under the latch on every iteration instead of trusting this captured reference once resolved}
+        \State \Comment{pred may be spliced out while waiting: re-read it under the latch each iteration}
         \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq target\_node.\text{predecessor}$
         \If{$pred \neq target\_node.\text{predecessor}$}
-            \State \textbf{continue} \Comment{pred was spliced out mid-wait; loop back and re-read fresh under the latch}
+            \State \textbf{continue} \Comment{pred spliced out mid-wait, re-read}
         \EndIf
         \If{$\exists t \in pred.\text{holders}$ with $t.\text{status} == \text{aborted}$ \textbf{or} $t.\text{status} == \text{must\_abort}$}
             \State \Call{abort\_transaction}{txn}
@@ -197,9 +184,9 @@ The shim locks at the granularity of a single record, identified by its primary 
         \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
             \State \textbf{return} MUST\_ABORT
         \EndIf
-        \State \textbf{break} \Comment{pred fully resolved with no abort among its holders}
+        \State \textbf{break}
     \EndLoop
-    \State \Comment{TODO: no deadlock detection yet --- this wait is unbounded and can deadlock against another txn waiting on this one; accepted for now, to be addressed later}
+    \State \Comment{TODO: no deadlock detection, this wait is unbounded}
     \State \textbf{return} LOCK\_ACQUIRED
 \EndProcedure
 
@@ -223,7 +210,7 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State \indent $must\_wait \gets \text{true}$
             \State \indent $return\_value \gets \text{UPGRADED}$
         \Else
-            \State \indent \Comment{case 3: something newer already queued behind this txn's shared node (it's no longer the tail). Deliberately aborts ordinary read-modify-write patterns for now; a known, accepted limitation (no lock-conversion/queue-jumping support yet), not a bug in this control flow. return\_value stays MUST\_ABORT.}
+            \State \indent \Comment{case 3: a newer node is queued behind, abort (known limitation)}
         \EndIf
     \}
     \If{$must\_wait$}
@@ -232,10 +219,10 @@ The shim locks at the granularity of a single record, identified by its primary 
             \If{$pred == \text{null}$}
                 \State \textbf{break}
             \EndIf
-            \State \Comment{pred (== node, the remaining SHARED holders we're queued behind) can be spliced out from under us while we wait; re-read new\_node.predecessor under the latch on every iteration instead of trusting a captured reference once resolved}
+            \State \Comment{same re-read of the predecessor as in \Call{lock}{}}
             \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq new\_node.\text{predecessor}$
             \If{$pred \neq new\_node.\text{predecessor}$}
-                \State \textbf{continue} \Comment{pred was spliced out mid-wait; loop back and re-read fresh under the latch}
+                \State \textbf{continue}
             \EndIf
             \If{$\exists t \in pred.\text{holders}$ with $t.\text{status} == \text{aborted}$ \textbf{or} $t.\text{status} == \text{must\_abort}$}
                 \State \Call{abort\_transaction}{txn}
@@ -244,9 +231,9 @@ The shim locks at the granularity of a single record, identified by its primary 
             \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
                 \State \textbf{return} MUST\_ABORT
             \EndIf
-            \State \textbf{break} \Comment{pred fully resolved with no abort among its holders}
+            \State \textbf{break}
         \EndLoop
-        \State \Comment{TODO: same unbounded-wait / no-deadlock-detection caveat as in \Call{lock}{}}
+        \State \Comment{TODO: same unbounded wait as in \Call{lock}{}}
     \EndIf
     \State \textbf{return} $return\_value$
 \EndProcedure
@@ -255,7 +242,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 \vspace{2pt}\hrule
 \endgroup
 \bigskip
-
+\newpage
 \begingroup
 \refstepcounter{algorithm}
 \noindent\textbf{Algorithm~\thealgorithm}\ \ Two-Phase Commit Transactional Lock Manager (Part 3: Commit Protocol)\par\nopagebreak\vspace{2pt}\hrule\vspace{2pt}
@@ -263,20 +250,20 @@ The shim locks at the granularity of a single record, identified by its primary 
 \begin{algorithmic}[1]
 
 \Procedure{prepare}{txn\_id}
-    \State \textbf{wait until} $\text{loaded}$ \Comment{2PC messages from the coordinator are held back until the recovered state is in transactions\_map, so an in-doubt txn is never mistaken for an unknown/evicted id}
+    \State \textbf{wait until} $\text{loaded}$ \Comment{held until recovered state is loaded}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
-        \State \Comment{unknown/already-evicted txn\_id: treat as a duplicate/late prepare for a txn that was already resolved and cleaned up}
+        \State \Comment{unknown txn\_id: late/duplicate prepare of a resolved txn}
         \State \textbf{Send no to 2PC controller}
         \State \textbf{return}
     \EndIf
     \If{$txn.\text{status} == \text{committed}$}
-        \State \Comment{duplicate/late prepare after commit already happened: nothing to abort, txn is already resolved the other way}
+        \State \Comment{duplicate/late prepare after commit}
         \State \textbf{Send no to 2PC controller}
         \State \textbf{return}
     \EndIf
     \If{$txn.\text{status} \notin \{\text{executed}, \text{prepared}\}$}
-        \State \Comment{covers the already-aborted case too: cascade abort sets txn.status directly, so no predecessor dereference is needed here}
+        \State \Comment{covers aborted and must\_abort}
         \State \textbf{Send no to 2PC controller}
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return}
@@ -288,9 +275,8 @@ The shim locks at the granularity of a single record, identified by its primary 
             \If{$pred == \text{null}$}
                 \State \textbf{break}
             \EndIf
-            \State \Comment{pred can be spliced out from under us while we wait; re-read node.predecessor under the latch on every iteration instead of trusting this captured reference once resolved}
             \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq node.\text{predecessor}$
-            \State \Comment{txn may have been cascade-aborted by a different key's predecessor while waiting here}
+            \State \Comment{may have been cascade-aborted via another key}
             \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
                 \State \textbf{Send no to 2PC controller}
                 \If{$\text{txn.status} == \text{must\_abort}$}
@@ -299,31 +285,31 @@ The shim locks at the granularity of a single record, identified by its primary 
                 \State \textbf{return}
             \EndIf
             \If{$pred \neq node.\text{predecessor}$}
-                \State \textbf{continue} \Comment{pred was spliced out mid-wait; loop back and re-read fresh under the latch}
+                \State \textbf{continue}
             \EndIf
             \If{$\exists t \in pred.\text{holders}$ with $t.\text{status} == \text{aborted}$ \textbf{or} $t.\text{status} == \text{must\_abort}$}
                 \State \Call{abort\_transaction}{txn}
                 \State \textbf{Send no to 2PC controller}
                 \State \textbf{return}
             \EndIf
-            \State \textbf{break} \Comment{pred fully resolved with no abort among its holders}
+            \State \textbf{break}
         \EndLoop
     \EndFor
 
     \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared}}
-        \State \Comment{status moved out from under us (e.g. a late cascade mark\_must\_abort landed after the wait loop finished) --- the txn never became prepared, so it is always safe to abort it here and release its locks rather than leaking them}
+        \State \Comment{late cascade mark: the txn never prepared, so abort it and release its locks}
         \State \textbf{Send no to 2PC controller}
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return}
     \EndIf
-    \State \Comment{CAS to prepared BEFORE forcing the record: a crash between the CAS and the force leaves no PREPARED record, so recovery presumes abort, and that is safe because the coordinator never saw a YES. Every call forces, including duplicate/concurrent prepares: a duplicate may arrive while the first call's force is still in flight, and a YES must never leave before a durable PREPARED record. Re-forcing a durable record is cheap and a second identical PREPARED record for the same txn\_id is harmless (write\_buffer is final once executed; recover() keys records by txn\_id).}
+    \State \Comment{CAS before force: a crash in between leaves no record, so presumed abort (safe: no YES was sent). Every call forces, so a YES never precedes a durable PREPARED record}
     \State $\text{log.append}(\text{PREPARED}\{txn\_id, txn.\text{write\_buffer}\}, \text{force}=\text{true})$
     \State \textbf{Send yes to 2PC controller}
 \EndProcedure
 
 \Statex
 \Procedure{commit}{txn\_id}
-    \State \textbf{wait until} $\text{loaded}$ \Comment{2PC messages from the coordinator are held back until the recovered state is in transactions\_map, so an in-doubt txn is never mistaken for an unknown/evicted id}
+    \State \textbf{wait until} $\text{loaded}$ \Comment{held until recovered state is loaded}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
         \State \textbf{return} \Comment{unknown/already-evicted txn\_id: no-op}
@@ -332,14 +318,13 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \textbf{return}
     \EndIf
     \State $\text{log.append}(\text{COMMIT}\{txn\_id\}, \text{force}=\text{true})$ \Comment{the decision is durable before anything touches the store}
-    \State \Comment{redo: blind puts, idempotent, so recovery may safely repeat them}
     \For{\textbf{each} $(key, value) \in txn.\text{write\_buffer}$}
         \State $\text{store.write}(key, value)$
     \EndFor
     \State $\text{store.sync}()$
-    \State \Comment{DONE is forced BEFORE the locks are released: a successor on any of these keys cannot prepare until this txn has left the chain, i.e. until its DONE is durable. So after a crash the txns with COMMIT but no DONE never conflict with each other, and redo order does not matter (redoing this txn can never overwrite the value of a later committed successor).}
+    \State \Comment{DONE is forced before locks are released, so redo order of COMMIT-without-DONE txns is irrelevant}
     \State $\text{log.append}(\text{DONE}\{txn\_id\}, \text{force}=\text{true})$
-    \State \Comment{a txn recovered as in-doubt has locks\_acquired = \{\}, so this block is a no-op for it}
+    \State \Comment{no-op for a recovered in-doubt txn (locks\_acquired is empty)}
     \State \textbf{atomic}(locks\_map) \{
         \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
             \State \indent remove $txn$ from $target\_node.\text{holders}$
@@ -351,7 +336,6 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndFor
     \}
     \State $\text{txn.status} \gets \text{committed}$
-    \State \Comment{safe to evict txn from any external txn-id registry after this point --- nothing in locks\_map references it anymore}
 \EndProcedure
 
 \Statex
@@ -361,7 +345,7 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \textbf{return}
     \EndIf
     \If{$prev\_status == \text{prepared}$}
-        \State \Comment{presumed abort: only a txn that voted YES has a PREPARED record, so only then is there anything to record; every other txn leaves no trace. Not forced: if this record is lost the txn is in-doubt again after recovery and the coordinator re-sends abort. Its locks are already gone by then (recovery does not rebuild locks\_map), so the retry costs nothing.}
+        \State \Comment{presumed abort: only a prepared txn has a PREPARED record. Not forced, a lost ABORT leaves the txn in-doubt and the coordinator re-sends abort}
         \State \indent $\text{log.append}(\text{ABORT}\{txn.\text{txn\_id}\}, \text{force}=\text{false})$
     \EndIf
 
@@ -386,15 +370,14 @@ The shim locks at the granularity of a single record, identified by its primary 
             \EndIf
         \EndFor
     \}
-    \State \Comment{safe to evict txn from any external txn-id registry after this point --- status is already set for any successor to observe directly, and a duplicate/late message for an evicted id can be treated as a no-op abort}
 \EndProcedure
 
 \Statex
 \Procedure{abort}{txn\_id}
-    \State \textbf{wait until} $\text{loaded}$ \Comment{2PC messages from the coordinator are held back until the recovered state is in transactions\_map, so an in-doubt txn is never mistaken for an unknown/evicted id}
+    \State \textbf{wait until} $\text{loaded}$ \Comment{held until recovered state is loaded}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
-        \State \textbf{return} \Comment{unknown/already-evicted txn\_id: no-op, per the evicted-id convention documented in \Call{abort\_transaction}{}}
+        \State \textbf{return} \Comment{unknown txn\_id: no-op}
     \EndIf
     \State \Call{abort\_transaction}{txn}
 \EndProcedure
@@ -410,7 +393,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 \vspace{2pt}\hrule
 \endgroup
 \bigskip
-
+\newpage
 \begingroup
 \refstepcounter{algorithm}
 \noindent\textbf{Algorithm~\thealgorithm}\ \ Two-Phase Commit Transactional Lock Manager (Part 4: Crash Recovery)\par\nopagebreak\vspace{2pt}\hrule\vspace{2pt}
@@ -418,12 +401,11 @@ The shim locks at the granularity of a single record, identified by its primary 
 \begin{algorithmic}[1]
 
 \Procedure{recover}{}
-    \State \Comment{runs once on restart, before serving anything: transactions\_map and locks\_map are empty (volatile state was lost) recovering is true and loaded is false. \Call{execute}{} is gated by recovering until the very end; prepare/commit/abort are gated by loaded: they are held until step (c) has put every in-doubt txn back in transactions\_map, and are served from then on, while \Call{recover}{} waits for the coordinator's decisions}
-    \State \Comment{recovering = true and loaded = false already hold from process start (see Data Structures), so they are not set here: setting them at this point would leave a window where a call arrives before they are closed}
+    \State \Comment{runs once on restart with empty volatile state; recovering $=$ true and loaded $=$ false since process start. \Call{execute}{} waits on recovering, prepare/commit/abort on loaded}
     \State $prepared \gets \{\}$ \Comment{txn\_id $\to$ write\_buffer, from PREPARED records}
     \State $committed \gets \{\}$ \Comment{txn\_ids with a COMMIT record}
     \State $resolved \gets \{\}$ \Comment{txn\_ids with a DONE or ABORT record}
-    \For{\textbf{each} $record \in \Call{log.scan}{}$} \Comment{in log order}
+    \For{\textbf{each} $record \in \Call{log.scan}{}$}
         \If{$record$ is PREPARED}
             \State $prepared[record.\text{txn\_id}] \gets record.\text{write\_buffer}$
         \EndIf
@@ -434,9 +416,8 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State $resolved.\text{add}(record.\text{txn\_id})$
         \EndIf
     \EndFor
-    \State \Comment{a COMMIT record is only ever appended after a forced PREPARED for the same txn\_id, so a COMMIT without a PREPARED cannot be found in the log}
-    \State \Comment{(a) resolved (DONE or ABORT): nothing to do, ignored below. Presumed abort: txns that never prepared (started/executed/aborting) wrote no log record, are absent from $prepared$, and are implicitly aborted}
-    \State \Comment{(b) committed-not-done (COMMIT, no DONE): redo. These txns are pairwise conflict-free: \Call{commit}{} forces DONE before it releases its locks, and a successor on a shared key can only pass its prepare-time wait (predecessor committed) after that release, so it cannot have a COMMIT record while its predecessor lacks DONE. Hence redo order does not matter. Redo is safe to repeat (also if we crash again during recovery) because store.write is an idempotent blind put and DONE is only appended after the writes are synced}
+    \State \Comment{(a) DONE/ABORT: ignored. Txns that never prepared left no record and are implicitly aborted}
+    \State \Comment{(b) COMMIT without DONE: redo. Pairwise conflict-free, so order is irrelevant; safe to repeat (idempotent puts, DONE appended after sync)}
     \For{\textbf{each} $txn\_id \in committed$}
         \If{$txn\_id \in resolved$}
             \State \textbf{continue}
@@ -448,7 +429,7 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \Call{log.append}{\text{DONE}\{txn\_id\}, \text{force}=\text{true}}
         \State $resolved.\text{add}(txn\_id)$
     \EndFor
-    \State \Comment{(c) in-doubt (PREPARED, no COMMIT, no ABORT): keep waiting for the coordinator's decision. Recreated as prepared txns; locks\_map is NOT rebuilt (block mode: no other txn runs meanwhile) and the read set was never logged}
+    \State \Comment{(c) in-doubt (PREPARED only): restored as prepared txns without locks (block mode) and left to the coordinator}
     \State $in\_doubt \gets \{\}$
     \For{\textbf{each} $(txn\_id, wb) \in prepared$}
         \If{$txn\_id \in committed$ \textbf{or} $txn\_id \in resolved$}
@@ -458,9 +439,9 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State $\text{transactions\_map}[txn\_id] \gets txn$
         \State $in\_doubt.\text{add}(txn)$
     \EndFor
-    \State \Comment{all in-doubt txns are now in transactions\_map: release the 2PC entry points held at \textbf{wait until} loaded. This must precede the wait below, which needs the coordinator's commit/abort calls to get through (no deadlock: the wait depends only on commit/abort being served, and they are served once loaded $=$ true). On a fresh empty log $in\_doubt$ is empty and loaded becomes true immediately}
+    \State \Comment{all in-doubt txns restored: serve coordinator messages, which the wait below needs}
     \State $\text{loaded} \gets \text{true}$
-    \State \Comment{\Call{commit}{txn\_id}/\Call{abort}{txn\_id} from the coordinator (served now that loaded is true) work unchanged on a recovered txn: locks\_acquired is empty, so their lock-release loops are no-ops (there are no nodes, hence no successors to cascade to), and the CAS from prepared and the write\_buffer apply behave as before. A duplicate \Call{prepare}{txn\_id} just re-votes yes (status is already prepared). Unknown txn\_id conventions after recovery: prepare votes NO (see prepare), commit/abort are no-ops (see their bodies); a commit for a txn\_id that has DONE is an already-applied no-op}
+    \State \Comment{commit/abort from the coordinator work unchanged on a recovered txn (no locks to release)}
     \State \textbf{wait until} $(\forall t \in in\_doubt,\ t.\text{status} \in \{\text{committed}, \text{aborted}\})$
     \State $\text{recovering} \gets \text{false}$ \Comment{open for new work}
 \EndProcedure
