@@ -15,6 +15,9 @@ Crash recovery is out of scope. The shim is assumed not to crash: in particular 
 \paragraph{Storage Assumptions.}
 The underlying NoSQL store is a black box offering only \texttt{read} and \texttt{write}: \texttt{write} is a blind put and no atomicity across keys is assumed. Store operations are blocking and are retried until they succeed, so the protocol has no error path for store failures.
 
+\paragraph{Deadlocks.}
+The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) are bounded by a timeout: when it expires the subtransaction aborts, which is always safe since it has not executed and voted nothing. This costs liveness only, never CO or 2PC atomicity. The waits in \texttt{prepare} have no timeout: a cross-shim cycle there (T1 before T2 on one shim, T2 before T1 on another) is a 2PC-level deadlock and is left to the coordinator, e.g.\ its vote timeout.
+
 \paragraph{Coordinator Assumptions.}
 \texttt{txn\_id}s are assigned by the coordinator. It calls \texttt{execute} at most once per \texttt{txn\_id} and sends no \texttt{prepare}/\texttt{commit}/\texttt{abort} for a \texttt{txn\_id} before its \texttt{execute} has been delivered. Garbage collection of transaction state is its responsibility as well: the shim drops a subtransaction from \texttt{transactions\_map} once it is committed or aborted, and later or duplicate messages for that \texttt{txn\_id} find no entry (\texttt{prepare} votes NO, \texttt{commit} and \texttt{abort} are no-ops).
 
@@ -44,6 +47,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}\}$
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}\}$
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
+\State $\text{lock\_timeout}$: duration \Comment{bounds every wait of the execution phase (\Call{lock}{}, \Call{upgrade}{}); prepare has none}
 \State \Comment{atomic(locks\_map) is one critical section; per-key latches are fine if the status re-check and the update of locks\_acquired stay atomic w.r.t. \Call{abort\_transaction}{} reading locks\_acquired}
 
 \Statex
@@ -157,13 +161,14 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndIf
         \State \indent $\text{txn.locks\_acquired}[k] = (mode, target\_node)$
     \}
+    \State $deadline \gets \text{now}() + \text{lock\_timeout}$
     \Loop
         \State \textbf{atomic}(locks\_map) \{ $pred \gets target\_node.\text{predecessor}$ \}
         \If{$pred == \text{null}$}
             \State \textbf{break}
         \EndIf
         \State \Comment{pred may be spliced out while waiting: re-read it under the latch each iteration}
-        \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq target\_node.\text{predecessor}$
+        \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq target\_node.\text{predecessor}$ \textbf{or} $\text{now}() \geq deadline$
         \If{$pred \neq target\_node.\text{predecessor}$}
             \State \textbf{continue} \Comment{pred spliced out mid-wait, re-read}
         \EndIf
@@ -174,9 +179,13 @@ The shim locks at the granularity of a single record, identified by its primary 
         \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
             \State \textbf{return} MUST\_ABORT
         \EndIf
+        \If{\textbf{not} \big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)}
+            \State \Call{abort\_transaction}{txn} \Comment{deadline reached: assume a deadlock, safe since nothing was voted}
+            \State \textbf{return} MUST\_ABORT
+        \EndIf
         \State \textbf{break}
     \EndLoop
-    \State \Comment{TODO: no deadlock detection, this wait is unbounded}
+    \State \Comment{deadlocks between running txns are broken by lock\_timeout, no wait-for graph is kept}
     \State \textbf{return} LOCK\_ACQUIRED
 \EndProcedure
 
@@ -207,13 +216,14 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndIf
     \}
     \If{$must\_wait$}
+        \State $deadline \gets \text{now}() + \text{lock\_timeout}$
         \Loop
             \State \textbf{atomic}(locks\_map) \{ $pred \gets new\_node.\text{predecessor}$ \}
             \If{$pred == \text{null}$}
                 \State \textbf{break}
             \EndIf
             \State \Comment{same re-read of the predecessor as in \Call{lock}{}}
-            \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq new\_node.\text{predecessor}$
+            \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq new\_node.\text{predecessor}$ \textbf{or} $\text{now}() \geq deadline$
             \If{$pred \neq new\_node.\text{predecessor}$}
                 \State \textbf{continue}
             \EndIf
@@ -224,9 +234,13 @@ The shim locks at the granularity of a single record, identified by its primary 
             \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
                 \State \textbf{return} MUST\_ABORT
             \EndIf
+            \If{\textbf{not} \big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)}
+                \State \Call{abort\_transaction}{txn} \Comment{deadline reached, as in \Call{lock}{}}
+                \State \textbf{return} MUST\_ABORT
+            \EndIf
             \State \textbf{break}
         \EndLoop
-        \State \Comment{TODO: same unbounded wait as in \Call{lock}{}}
+        \State \Comment{bounded by lock\_timeout, like the wait in \Call{lock}{}}
     \EndIf
     \State \textbf{return} $return\_value$
 \EndProcedure

@@ -15,6 +15,7 @@ Data Structures:
     // per-key latches (one at a time) as long as the status re-check in lock()/upgrade() and the update of
     // txn.locks_acquired stay atomic with respect to abort_transaction() reading locks_acquired (e.g. both
     // under a per-txn guard); otherwise a foreign abort_transaction() can miss a node appended concurrently
+    lock_timeout: duration   // bounds every wait of the execution phase (lock(), upgrade()); prepare() has none
 
 
 Store:
@@ -33,6 +34,10 @@ Store:
         //    delivered. Garbage collection of txn state is its responsibility too: the shim drops a txn
         //    from transactions_map once it is committed or aborted, and later or duplicate messages for
         //    that id take the unknown-id branches (prepare votes NO, commit/abort are no-ops).
+        // 4. Deadlocks: only the execution-phase waits (lock(), upgrade()) are bounded, by lock_timeout.
+        //    The waits in prepare() have no timeout: a cross-shim cycle at prepare (T1 before T2 on one
+        //    shim, T2 before T1 on another) is a 2PC-level deadlock, left to the coordinator (e.g. its
+        //    vote timeout) and not handled by the shim.
 
 
 procedure execute(txn_id, code):
@@ -138,6 +143,7 @@ procedure lock(k, mode, txn):
         txn.locks_acquired[k] = (mode, target_node)
     }
 
+    deadline = now() + lock_timeout   // one deadline for the whole acquisition, not reset by the re-read iterations
     loop:
         atomic(locks_map) {
             pred = target_node.predecessor
@@ -153,6 +159,7 @@ procedure lock(k, mode, txn):
                 t.status in {committed, aborted, executed, prepared, committing, must_abort})
                 or txn.status == aborted or txn.status == must_abort
                 or pred != target_node.predecessor
+                or now() >= deadline
 
         if pred != target_node.predecessor:
             continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
@@ -164,11 +171,18 @@ procedure lock(k, mode, txn):
         if txn.status in {aborted, must_abort}:
             return MUST_ABORT
 
+        if not (∀ t in pred.holders,
+                t.status in {committed, aborted, executed, prepared, committing, must_abort}):
+            // the wait ended on the deadline: assume a deadlock (or a predecessor that never
+            // finishes executing). Always safe: this txn has not executed and voted nothing, so it
+            // just aborts. Costs liveness only, never CO or 2PC atomicity
+            abort_transaction(txn)
+            return MUST_ABORT
+
         break   // pred fully resolved with no abort among its holders
 
-    // TODO: no deadlock detection yet --- this wait is unbounded and
-    // can deadlock against another txn waiting on this one; accepted
-    // for now, to be addressed later
+    // Deadlocks between running txns (T1 holds X and waits for Y while T2 holds Y and waits for X) are
+    // broken by lock_timeout above; no wait-for graph is kept
 
     return LOCK_ACQUIRED
 
@@ -207,6 +221,7 @@ procedure upgrade(k, txn):
     }
 
     if must_wait:
+        deadline = now() + lock_timeout
         loop:
             atomic(locks_map) {
                 pred = new_node.predecessor
@@ -222,6 +237,7 @@ procedure upgrade(k, txn):
                         t.status in {committed, aborted, executed, prepared, committing, must_abort})
                         or txn.status == aborted or txn.status == must_abort
                         or pred != new_node.predecessor
+                        or now() >= deadline
 
             if pred != new_node.predecessor:
                 continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
@@ -233,9 +249,15 @@ procedure upgrade(k, txn):
             if txn.status in {aborted, must_abort}:
                 return MUST_ABORT
 
+            if not (∀ t in pred.holders,
+                        t.status in {committed, aborted, executed, prepared, committing, must_abort}):
+                abort_transaction(txn)   // deadline reached: same reasoning as in lock()
+                return MUST_ABORT
+
             break   // pred fully resolved with no abort among its holders
 
-        // TODO: same unbounded-wait / no-deadlock-detection caveat as in lock()
+        // the wait above is bounded by lock_timeout, like in lock(): e.g. two readers of the same
+        // shared node, one upgrading and waiting for the other, which waits on this txn via another key
 
     return return_value
 
