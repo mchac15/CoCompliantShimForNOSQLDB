@@ -19,7 +19,7 @@ The underlying NoSQL store is a black box offering only \texttt{read} and \textt
 The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) are bounded by a timeout: when it expires the subtransaction aborts, which is always safe since it has not executed and voted nothing. This costs liveness only, never CO or 2PC atomicity. The waits in \texttt{prepare} have no timeout: a cross-shim cycle there (T1 before T2 on one shim, T2 before T1 on another) is a 2PC-level deadlock and is left to the coordinator, e.g.\ its vote timeout.
 
 \paragraph{Coordinator Assumptions.}
-\texttt{txn\_id}s are assigned by the coordinator. It calls \texttt{execute} at most once per \texttt{txn\_id} and sends no \texttt{prepare}/\texttt{commit}/\texttt{abort} for a \texttt{txn\_id} before its \texttt{execute} has been delivered. Garbage collection of transaction state is its responsibility as well: the shim drops a subtransaction from \texttt{transactions\_map} once it is committed or aborted, and later or duplicate messages for that \texttt{txn\_id} find no entry (\texttt{prepare} votes NO, \texttt{commit} and \texttt{abort} are no-ops).
+\texttt{txn\_id}s are assigned by the coordinator. It calls \texttt{execute} at most once per \texttt{txn\_id} and sends no \texttt{prepare}/\texttt{commit}/\texttt{abort} for a \texttt{txn\_id} before its \texttt{execute} has been delivered. Garbage collection of transaction state is its responsibility as well: the shim drops a subtransaction from \texttt{transactions\_map} once it is committed or aborted, and later or duplicate messages for that \texttt{txn\_id} find no entry (\texttt{prepare} votes NO, \texttt{commit} and \texttt{abort} are no-ops that are still acknowledged, so the coordinator can garbage-collect on the ack). Aborts carry a reason (\texttt{abort\_reason}), returned by \texttt{execute} and attached to a NO vote, so the coordinator can choose a retry policy.
 
 \paragraph{Execution Model.}
 A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade: in place if the subtransaction is the sole reader, otherwise onto a new exclusive node behind the readers. An upgrade may move a subtransaction only across readers, never across a writer, since the value it read would be stale by the time its own write takes effect. If a blind writer (one that never read the key) is already queued behind, the new node goes in front of it; if the node behind is itself an upgrade, i.e.\ its holder read the key too, exactly one of the two read-modify-write subtransactions must abort, and it is the later upgrader. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
@@ -28,7 +28,7 @@ A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its lo
 Each participant runs one shim, colocated with its own database. A subtransaction is bound to a single participant's database by definition --- cross-database access is expressed as multiple subtransactions within one Sonata global transaction, coordinated by Sonata's outer 2PC, not by any single subtransaction spanning stores. The shim's \texttt{locks\_map} is therefore scoped to one participant, with a single point of serialization; no cross-node lock coordination is needed within the shim itself.
 
 \paragraph{Data Model.}
-The shim locks at the granularity of a single record, identified by its primary key $k$; this is the unit \texttt{get}/\texttt{put} and the \texttt{locks\_map} chains operate on. Values are treated as opaque --- the shim does not interpret or type-check them, only serializes access to them via SHARED/EXCLUSIVE locks.
+The shim locks at the granularity of a single record, identified by its primary key $k$; this is the unit \texttt{get}/\texttt{put} and the \texttt{locks\_map} chains operate on. Values are treated as opaque --- the shim does not interpret or type-check them, only serializes access to them via SHARED/EXCLUSIVE locks. A subtransaction only issues \texttt{get}/\texttt{put} on single records. Not supported: \texttt{delete} (an application may put a tombstone value, which the shim treats as any other opaque value), range scans and predicate reads (the lock unit is one record, so there is no phantom protection), and null values (null is the ``no predecessor version'' marker in \texttt{get}). There is no read-only vote: a read-only subtransaction keeps its SHARED nodes until commit, since CO orders readers against writers too.
 \newpage
 \vspace{1em}
 
@@ -44,7 +44,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \State $\text{chain}: \{\text{head}, \text{tail}\}$ \Comment{doubly linked through predecessor/next, arrival order $=$ required commit order; last\_node() $=$ tail}
 \State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, chain>}$ \Comment{one chain per key, generations of holders}
-\State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}\}$
+\State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}, \text{abort\_reason}\}$ \Comment{abort\_reason $\in$ \{NONE, CASCADE, DEADLOCK, RMW\_CONFLICT, COORDINATOR, DUPLICATE\_ID, UNKNOWN\_TXN\}, default NONE, set at most once by \Call{set\_reason}{}; NONE on an aborted txn means unspecified}
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}\}$
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
 \State $\text{lock\_timeout}$: duration \Comment{bounds every wait of the execution phase (\Call{lock}{}, \Call{upgrade}{}); prepare has none}
@@ -57,10 +57,15 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State \Comment{store.write is blocking and retried until it succeeds; crash recovery is out of scope (the shim is assumed not to crash between voting YES and the decision)}
 
 \Statex
+\Procedure{set\_reason}{txn, reason}
+    \State \Call{CAS}{\text{txn.abort\_reason}, \text{NONE}, reason} \Comment{the first reason wins; informational, never read by the protocol itself}
+\EndProcedure
+
+\Statex
 \Procedure{execute}{txn\_id, code}
     \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{code}=code$
     \If{$\Call{transactions\_map.putIfAbsent}{txn.\text{txn\_id}, txn} \neq \text{null}$}
-        \State \textbf{return} FAILED \Comment{txn\_id already registered (collision / duplicate)}
+        \State \textbf{return} FAILED, DUPLICATE\_ID \Comment{txn\_id already registered (collision / duplicate)}
     \EndIf
     \State $execution\_failed \gets \text{false}$
     \State $txn.\text{code}$ calls \Call{get}{k, txn} or \Call{put}{k, v, txn} multiple times
@@ -69,7 +74,7 @@ The shim locks at the granularity of a single record, identified by its primary 
     \EndIf
     \If{$execution\_failed$ \textbf{or not} \Call{CAS}{txn.\text{status}, \text{started}, \text{executed}}}
         \State \Call{abort\_transaction}{txn} \Comment{idempotent; releases the locks if a cascade or foreign abort landed after the last get/put}
-        \State \textbf{return} FAILED
+        \State \textbf{return} FAILED, $\text{txn.abort\_reason}$ \Comment{lets the coordinator pick a retry policy, e.g. back off on DEADLOCK}
     \EndIf
     \State \textbf{return} SUCCEEDED
 \EndProcedure
@@ -173,6 +178,7 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State \textbf{continue} \Comment{pred spliced out mid-wait, re-read}
         \EndIf
         \If{$\exists t \in pred.\text{holders}$ with $t.\text{status} == \text{aborted}$ \textbf{or} $t.\text{status} == \text{must\_abort}$}
+            \State \Call{set\_reason}{txn, CASCADE}
             \State \Call{abort\_transaction}{txn}
             \State \textbf{return} MUST\_ABORT
         \EndIf
@@ -180,6 +186,7 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State \textbf{return} MUST\_ABORT
         \EndIf
         \If{\textbf{not} \big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)}
+            \State \Call{set\_reason}{txn, DEADLOCK}
             \State \Call{abort\_transaction}{txn} \Comment{deadline reached: assume a deadlock, safe since nothing was voted}
             \State \textbf{return} MUST\_ABORT
         \EndIf
@@ -207,6 +214,7 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndWhile
         \State \indent $after \gets p.\text{next}$ \Comment{EXCLUSIVE or null}
         \If{$after \neq \text{null}$ \textbf{and} $after.\text{upgraded}$}
+            \State \indent \Call{set\_reason}{txn, RMW\_CONFLICT}
             \State \indent \Comment{case 3b: its holder read $k$ too (read-modify-write vs read-modify-write): this txn loses, return\_value stays MUST\_ABORT}
         \ElsIf{$p == node$ \textbf{and} $node.\text{holders} == \{txn\}$}
             \State \indent $node.\text{mode} \gets \text{EXCLUSIVE}$; $node.\text{upgraded} \gets \text{true}$ \Comment{case 1: in place, at most a blind writer behind}
@@ -244,6 +252,7 @@ The shim locks at the granularity of a single record, identified by its primary 
                 \State \textbf{continue}
             \EndIf
             \If{$\exists t \in pred.\text{holders}$ with $t.\text{status} == \text{aborted}$ \textbf{or} $t.\text{status} == \text{must\_abort}$}
+                \State \Call{set\_reason}{txn, CASCADE}
                 \State \Call{abort\_transaction}{txn}
                 \State \textbf{return} MUST\_ABORT
             \EndIf
@@ -251,6 +260,7 @@ The shim locks at the granularity of a single record, identified by its primary 
                 \State \textbf{return} MUST\_ABORT
             \EndIf
             \If{\textbf{not} \big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)}
+                \State \Call{set\_reason}{txn, DEADLOCK}
                 \State \Call{abort\_transaction}{txn} \Comment{deadline reached, as in \Call{lock}{}}
                 \State \textbf{return} MUST\_ABORT
             \EndIf
@@ -276,7 +286,7 @@ The shim locks at the granularity of a single record, identified by its primary 
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
         \State \Comment{unknown txn\_id: late/duplicate prepare of a resolved txn}
-        \State \textbf{Send no to 2PC controller}
+        \State \textbf{Send no(UNKNOWN\_TXN) to 2PC controller}
         \State \textbf{return}
     \EndIf
     \If{$txn.\text{status} \in \{\text{prepared}, \text{committing}, \text{committed}\}$}
@@ -286,7 +296,7 @@ The shim locks at the granularity of a single record, identified by its primary 
     \EndIf
     \If{$txn.\text{status} \notin \{\text{executed}, \text{prepared}\}$}
         \State \Comment{covers aborted and must\_abort}
-        \State \textbf{Send no to 2PC controller}
+        \State \textbf{Send no}($\text{txn.abort\_reason}$) \textbf{to 2PC controller}
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return}
     \EndIf
@@ -300,7 +310,7 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{must\_abort}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq node.\text{predecessor}$
             \State \Comment{may have been cascade-aborted via another key}
             \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
-                \State \textbf{Send no to 2PC controller}
+                \State \textbf{Send no}($\text{txn.abort\_reason}$) \textbf{to 2PC controller}
                 \If{$\text{txn.status} == \text{must\_abort}$}
                     \State \Call{abort\_transaction}{txn}
                 \EndIf
@@ -310,8 +320,9 @@ The shim locks at the granularity of a single record, identified by its primary 
                 \State \textbf{continue}
             \EndIf
             \If{$\exists t \in pred.\text{holders}$ with $t.\text{status} == \text{aborted}$ \textbf{or} $t.\text{status} == \text{must\_abort}$}
+                \State \Call{set\_reason}{txn, CASCADE}
                 \State \Call{abort\_transaction}{txn}
-                \State \textbf{Send no to 2PC controller}
+                \State \textbf{Send no}($\text{txn.abort\_reason}$) \textbf{to 2PC controller}
                 \State \textbf{return}
             \EndIf
             \State \textbf{break}
@@ -320,7 +331,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 
     \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared}}
         \State \Comment{late cascade mark: the txn never prepared, so abort it and release its locks}
-        \State \textbf{Send no to 2PC controller}
+        \State \textbf{Send no}($\text{txn.abort\_reason}$) \textbf{to 2PC controller}
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return}
     \EndIf
@@ -331,7 +342,8 @@ The shim locks at the granularity of a single record, identified by its primary 
 \Procedure{commit}{txn\_id}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
-        \State \textbf{return} \Comment{unknown/already-evicted txn\_id: no-op}
+        \State \textbf{Send commit\_ack to 2PC controller} \Comment{unknown/already-evicted txn\_id: nothing to do, but ack (idempotent)}
+        \State \textbf{return}
     \EndIf
     \If{\textbf{not} \Call{CAS}{\text{txn.status}, \text{prepared}, \text{committing}}}
         \State \textbf{return}
@@ -354,6 +366,7 @@ The shim locks at the granularity of a single record, identified by its primary 
     \}
     \State $\text{txn.status} \gets \text{committed}$
     \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: volatile state dropped; the coordinator owns the txn\_id lifecycle}
+    \State \textbf{Send commit\_ack to 2PC controller} \Comment{the coordinator may now forget the txn}
 \EndProcedure
 
 \Statex
@@ -388,9 +401,14 @@ The shim locks at the granularity of a single record, identified by its primary 
 \Procedure{abort}{txn\_id}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
-        \State \textbf{return} \Comment{unknown txn\_id: no-op}
+        \State \textbf{Send abort\_ack to 2PC controller} \Comment{unknown txn\_id: no-op, still acked}
+        \State \textbf{return}
     \EndIf
+    \State \Call{set\_reason}{txn, COORDINATOR}
     \State \Call{abort\_transaction}{txn}
+    \If{$\text{txn.status} == \text{aborted}$}
+        \State \textbf{Send abort\_ack to 2PC controller} \Comment{no ack if the abort lost against a commit already in progress}
+    \EndIf
 \EndProcedure
 
 \Statex
@@ -398,6 +416,7 @@ The shim locks at the granularity of a single record, identified by its primary 
     \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{started}, \text{executed}\}, \text{must\_abort}}}
         \State \textbf{return}
     \EndIf
+    \State \Call{set\_reason}{txn, CASCADE}
 \EndProcedure
 
 \end{algorithmic}
