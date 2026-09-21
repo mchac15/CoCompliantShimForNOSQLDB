@@ -10,13 +10,13 @@
 \section*{System Model}
 
 \paragraph{Failure Model.}
-Crash-recovery; no Byzantine/permanent failures. A crash wipes all volatile state (\texttt{locks\_map}, \texttt{transactions\_map}); the only durable state is the shim's write-ahead log. Only prepared subtransactions are ever logged (presumed abort): any subtransaction that had not voted YES leaves no record and is treated as aborted after a crash, which is safe because the coordinator never saw a YES. On restart, a subtransaction with a COMMIT record but no DONE record is redone from its logged \texttt{write\_buffer}; one that is prepared but undecided is in doubt and is restored as \texttt{prepared} without locks, waiting for the coordinator to (re-)send \texttt{commit}/\texttt{abort} --- no predecessor re-check is needed since its predecessors were resolved before it prepared. Recovery is block-mode: until every such subtransaction has been resolved (every COMMIT-without-DONE redone, every in-doubt one committed or aborted by the coordinator), the shim accepts no new work --- \texttt{execute} returns FAILED and the coordinator retries or aborts the subtransaction --- so \texttt{locks\_map} need not be rebuilt for the recovered subtransactions. Coordinator messages (\texttt{prepare}, \texttt{commit}, \texttt{abort}) are held back only until the in-doubt subtransactions have been restored, so a recovered subtransaction is never mistaken for an unknown one; from then on they are served while recovery waits for the coordinator's decisions. A lost (unforced) ABORT record merely makes the subtransaction in-doubt again, and the coordinator's retry resolves it. Network is asynchronous: messages may be delayed, lost, duplicated, reordered, not corrupted; coordinator messages are therefore idempotent at the shim. Partitions eventually heal.
+Crash recovery is out of scope. The shim is assumed not to crash: in particular not between voting YES and the coordinator's decision. Nothing is persisted (\texttt{locks\_map}, \texttt{transactions\_map} and the write buffers are volatile), so 2PC atomicity holds only under this no-crash assumption. No Byzantine failures. Network is asynchronous: messages may be delayed, lost, duplicated, reordered, not corrupted; coordinator messages are therefore idempotent at the shim. Partitions eventually heal.
 
-\paragraph{Storage and Log Assumptions.}
-The underlying NoSQL store is a black box offering only \texttt{read}, \texttt{write} and \texttt{sync}: \texttt{write} is a blind put (idempotent, hence safe to redo), no atomicity across keys is assumed, and \texttt{sync} returns once all previous writes are durable. The log is a single append-only file; a forced append returns only once the record (and all earlier ones) is on stable storage. Log and store operations are blocking and are retried until they succeed, so the protocol has no error path for I/O failures --- a subtransaction that cannot force its PREPARED record simply blocks and never votes YES without one. An incomplete or corrupt record at the log tail (crash mid-append) is discarded entirely on scan. The log is never truncated (out of scope for now). \texttt{txn\_id}s are assigned by the coordinator and never reused, so a finished subtransaction is never re-executed after recovery; a \texttt{txn\_id} may appear in several PREPARED records (duplicate prepare), all carrying the identical \texttt{write\_buffer}, and recovery treats them as one.
+\paragraph{Storage Assumptions.}
+The underlying NoSQL store is a black box offering only \texttt{read} and \texttt{write}: \texttt{write} is a blind put and no atomicity across keys is assumed. Store operations are blocking and are retried until they succeed, so the protocol has no error path for store failures. \texttt{txn\_id}s are assigned by the coordinator and never reused.
 
 \paragraph{Execution Model.}
-A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade in place, or off the shared node if other readers joined it; if the chain has already moved on past that point, the upgrade cannot be safely spliced in and the subtransaction aborts. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. A subtransaction votes YES only after its \texttt{write\_buffer} is forced to the log in a PREPARED record (the status is CASed to \texttt{prepared} first, and every prepare call forces, including duplicates). On \texttt{commit} the status moves to \texttt{committing}, the COMMIT record is forced (the decision is durable before the store is touched), the buffer is applied to the store and synced, and DONE is forced before the locks are released; only then is the status \texttt{committed}. Because a successor cannot prepare until its predecessors have left the chain, i.e.\ until their DONE is durable, the subtransactions with COMMIT but no DONE after a crash are pairwise conflict-free, so redo order does not matter.
+A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade in place, or off the shared node if other readers joined it; if the chain has already moved on past that point, the upgrade cannot be safely spliced in and the subtransaction aborts. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
 
 \paragraph{Architecture.}
 Each participant runs one shim, colocated with its own database. A subtransaction is bound to a single participant's database by definition --- cross-database access is expressed as multiple subtransactions within one Sonata global transaction, coordinated by Sonata's outer 2PC, not by any single subtransaction spanning stores. The shim's \texttt{locks\_map} is therefore scoped to one participant, with a single point of serialization; no cross-node lock coordination is needed within the shim itself.
@@ -41,34 +41,15 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}, \text{NULL}\}$
 \State \Comment{TODO: intermediate states for retry mechanism}
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
-\State $\text{recovering}: \text{boolean} = \text{true}$ \Comment{true until \Call{recover}{} has resolved every in-doubt txn; gates \Call{execute}{}}
-\State $\text{loaded}: \text{boolean} = \text{false}$ \Comment{false until \Call{recover}{} has restored the in-doubt txns; gates prepare/commit/abort}
 
 \Statex
-\State \textbf{Durability Interfaces:}
-\State \Comment{the log is the only durable state (volatile maps are lost on a crash); only prepared txns are logged (presumed abort)}
-\State \textbf{Log:} single append-only file
-\State \Call{log.append}{record, force}
-\Comment{force = true: durable on return}
-\State \Call{log.scan}{} $\to$ ordered list of records
-\State \Comment{TODO: log.truncate() --- checkpointing / dropping records of finished txns}
-\State $\text{record} \in \{$
-\State \quad PREPARED$\{\text{txn\_id}, \text{write\_buffer}\}$ \Comment{forced, before sending YES}
-\State \quad COMMIT$\{\text{txn\_id}\}$ \Comment{forced, before applying write\_buffer to the store}
-\State \quad DONE$\{\text{txn\_id}\}$ \Comment{forced, after \Call{store.sync}{}, before locks are released}
-\State \quad ABORT$\{\text{txn\_id}\}$ \Comment{NOT forced, only for prepared txns; a lost ABORT leaves the txn in-doubt}
-\State $\}$
-\State \Comment{DONE is forced before lock release, so txns with COMMIT but no DONE never conflict and their redo order is irrelevant}
 \State \textbf{Store:} black box NoSQL store, nothing more is assumed than the following
 \State \Call{store.read}{k} $\to$ value
-\State \Call{store.write}{k, v} \Comment{blind put: idempotent, safe to redo}
-\State \Call{store.sync}{} \Comment{returns once all previous writes are durable}
+\State \Call{store.write}{k, v} \Comment{blind put; no atomicity across keys assumed}
+\State \Comment{store.write is blocking and retried until it succeeds; crash recovery is out of scope (the shim is assumed not to crash between voting YES and the decision)}
 
 \Statex
 \Procedure{execute}{code}
-    \If{$\text{recovering}$}
-        \State \textbf{return} FAILED
-    \EndIf
     \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{code}=code$
     \If{$\Call{transactions\_map.putIfAbsent}{txn.\text{txn\_id}, txn} \neq \text{null}$}
         \State \textbf{return} FAILED \Comment{txn\_id already registered (collision / duplicate)}
@@ -250,7 +231,6 @@ The shim locks at the granularity of a single record, identified by its primary 
 \begin{algorithmic}[1]
 
 \Procedure{prepare}{txn\_id}
-    \State \textbf{wait until} $\text{loaded}$ \Comment{held until recovered state is loaded}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
         \State \Comment{unknown txn\_id: late/duplicate prepare of a resolved txn}
@@ -302,14 +282,11 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return}
     \EndIf
-    \State \Comment{CAS before force: a crash in between leaves no record, so presumed abort (safe: no YES was sent). Every call forces, so a YES never precedes a durable PREPARED record}
-    \State $\text{log.append}(\text{PREPARED}\{txn\_id, txn.\text{write\_buffer}\}, \text{force}=\text{true})$
     \State \textbf{Send yes to 2PC controller}
 \EndProcedure
 
 \Statex
 \Procedure{commit}{txn\_id}
-    \State \textbf{wait until} $\text{loaded}$ \Comment{held until recovered state is loaded}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
         \State \textbf{return} \Comment{unknown/already-evicted txn\_id: no-op}
@@ -317,14 +294,10 @@ The shim locks at the granularity of a single record, identified by its primary 
     \If{\textbf{not} \Call{CAS}{\text{txn.status}, \text{prepared}, \text{committing}}}
         \State \textbf{return}
     \EndIf
-    \State $\text{log.append}(\text{COMMIT}\{txn\_id\}, \text{force}=\text{true})$ \Comment{the decision is durable before anything touches the store}
+    \State \Comment{committing, not committed, while the store is written: a coordinator abort can no longer take the txn, and a successor's prepare cannot pass before the writes are applied}
     \For{\textbf{each} $(key, value) \in txn.\text{write\_buffer}$}
         \State $\text{store.write}(key, value)$
     \EndFor
-    \State $\text{store.sync}()$
-    \State \Comment{DONE is forced before locks are released, so redo order of COMMIT-without-DONE txns is irrelevant}
-    \State $\text{log.append}(\text{DONE}\{txn\_id\}, \text{force}=\text{true})$
-    \State \Comment{no-op for a recovered in-doubt txn (locks\_acquired is empty)}
     \State \textbf{atomic}(locks\_map) \{
         \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
             \State \indent remove $txn$ from $target\_node.\text{holders}$
@@ -340,13 +313,8 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \Statex
 \Procedure{abort\_transaction}{txn}
-    \State $(ok, prev\_status) \gets$ \Call{CAS}{\text{txn.status}, \{\text{executed}, \text{prepared}, \text{NULL}, \text{must\_abort}, \text{started}\}, \text{aborted}} \Comment{also yields the status it replaced}
-    \If{\textbf{not} $ok$}
+    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{executed}, \text{prepared}, \text{NULL}, \text{must\_abort}, \text{started}\}, \text{aborted}}}
         \State \textbf{return}
-    \EndIf
-    \If{$prev\_status == \text{prepared}$}
-        \State \Comment{presumed abort: only a prepared txn has a PREPARED record. Not forced, a lost ABORT leaves the txn in-doubt and the coordinator re-sends abort}
-        \State \indent $\text{log.append}(\text{ABORT}\{txn.\text{txn\_id}\}, \text{force}=\text{false})$
     \EndIf
 
     \State \textbf{atomic}(locks\_map) \{
@@ -374,7 +342,6 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \Statex
 \Procedure{abort}{txn\_id}
-    \State \textbf{wait until} $\text{loaded}$ \Comment{held until recovered state is loaded}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
         \State \textbf{return} \Comment{unknown txn\_id: no-op}
@@ -394,61 +361,5 @@ The shim locks at the granularity of a single record, identified by its primary 
 \endgroup
 \bigskip
 \newpage
-\begingroup
-\refstepcounter{algorithm}
-\noindent\textbf{Algorithm~\thealgorithm}\ \ Two-Phase Commit Transactional Lock Manager (Part 4: Crash Recovery)\par\nopagebreak\vspace{2pt}\hrule\vspace{2pt}
-\small
-\begin{algorithmic}[1]
-
-\Procedure{recover}{}
-    \State \Comment{runs once on restart with empty volatile state; recovering $=$ true and loaded $=$ false since process start. \Call{execute}{} waits on recovering, prepare/commit/abort on loaded}
-    \State $prepared \gets \{\}$ \Comment{txn\_id $\to$ write\_buffer, from PREPARED records}
-    \State $committed \gets \{\}$ \Comment{txn\_ids with a COMMIT record}
-    \State $resolved \gets \{\}$ \Comment{txn\_ids with a DONE or ABORT record}
-    \For{\textbf{each} $record \in \Call{log.scan}{}$}
-        \If{$record$ is PREPARED}
-            \State $prepared[record.\text{txn\_id}] \gets record.\text{write\_buffer}$
-        \EndIf
-        \If{$record$ is COMMIT}
-            \State $committed.\text{add}(record.\text{txn\_id})$
-        \EndIf
-        \If{$record$ is DONE \textbf{or} ABORT}
-            \State $resolved.\text{add}(record.\text{txn\_id})$
-        \EndIf
-    \EndFor
-    \State \Comment{(a) DONE/ABORT: ignored. Txns that never prepared left no record and are implicitly aborted}
-    \State \Comment{(b) COMMIT without DONE: redo. Pairwise conflict-free, so order is irrelevant; safe to repeat (idempotent puts, DONE appended after sync)}
-    \For{\textbf{each} $txn\_id \in committed$}
-        \If{$txn\_id \in resolved$}
-            \State \textbf{continue}
-        \EndIf
-        \For{\textbf{each} $(k, v) \in prepared[txn\_id]$}
-            \State \Call{store.write}{k, v}
-        \EndFor
-        \State \Call{store.sync}{}
-        \State \Call{log.append}{\text{DONE}\{txn\_id\}, \text{force}=\text{true}}
-        \State $resolved.\text{add}(txn\_id)$
-    \EndFor
-    \State \Comment{(c) in-doubt (PREPARED only): restored as prepared txns without locks (block mode) and left to the coordinator}
-    \State $in\_doubt \gets \{\}$
-    \For{\textbf{each} $(txn\_id, wb) \in prepared$}
-        \If{$txn\_id \in committed$ \textbf{or} $txn\_id \in resolved$}
-            \State \textbf{continue}
-        \EndIf
-        \State $txn \gets$ new txn with $\text{txn\_id}=txn\_id$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{prepared}$, $\text{write\_buffer}=wb$
-        \State $\text{transactions\_map}[txn\_id] \gets txn$
-        \State $in\_doubt.\text{add}(txn)$
-    \EndFor
-    \State \Comment{all in-doubt txns restored: serve coordinator messages, which the wait below needs}
-    \State $\text{loaded} \gets \text{true}$
-    \State \Comment{commit/abort from the coordinator work unchanged on a recovered txn (no locks to release)}
-    \State \textbf{wait until} $(\forall t \in in\_doubt,\ t.\text{status} \in \{\text{committed}, \text{aborted}\})$
-    \State $\text{recovering} \gets \text{false}$ \Comment{open for new work}
-\EndProcedure
-
-\end{algorithmic}
-\vspace{2pt}\hrule
-\endgroup
-\bigskip
 
 \end{document}
