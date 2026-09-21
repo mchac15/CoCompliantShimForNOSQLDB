@@ -16,10 +16,10 @@ Crash recovery is out of scope. The shim is assumed not to crash: in particular 
 The underlying NoSQL store is a black box offering only \texttt{read} and \texttt{write}: \texttt{write} is a blind put and no atomicity across keys is assumed. Store operations are blocking and are retried until they succeed, so the protocol has no error path for store failures.
 
 \paragraph{Deadlocks.}
-The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) are bounded by a timeout: when it expires the subtransaction aborts, which is always safe since it has not executed and voted nothing. This costs liveness only, never CO or 2PC atomicity. The waits in \texttt{prepare} have no timeout: a cross-shim cycle there (T1 before T2 on one shim, T2 before T1 on another) is a 2PC-level deadlock and is left to the coordinator, e.g.\ its vote timeout.
+The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) are handled by an age-based give-up: when a wait exceeds the timeout, the subtransaction aborts only if it is younger than a still-running predecessor it waits for, otherwise it renews the timeout and keeps waiting. Aborting is always safe since it has not executed and voted nothing, and costs liveness only, never CO or 2PC atomicity. Around a wait-for cycle at least one subtransaction waits for an older one, so a cycle loses exactly its youngest waiter instead of every member timing out at once (and, through the cascade of an exclusive holder, dooming each other); the oldest is never the victim. The waits in \texttt{prepare} have no timeout: a cross-shim cycle there (T1 before T2 on one shim, T2 before T1 on another) is a 2PC-level deadlock and is left to the coordinator, e.g.\ its vote timeout.
 
 \paragraph{Coordinator Assumptions.}
-\texttt{txn\_id}s are assigned by the coordinator. It calls \texttt{execute} at most once per \texttt{txn\_id} and sends no \texttt{prepare}/\texttt{commit}/\texttt{abort} for a \texttt{txn\_id} before its \texttt{execute} has been delivered. Garbage collection of transaction state is its responsibility as well: the shim drops a subtransaction from \texttt{transactions\_map} once it is committed or aborted, and later or duplicate messages for that \texttt{txn\_id} find no entry (\texttt{prepare} votes NO, \texttt{commit} and \texttt{abort} are no-ops).
+\texttt{txn\_id}s are assigned by the coordinator, together with a priority \texttt{ts} that it keeps when it retries an aborted global transaction under a fresh \texttt{txn\_id} (so a retried transaction only gets older). It calls \texttt{execute} at most once per \texttt{txn\_id} and sends no \texttt{prepare}/\texttt{commit}/\texttt{abort} for a \texttt{txn\_id} before its \texttt{execute} has been delivered. Garbage collection of transaction state is its responsibility as well: the shim drops a subtransaction from \texttt{transactions\_map} once it is committed or aborted, and later or duplicate messages for that \texttt{txn\_id} find no entry (\texttt{prepare} votes NO, \texttt{commit} and \texttt{abort} are no-ops).
 
 \paragraph{Execution Model.}
 A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade: in place if the subtransaction is the sole reader, otherwise onto a new exclusive node behind the readers. An upgrade may move a subtransaction only across readers, never across a writer, since the value it read would be stale by the time its own write takes effect. If a blind writer (one that never read the key) is already queued behind, the new node goes in front of it; if the node behind is itself an upgrade, i.e.\ its holder read the key too, exactly one of the two read-modify-write subtransactions must abort, and it is the later upgrader. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
@@ -44,10 +44,11 @@ The shim locks at the granularity of a single record, identified by its primary 
 
 \State $\text{chain}: \{\text{head}, \text{tail}\}$ \Comment{doubly linked through predecessor/next, arrival order $=$ required commit order; last\_node() $=$ tail}
 \State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, chain>}$ \Comment{one chain per key, generations of holders}
-\State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}\}$
+\State $\text{txn}: \{\text{txn\_id}, \text{ts}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{code}, \text{write\_buffer}: \text{key} \to \text{value}\}$
+\State \Comment{ts: priority given by the coordinator, smaller $=$ older, kept across retries of the same global txn; older(a, b) $=$ (a.ts, a.txn\_id) $<$ (b.ts, b.txn\_id), a total order}
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}\}$
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
-\State $\text{lock\_timeout}$: duration \Comment{bounds every wait of the execution phase (\Call{lock}{}, \Call{upgrade}{}); prepare has none}
+\State $\text{lock\_timeout}$: duration \Comment{period after which a waiting txn of the execution phase (\Call{lock}{}, \Call{upgrade}{}) checks whether it has to give up (deadlock victim, see \Call{lock}{}); prepare has none}
 \State \Comment{atomic(locks\_map) is one critical section; per-key latches are fine if the status re-check and the update of locks\_acquired stay atomic w.r.t. \Call{abort\_transaction}{} reading locks\_acquired}
 
 \Statex
@@ -57,8 +58,8 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State \Comment{store.write is blocking and retried until it succeeds; crash recovery is out of scope (the shim is assumed not to crash between voting YES and the decision)}
 
 \Statex
-\Procedure{execute}{txn\_id, code}
-    \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{code}=code$
+\Procedure{execute}{txn\_id, ts, code}
+    \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{ts}=ts$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{code}=code$
     \If{$\Call{transactions\_map.putIfAbsent}{txn.\text{txn\_id}, txn} \neq \text{null}$}
         \State \textbf{return} FAILED \Comment{txn\_id already registered (collision / duplicate)}
     \EndIf
@@ -180,12 +181,17 @@ The shim locks at the granularity of a single record, identified by its primary 
             \State \textbf{return} MUST\_ABORT
         \EndIf
         \If{\textbf{not} \big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)}
-            \State \Call{abort\_transaction}{txn} \Comment{deadline reached: assume a deadlock, safe since nothing was voted}
-            \State \textbf{return} MUST\_ABORT
+            \State \Comment{the wait ended on the deadline: a deadlock or just a slow predecessor. Victim policy (wait-die on the timeout): give up only if younger than a still-running holder it waits for; safe since nothing was voted. Around a wait-for cycle at least one txn waits for an older one, so the youngest waiter is the victim and the oldest is never (no starvation, the coordinator keeps ts across retries)}
+            \If{$\exists t \in pred.\text{holders}$ with $t.\text{status} == \text{started}$ \textbf{and} $\text{older}(t, txn)$}
+                \State \Call{abort\_transaction}{txn}
+                \State \textbf{return} MUST\_ABORT
+            \EndIf
+            \State $deadline \gets \text{now}() + \text{lock\_timeout}$ \Comment{oldest of what it waits for: keep waiting}
+            \State \textbf{continue}
         \EndIf
         \State \textbf{break}
     \EndLoop
-    \State \Comment{deadlocks between running txns are broken by lock\_timeout, no wait-for graph is kept}
+    \State \Comment{deadlocks between running txns are broken by the age-based give-up above, no wait-for graph is kept}
     \State \textbf{return} LOCK\_ACQUIRED
 \EndProcedure
 
@@ -251,12 +257,17 @@ The shim locks at the granularity of a single record, identified by its primary 
                 \State \textbf{return} MUST\_ABORT
             \EndIf
             \If{\textbf{not} \big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{aborted}, \text{executed}, \text{prepared}, \text{committing}, \text{must\_abort}\}\big)}
-                \State \Call{abort\_transaction}{txn} \Comment{deadline reached, as in \Call{lock}{}}
-                \State \textbf{return} MUST\_ABORT
+                \State \Comment{deadline reached: same victim policy as in \Call{lock}{}}
+                \If{$\exists t \in pred.\text{holders}$ with $t.\text{status} == \text{started}$ \textbf{and} $\text{older}(t, txn)$}
+                    \State \Call{abort\_transaction}{txn}
+                    \State \textbf{return} MUST\_ABORT
+                \EndIf
+                \State $deadline \gets \text{now}() + \text{lock\_timeout}$
+                \State \textbf{continue}
             \EndIf
             \State \textbf{break}
         \EndLoop
-        \State \Comment{bounded by lock\_timeout, like the wait in \Call{lock}{}}
+        \State \Comment{same give-up rule as the wait in \Call{lock}{}}
     \EndIf
     \State \textbf{return} $return\_value$
 \EndProcedure
