@@ -1,6 +1,6 @@
 ---
 name: co-shim-context
-description: Load at the start of every conversation in this repo, and whenever an error/bug is found in pseudo.txt (or other project pseudocode) before implementing a fix. Provides the full project context, invariants, settled design decisions, and known open issues for the Speculative CO-Compliant Subtransaction Shim so reviews and fixes are consistent with prior analysis.
+description: Load at the start of every conversation in this repo, and whenever an error/bug is found in pseudo.txt (or other project pseudocode) before implementing a fix. Provides the full project context, invariants, settled design decisions, and deferred items for the Speculative CO-Compliant Subtransaction Shim so reviews and fixes are consistent with prior analysis.
 ---
 
 # Project: Speculative CO-Compliant Subtransaction Shim for NoSQL Stores
@@ -31,49 +31,65 @@ speculated on its data must abort too.
 ## Core data structures
 
 - `lock_mode ∈ {SHARED, EXCLUSIVE}`.
-- `LockNode { mode, holders: set of txn, predecessor, next }`. A node is one "generation" of lock
-  holders on a key. Consecutive SHARED requests join the same node; any EXCLUSIVE request, or a
-  SHARED request behind an EXCLUSIVE node, creates a new node.
-- `locks_map: ConcurrentHashMap<key, chain>`. Each key has a chain (doubly linked list) of
-  LockNodes ordered by arrival. The chain order *is* the conflict order on that key, and therefore
-  the required commit order.
-- `txn { txn_id, locks_acquired: key -> (mode, node), status, code }`.
-- `transactions_map: ConcurrentHashMap<txn_id, txn>`. `txn_id` is assigned by the 2PC coordinator,
-  not generated locally.
+- `LockNode { mode, holders: set of txn, predecessor, next, upgraded }`. A node is one "generation"
+  of lock holders on a key. Consecutive SHARED requests join the same node; any EXCLUSIVE request,
+  or a SHARED request behind an EXCLUSIVE node, creates a new node. `upgraded` (default false) means
+  the holder read the key before writing it (set by `upgrade()`); a node from a direct `put` is a
+  blind write.
+- `chain { head, tail }` per key, doubly linked through `predecessor`/`next`; `locks_map:
+  ConcurrentHashMap<key, chain>`. The chain order *is* the conflict order on that key, and therefore
+  the required commit order. Empty chains are removed from `locks_map` under the latch.
+- `txn { txn_id, locks_acquired: key -> (mode, node), status, code, write_buffer: key -> value }`.
+- `transactions_map: ConcurrentHashMap<txn_id, txn>`. `txn_id` is assigned by the 2PC coordinator.
+  A txn is removed from it when it is committed or aborted.
+- `lock_timeout`: bounds the waits of the execution phase.
 
 ## Transaction lifecycle
 
-Statuses: `NULL` (running) → `executed` → `prepared` → `committed`, with `must_abort` (doomed by a
-cascade) and `aborted` as the failure path. A design for executor-owned cleanup adds
-`abort_requested` (running and doomed) — see open issues.
+Statuses: `started` (running) → `executed` → `prepared` → `committing` → `committed`, with
+`must_abort` (doomed by a cascade) and `aborted` as the failure path.
 
-1. **execute(code)**: registers the txn and runs client code, which calls `get(k)` / `put(k, v)`.
-   Any `FAILED` result stops execution. On completion, CAS `NULL → executed`.
-2. **get / put**: acquire SHARED / EXCLUSIVE via `lock()`, then read or write the store directly.
-   Writes are in place (dirty); rollback will rely on an undo log (not yet implemented).
-3. **lock(k, mode)**: appends to the key's chain, then waits until every holder of the
-   predecessor node has at least `executed` (the speculation point). If a predecessor holder is
-   aborted or doomed, the txn aborts.
-4. **upgrade(k)**: SHARED → EXCLUSIVE. Case 1: sole holder of the tail node, upgrade in place.
-   Case 2: tail node shared with others, leave it and append a new EXCLUSIVE node behind it.
-   Case 3: something newer already queued behind, abort.
+Writes are **buffered** (`write_buffer`), not in place: nothing touches the store before `commit`,
+so there is no undo log. The buffer is final once the txn is `executed`. Nothing is logged and there
+is no crash recovery (out of scope).
+
+1. **execute(txn_id, code)**: registers the txn and runs client code, which calls `get(k)` /
+   `put(k, v)`. Any `FAILED` result stops execution. On completion, CAS `started → executed`; on any
+   failure it calls the idempotent `abort_transaction`.
+2. **get / put**: acquire SHARED / EXCLUSIVE via `lock()`. `put` fills `write_buffer`. `get` returns
+   the txn's own buffered write, else the buffer of the nearest EXCLUSIVE node at or before its own
+   node (safe: `lock()` returns only once every predecessor holder is at least `executed`), else the
+   store value (the writer, if any, already committed and applied its buffer).
+3. **lock(k, mode)**: appends to the key's chain (after re-checking the txn is not doomed, under the
+   latch), then waits until every holder of the predecessor node has at least `executed` (the
+   speculation point). If a predecessor holder is aborted or doomed, the txn aborts. The wait has a
+   deadline (`lock_timeout`): on expiry the txn aborts (deadlock breaking).
+4. **upgrade(k)**: SHARED → EXCLUSIVE, moving the txn only across readers, never across a writer.
+   Skip the SHARED nodes behind the txn's node to `p`, look at `after = p.next`. If `after.upgraded`
+   (RMW vs RMW): abort. Else if the txn is the sole holder and `p` is its node: flip in place. Else
+   leave the node and put a new EXCLUSIVE node right behind `p`: at the tail, or in front of the
+   blind writer `after` (whose predecessor pointer is fixed so it also waits for the upgrader). The
+   wait for the readers ahead is bounded by `lock_timeout` too.
 5. **prepare(txn_id)**: for every acquired lock, wait until all predecessor holders are
    `committed`, `aborted`, or `must_abort`. If any predecessor aborted, or the txn itself was
-   marked, abort and vote NO. Otherwise CAS to `prepared` and vote YES.
-6. **commit(txn_id)**: CAS `prepared → committed`, remove txn from every node, splice out nodes
-   that become empty (relinking predecessor/next).
+   marked, abort and vote NO. Otherwise CAS to `prepared` and vote YES. No timeout here: cross-shim
+   cycles are the coordinator's problem. A duplicate prepare on `prepared/committing/committed`
+   re-sends YES.
+6. **commit(txn_id)**: CAS `prepared → committing` (so an abort can no longer take it and a
+   successor's prepare cannot pass early), apply `write_buffer` to the store, remove the txn from
+   every node and splice out nodes that become empty, set `committed`, evict from `transactions_map`.
 7. **abort_transaction(txn)**: CAS to `aborted`. For each EXCLUSIVE lock held, mark every holder
-   of every later node on that chain `must_abort` (under the key's latch, **before** splicing).
-   Then remove the txn and splice out empty nodes.
-8. **mark_must_abort(txn)**: CAS `{NULL, executed} → must_abort`. Never touches `prepared`.
+   of every later node on that chain `must_abort` (under the latch, **before** splicing).
+   Then remove the txn, splice out empty nodes, evict from `transactions_map`.
+8. **mark_must_abort(txn)**: CAS `{started, executed} → must_abort`. Never touches `prepared`.
 
 ## Invariants that must hold
 
 - **CO**: a transaction may only commit after every transaction ahead of it on any shared key's
   chain has resolved. Ordering can be enforced transitively through intermediate nodes (a writer
   behind a reader behind a writer commits after both), but only if the chain stays connected.
-- **Chain integrity**: `predecessor`/`next` pointers and the chain's list order must always agree.
-  Every new node must be appended to the list, not only linked by pointers. A node is spliced out
+- **Chain integrity**: `predecessor`/`next` pointers and the chain's head/tail must always agree.
+  Every new node must be appended (or inserted), not only linked by pointers. A node is spliced out
   only when its holder set is empty, and splicing must relink both neighbours.
 - **Prepared is final for cascades**: once a txn has voted YES it must be able to commit. No
   cascade may move a `prepared` txn to `must_abort`; the prepare-time wait guarantees all its
@@ -81,11 +97,15 @@ cascade) and `aborted` as the failure path. A design for executor-owned cleanup 
 - **Cascade before splice**: an aborting writer must mark its successors doomed before it
   disappears from the chain, so no successor can observe an empty predecessor and vote YES on
   rolled-back data.
-- **Single cleanup owner for running txns**: while a txn is executing, only its execution thread
-  may release its locks; other threads request the abort and the executor acts on it.
+- **No leaked node from a foreign abort**: a foreign thread may abort a running txn
+  (`abort_transaction`), so `lock()`/`upgrade()` re-check the status inside the latch before
+  appending, and the status check and the `locks_acquired` update must be atomic w.r.t. that abort's
+  read of `locks_acquired`. `execute()` always calls the idempotent `abort_transaction` on FAILED.
+- **An upgrade never moves a txn across a writer**: otherwise the value it read is stale when its
+  own write takes effect (lost update).
 - **Wait predicates must re-read pointers**: `node.predecessor` changes while waiting because
-  predecessors get spliced out. Waits must loop and re-read under the key's latch, never capture a
-  node reference once.
+  predecessors get spliced out or a node is inserted in front. Waits must loop and re-read under the
+  latch, never capture a node reference once.
 
 ## Settled design decisions (do not re-litigate)
 
@@ -93,7 +113,8 @@ cascade) and `aborted` as the failure path. A design for executor-owned cleanup 
   changing. The extra cascades this causes are an accepted trade-off.
 - **Concurrency control**: `ConcurrentHashMap` with per-entry (per-key) synchronization, not a
   global latch. Hold at most one key latch at a time; release multi-key commits/aborts key by key.
-  Chains are created with `computeIfAbsent`.
+  Chains are created with `computeIfAbsent`. The pseudocode's `atomic(locks_map)` is one critical
+  section; an implementation may refine it if the status re-check stays atomic (see invariants).
 - **Wait/notify mechanics** (condition variables, futures) are an implementation detail, not a
   protocol concern.
 - **Transactions that hang or throw inside client code** are the client's problem; no execution
@@ -102,41 +123,23 @@ cascade) and `aborted` as the failure path. A design for executor-owned cleanup 
   there is no clean way to prevent it, and prepare catches it.
 - **Aborting behind aborted *readers*** (prepare aborts if any predecessor holder aborted, even a
   SHARED one) is known to over-abort; deferred for now.
+- **No crash recovery / durability**: out of scope; the shim is assumed not to crash between voting
+  YES and the decision.
+- **The 2PC coordinator owns the txn lifecycle**: it calls `execute` at most once per txn_id, sends
+  no prepare/commit/abort before `execute` was delivered, and garbage-collects. The shim evicts a
+  txn on commit/abort; later messages hit the unknown-id branches. No tombstones.
+- **Deadlocks**: only the execution phase is handled, by timeouts (`lock_timeout`). Waits in
+  `prepare()` have no timeout; a cross-shim cycle there is a 2PC-level matter left to the
+  coordinator.
+- **Retry** is the coordinator's job (fresh txn_id), not a shim state.
 
-## Not yet implemented (known TODOs)
+## Deferred (not bugs unless asked)
 
-- **Deadlock detection/prevention**: waits in `lock()`, `upgrade()` and `prepare()` are unbounded.
-  This includes cross-shim deadlocks at prepare time, where conflict orders differ between shims.
-- **Undo / write log** for rolling back in-place writes. Undo records must be written before the
-  store write; undo across a cascade of writers must apply newest-first.
-- **Durability** of prepared state for 2PC crash recovery.
-- **Retry mechanism** and its intermediate states.
-
-## Known open issues in the current pseudocode
-
-1. **Upgrade case 2 never appends `new_node` to the chain list**, so `last_node()` still returns
-   the shared node; later readers join ahead of the upgraded write and later writers overwrite
-   `node.next`. Also `upgrade()` references an undefined `target_node` after its wait (should be
-   `node`).
-2. **Stale predecessor pointers in wait predicates**: after a predecessor commits or aborts and is
-   spliced out, `node.predecessor` may be null (null dereference) or the captured node's holder
-   set may be empty (vacuous wait, allowing a commit ahead of an earlier writer). Fix with a
-   re-reading loop under the key latch; for prepare, "all earlier nodes resolved" reduces to
-   `node.predecessor == null`.
-3. **Cross-thread abort of a running txn**: coordinator abort, prepare on a `NULL` txn, and
-   prepare after a `NULL → must_abort` cascade all call `abort_transaction` from a foreign thread
-   while the executor may still be appending to `locks_acquired` or about to write. Planned fix:
-   `abort_requested` status, executor-owned cleanup, status re-check inside the latch in `lock()`,
-   and tombstones for aborts that arrive before `execute`.
-4. **Lock leak in prepare**: when the final CAS to `prepared` fails (late cascade mark), the txn
-   votes NO but is never aborted.
-5. **Smaller**: `execute()` returns SUCCEEDED even on failure or failed final CAS;
-   `putIfAbsent` returns null on success in Java; missing null checks for unknown txn_ids in
-   `prepare`/`commit`/`abort`; duplicate prepare after commit votes NO; upgrade case 3 aborts
-   common read-modify-write patterns; finished `must_abort` txns hold locks until the coordinator
-   contacts them; empty chains are never removed from `locks_map` (removal must be conditional
-   under the entry latch); `tartget_node` typo; stale comments ("integrate this data structure",
-   "recursive").
+- Cascade could stop at the next blind writer instead of dooming every later node.
+- A doomed-but-finished (`executed → must_abort`) txn holds its locks until the coordinator contacts
+  it (successors and prepare treat it as aborted meanwhile).
+- Blocked `prepare` handlers can exhaust a thread pool (implementation note).
+- Values are assumed non-null (`get` uses null as "no predecessor version").
 
 ## Guidance for working on this project
 
