@@ -406,4 +406,41 @@ The shim locks at the granularity of a single record, identified by its primary 
 \bigskip
 \newpage
 
+\section*{Invariants and Correctness Argument}
+
+This section is a proof sketch, not a machine-checked proof; the algorithms above have not been model-checked.
+
+\paragraph{Invariants.}
+\begin{description}
+\item[I1 Chain integrity.] For every key, \texttt{predecessor}/\texttt{next} and the chain's head/tail always agree, every new node is appended (or inserted) and not only linked, and a node is spliced out only when its holder set is empty, relinking both neighbours.
+\item[I2 Cascade before splice.] An aborting transaction marks its dependents \texttt{must\_abort} before it disappears from a chain, so no successor can observe an empty predecessor and vote YES on rolled-back data.
+\item[I3 Prepared is final.] A transaction that voted YES can still commit: \texttt{mark\_must\_abort} never touches \texttt{prepared}, and the prepare-time wait guarantees that every predecessor was resolved before the vote.
+\item[I4 No leaked node.] The status re-check and the update of \texttt{locks\_acquired} are atomic with respect to \Call{abort\_transaction}{} reading \texttt{locks\_acquired}, and \Call{execute}{} always calls the idempotent \Call{abort\_transaction}{} on failure, so an aborted transaction never leaves a node behind.
+\item[I5 Upgrades never cross a writer.] Otherwise the value read would be stale when the upgrader's own write takes effect (lost update); two read-modify-write upgraders on the same position cannot both survive.
+\item[I6 Buffer finality.] A \texttt{write\_buffer} does not change once the transaction is \texttt{executed}, and \Call{lock}{} returns only after every predecessor holder is at least \texttt{executed}, so a speculative read sees a final value.
+\item[I7 Fresh pointers.] Wait predicates never rely on a captured node reference: \texttt{predecessor} is re-read under the latch on every iteration, since nodes are spliced out or inserted in front while waiting.
+\end{description}
+
+\paragraph{Local CO.} Claim: if $T_i$ precedes $T_j$ on the chain of some key, then $T_j$ does not vote YES before $T_i$ has committed or aborted (and $T_j$ does not commit before $T_i$ commits).
+(1) By I1 and I5, the chain order of a key is the conflict order of the transactions that touch it: locks are only appended at the tail, and an upgrade only moves a transaction across readers or in front of a blind writer, which never read the key. A read returns the value of the nearest EXCLUSIVE node at or before its own node (I6), so reads are consistent with the chain order.
+(2) \Call{prepare}{} does not vote until, for every key, the predecessor node has been removed from the chain by the commit or abort of all its holders (its wait re-reads the pointer, I7, so it keeps waiting through spliced-out nodes until the head is reached), and it votes NO if an aborted or doomed holder is seen.
+(3) If a predecessor aborts, every transaction that read its value is doomed before the splice (I2) and cannot pass \Call{prepare}{}: the final CAS to \texttt{prepared} fails. If the predecessor commits, its writes are applied before its nodes are spliced, so a successor observing the splice reads correct data.
+(4) A transaction that voted YES cannot be doomed later (I3), and \texttt{committing} keeps a coordinator abort from taking it. Hence, on each shim, the commit order of conflicting transactions equals their conflict order: the local history is CO.
+
+\paragraph{Global serializability.} Each shim produces a CO history, and all shims use 2PC as atomic commitment with an external coordinator. It is a known result that the union of CO local histories under atomic commitment is globally CO, hence globally serializable, without any global concurrency-control component. The system model assumptions (no crash between YES and the decision, coordinator-owned \texttt{txn\_id} lifecycle) are part of this argument.
+
+\paragraph{Liveness.} Waits of the execution phase are bounded by \texttt{lock\_timeout} (deadlock breaking, costs liveness only). Within one shim there is no cycle among executed transactions: a cycle of chain orders would need each transaction to wait for the other to reach \texttt{executed}, which the timeout breaks before both can finish. Waits in \texttt{prepare} follow the chain order and cannot cycle within one shim; cross-shim cycles there are left to the coordinator.
+
+\paragraph{Known limitations.}
+\begin{itemize}
+\item A doomed transaction that already finished executing keeps its nodes until the coordinator contacts it, so new writers behind it abort and the cascade to its own successors is delayed.
+\item A waiter aborts when it sees an aborted or doomed predecessor holder, even a reader, and the cascade dooms the whole suffix of a chain, including blind writers that never read the aborted value.
+\item Deadlock victims are chosen by whoever times out first; both members of a cycle can be aborted.
+\item A transaction that is \texttt{executed} but never prepared holds its locks until the coordinator contacts it; there is no participant-side timeout, although aborting before voting YES would be legal.
+\item Crash recovery, and blocking of prepared transactions when the coordinator dies, are out of scope.
+\end{itemize}
+
+\bigskip
+\newpage
+
 \end{document}
