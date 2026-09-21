@@ -13,7 +13,10 @@
 Crash recovery is out of scope. The shim is assumed not to crash: in particular not between voting YES and the coordinator's decision. Nothing is persisted (\texttt{locks\_map}, \texttt{transactions\_map} and the write buffers are volatile), so 2PC atomicity holds only under this no-crash assumption. No Byzantine failures. Network is asynchronous: messages may be delayed, lost, duplicated, reordered, not corrupted; coordinator messages are therefore idempotent at the shim. Partitions eventually heal.
 
 \paragraph{Storage Assumptions.}
-The underlying NoSQL store is a black box offering only \texttt{read} and \texttt{write}: \texttt{write} is a blind put and no atomicity across keys is assumed. Store operations are blocking and are retried until they succeed, so the protocol has no error path for store failures. \texttt{txn\_id}s are assigned by the coordinator and never reused.
+The underlying NoSQL store is a black box offering only \texttt{read} and \texttt{write}: \texttt{write} is a blind put and no atomicity across keys is assumed. Store operations are blocking and are retried until they succeed, so the protocol has no error path for store failures.
+
+\paragraph{Coordinator Assumptions.}
+\texttt{txn\_id}s are assigned by the coordinator. It calls \texttt{execute} at most once per \texttt{txn\_id} and sends no \texttt{prepare}/\texttt{commit}/\texttt{abort} for a \texttt{txn\_id} before its \texttt{execute} has been delivered. Garbage collection of transaction state is its responsibility as well: the shim drops a subtransaction from \texttt{transactions\_map} once it is committed or aborted, and later or duplicate messages for that \texttt{txn\_id} find no entry (\texttt{prepare} votes NO, \texttt{commit} and \texttt{abort} are no-ops).
 
 \paragraph{Execution Model.}
 A subtransaction's handler issues \texttt{get}/\texttt{put} calls against its local store as it runs; each call acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution (\texttt{committed}/\texttt{aborted}) at \texttt{prepare}. A later write to an already-read key triggers a lock upgrade in place, or off the shared node if other readers joined it; if the chain has already moved on past that point, the upgrade cannot be safely spliced in and the subtransaction aborts. Each subtransaction's \texttt{execute} runs its handler code as a single logical unit and ends by flipping status to \texttt{executed} --- but this is not uninterruptible in the scheduling sense: individual \texttt{get}/\texttt{put} calls within it can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{MUST\_ABORT} result from any \texttt{get}/\texttt{put} (whether from \Call{lock}{} or from \Call{upgrade}{}'s case 3) requires the handler to stop executing immediately rather than continue. Application code may not access the store or acquire locks except through \texttt{get}/\texttt{put}. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
@@ -245,9 +248,9 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \textbf{Send no to 2PC controller}
         \State \textbf{return}
     \EndIf
-    \If{$txn.\text{status} == \text{committed}$}
-        \State \Comment{duplicate/late prepare after commit}
-        \State \textbf{Send no to 2PC controller}
+    \If{$txn.\text{status} \in \{\text{prepared}, \text{committing}, \text{committed}\}$}
+        \State \Comment{duplicate/late prepare: the txn already voted YES, re-send it}
+        \State \textbf{Send yes to 2PC controller}
         \State \textbf{return}
     \EndIf
     \If{$txn.\text{status} \notin \{\text{executed}, \text{prepared}\}$}
@@ -317,6 +320,7 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndFor
     \}
     \State $\text{txn.status} \gets \text{committed}$
+    \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: volatile state dropped; the coordinator owns the txn\_id lifecycle}
 \EndProcedure
 
 \Statex
@@ -346,6 +350,7 @@ The shim locks at the granularity of a single record, identified by its primary 
             \EndIf
         \EndFor
     \}
+    \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: evicted like in \Call{commit}{}}
 \EndProcedure
 
 \Statex

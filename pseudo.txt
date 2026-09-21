@@ -29,6 +29,11 @@ Store:
         // 2. No crashes: crash recovery is out of scope. The shim is assumed not to crash between
         //    voting YES and the coordinator's decision (nothing is logged, so a crash there would
         //    lose a prepared txn and break 2PC atomicity).
+        // 3. Coordinator: txn_ids are assigned by the coordinator. It calls execute at most once per
+        //    txn_id and sends no prepare/commit/abort for a txn_id before its execute has been
+        //    delivered. Garbage collection of txn state is its responsibility too: the shim drops a txn
+        //    from transactions_map once it is committed or aborted, and later or duplicate messages for
+        //    that id take the unknown-id branches (prepare votes NO, commit/abort are no-ops).
 
 
 procedure execute(code):
@@ -245,10 +250,10 @@ procedure prepare(txn_id):
         send no to 2PC controller
         return
 
-    if txn.status == committed:
-        // duplicate/late prepare after commit already happened: nothing
-        // to abort, txn is already resolved the other way
-        send no to 2PC controller
+    if txn.status in {prepared, committing, committed}:
+        // duplicate/late prepare (coordinator messages are idempotent): the txn already voted YES
+        // and every predecessor was resolved before that, so just re-send the vote
+        send yes to 2PC controller
         return
 
     if txn.status not in {executed, prepared}:
@@ -329,8 +334,10 @@ procedure commit(txn_id):
                 remove target_node from chain
     }
     txn.status=committed
-    // safe to evict txn from any external txn-id registry after this
-    // point --- nothing in locks_map references it anymore
+    transactions_map.remove(txn.txn_id)
+    // resolved: the volatile state is dropped, nothing in locks_map references the txn anymore.
+    // Whatever comes for this txn_id afterwards is handled by the unknown-id branches
+    // (assumption 3: the coordinator owns the txn_id lifecycle)
 
 
 procedure abort_transaction(txn):
@@ -360,10 +367,9 @@ procedure abort_transaction(txn):
     }
 
 
-    // safe to evict txn from any external txn-id registry after this
-    // point --- status is already set for any successor to observe
-    // directly, and a duplicate/late message for an evicted id can be
-    // treated as a no-op abort
+    transactions_map.remove(txn.txn_id)
+    // resolved: evicted like in commit(). Successors observe txn.status directly (they hold a
+    // reference, not a map lookup), and a duplicate/late message for the evicted id is a no-op abort
 
 procedure abort(txn_id):
     txn = transactions_map[txn_id]
