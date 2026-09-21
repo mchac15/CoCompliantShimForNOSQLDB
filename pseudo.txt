@@ -11,7 +11,11 @@ Data Structures:
     status ∈ {started, executed, prepared, committing, committed, aborted, must_abort,NULL}
     // TODO: intermediate states for retry mechanism
 
-    transactions_map: ConcurrentHashMap<txn_id, txn>   
+    transactions_map: ConcurrentHashMap<txn_id, txn>
+    // atomic(locks_map) { ... } is one critical section over the chains. An implementation may use
+    // per-key latches (one at a time) as long as the status re-check in lock()/upgrade() and the update of
+    // txn.locks_acquired stay atomic with respect to abort_transaction() reading locks_acquired (e.g. both
+    // under a per-txn guard); otherwise a foreign abort_transaction() can miss a node appended concurrently
 
 
 Store:
@@ -42,6 +46,11 @@ procedure execute(code):
     // may block inside a get/put on a predecessor; a FAILED result
     // requires the handler to stop calling get/put and return immediately
     if execution_failed or not CAS(txn.status, started, executed):
+        // a get/put that returned FAILED already ran abort_transaction, but the CAS can also fail
+        // because a cascade / foreign abort landed after the last get/put, and then nobody has
+        // released the locks yet. abort_transaction is idempotent (its CAS fails on an already
+        // aborted txn), so always call it here
+        abort_transaction(txn)
         return FAILED
 
     return SUCCEEDED
@@ -100,6 +109,12 @@ procedure lock(k, mode, txn):
         return upgrade(k, txn)
 
     atomic(locks_map) {
+        if txn.status in {aborted, must_abort}:
+            // re-check under the latch: a foreign abort_transaction() (coordinator abort(), or
+            // prepare() on a txn that is still started) may have released this txn's locks after
+            // the check at the top. Appending a node now would leave one nobody ever removes
+            return MUST_ABORT
+
         if k not in locks_map:
             locks_map[k] = new chain
 
@@ -161,6 +176,9 @@ procedure upgrade(k, txn):
     return_value=MUST_ABORT
 
     atomic(locks_map) {
+        if txn.status in {aborted, must_abort}:
+            return MUST_ABORT   // re-check under the latch, same reason as in lock()
+
         node = txn.locks_acquired[k].target_node
 
         if node == locks_map[k].last_node() and node.holders == {txn}:

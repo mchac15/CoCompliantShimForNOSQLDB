@@ -41,6 +41,7 @@ The shim locks at the granularity of a single record, identified by its primary 
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}, \text{NULL}\}$
 \State \Comment{TODO: intermediate states for retry mechanism}
 \State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$
+\State \Comment{atomic(locks\_map) is one critical section; per-key latches are fine if the status re-check and the update of locks\_acquired stay atomic w.r.t. \Call{abort\_transaction}{} reading locks\_acquired}
 
 \Statex
 \State \textbf{Store:} black box NoSQL store, nothing more is assumed than the following
@@ -60,6 +61,7 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State stop execution and set $execution\_failed \gets \text{true}$
     \EndIf
     \If{$execution\_failed$ \textbf{or not} \Call{CAS}{txn.\text{status}, \text{started}, \text{executed}}}
+        \State \Call{abort\_transaction}{txn} \Comment{idempotent; releases the locks if a cascade or foreign abort landed after the last get/put}
         \State \textbf{return} FAILED
     \EndIf
     \State \textbf{return} SUCCEEDED
@@ -130,6 +132,9 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \textbf{return} \Call{upgrade}{k, txn}
     \EndIf
     \State \textbf{atomic}(locks\_map) \{
+        \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
+            \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the latch: a foreign \Call{abort\_transaction}{} may have released our locks after the check above}
+        \EndIf
         \If{$k \notin \text{locks\_map}$}
             \State \indent $\text{locks\_map}[k] = \text{new chain}$
         \EndIf
@@ -177,6 +182,9 @@ The shim locks at the granularity of a single record, identified by its primary 
     \State $node \gets \text{null}$
     \State $return\_value \gets \text{MUST\_ABORT}$
     \State \textbf{atomic}(locks\_map) \{
+        \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
+            \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the latch, as in \Call{lock}{}}
+        \EndIf
         \State \indent $node \gets \text{txn.locks\_acquired}[k].\text{target\_node}$
         \If{$node == \text{locks\_map}[k].\text{last\_node}()$ \textbf{and} $node.\text{holders} == \{txn\}$}
             \State \indent $\text{locks\_map}[k].\text{last\_node}().\text{mode} = \text{EXCLUSIVE}$ \Comment{case 1: pure in-place upgrade}
