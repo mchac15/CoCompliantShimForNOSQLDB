@@ -319,6 +319,11 @@ The shim locks at the granularity of a single record, identified by its primary 
     \EndFor
 
     \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared}}
+        \If{$txn.\text{status} \in \{\text{prepared}, \text{committing}, \text{committed}\}$}
+            \State \Comment{a concurrent duplicate prepare already voted YES: voting NO now would contradict it, re-send YES}
+            \State \textbf{Send yes to 2PC controller}
+            \State \textbf{return}
+        \EndIf
         \State \Comment{late cascade mark: the txn never prepared, so abort it and release its locks}
         \State \textbf{Send no to 2PC controller}
         \State \Call{abort\_transaction}{txn}
