@@ -366,8 +366,12 @@ The shim locks at the granularity of a single record, identified by its primary 
         \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
             \State \indent $chain \gets \text{locks\_map}[k]$
             \If{$mode == \text{EXCLUSIVE}$}
+                \State \indent\indent \Comment{doom exactly the txns that depend on this write: the readers behind it and the upgraded writers (they read $k$), and transitively everything up to the first blind writer, which never read $k$ and which everything behind it read from instead}
                 \State \indent\indent $successor\_node \gets target\_node.\text{next}$
                 \While{$successor\_node \neq \text{null}$}
+                    \If{$successor\_node.\text{mode} == \text{EXCLUSIVE}$ \textbf{and not} $successor\_node.\text{upgraded}$}
+                        \State \indent\indent\indent \textbf{break} \Comment{blind writer}
+                    \EndIf
                     \State \indent\indent\indent \textbf{for each} $t \in successor\_node.\text{holders}$\textbf{:} \Call{mark\_must\_abort}{t}
                     \State \indent\indent\indent $successor\_node \gets successor\_node.\text{next}$
                 \EndWhile

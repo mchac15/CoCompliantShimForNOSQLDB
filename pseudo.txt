@@ -401,8 +401,15 @@ procedure abort_transaction(txn):
             chain = locks_map[k]
 
             if mode == EXCLUSIVE:
+                // doom exactly the txns that depend on this txn's write: the readers behind it and
+                // the upgraded writers (they read k and computed their write from it), and, since
+                // those are doomed in turn, everything up to the first blind writer. A blind writer
+                // never read k and neither did anyone behind it (they read from it, not from us), so
+                // the walk stops there
                 successor_node = target_node.next
                 while successor_node != null:
+                    if successor_node.mode == EXCLUSIVE and not successor_node.upgraded:
+                        break   // blind writer
                     for each t in successor_node.holders:
                         mark_must_abort(t)
                     successor_node = successor_node.next
