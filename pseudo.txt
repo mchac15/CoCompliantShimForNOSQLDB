@@ -437,6 +437,11 @@ procedure abort(txn_id):
     abort_transaction(txn)
 
 
-procedure mark_must_abort(txn):
+procedure mark_must_abort(txn_id):
+    txn = transactions_map[txn_id]
+
+    if txn == null:
+        return   // unknown/already-evicted txn_id: no-op, per the
+                 // evicted-id convention documented in abort_transaction()
     if not CAS(txn.status, {started, executed}, must_abort):
         return
