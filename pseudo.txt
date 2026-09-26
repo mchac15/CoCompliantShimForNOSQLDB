@@ -410,6 +410,8 @@ procedure abort_transaction(txn):
             if mode == EXCLUSIVE:
                 successor_node = target_node.next
                 while successor_node != null:
+                    if successor_node.mode == EXCLUSIVE and not successor_node.upgraded:
+                        break   // blind write
                     for each t in successor_node.holders:
                         if mark_must_abort(t):
                             doomed_finished.add(t)
