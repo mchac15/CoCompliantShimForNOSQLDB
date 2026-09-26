@@ -367,13 +367,14 @@ The shim locks at the granularity of a single record, identified by its primary 
         \State \textbf{return}
     \EndIf
 
+    \State $doomed\_finished \gets \{\}$ \Comment{txn\_ids of cascade victims that had already finished executing}
     \State \textbf{atomic}(locks\_map) \{
         \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
             \State \indent $chain \gets \text{locks\_map}[k]$
             \If{$mode == \text{EXCLUSIVE}$}
                 \State \indent\indent $successor\_node \gets target\_node.\text{next}$
                 \While{$successor\_node \neq \text{null}$}
-                    \State \indent\indent\indent \textbf{for each} $t \in successor\_node.\text{holders}$\textbf{:} \Call{mark\_must\_abort}{t}
+                    \State \indent\indent\indent \textbf{for each} $t \in successor\_node.\text{holders}$\textbf{:} \textbf{if} \Call{mark\_must\_abort}{t.\text{txn\_id}}\textbf{:} $doomed\_finished\text{.add}(t.\text{txn\_id})$
                     \State \indent\indent\indent $successor\_node \gets successor\_node.\text{next}$
                 \EndWhile
             \EndIf
@@ -387,6 +388,8 @@ The shim locks at the granularity of a single record, identified by its primary 
         \EndFor
     \}
     \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: evicted like in \Call{commit}{}}
+
+    \State \textbf{for each} $id \in doomed\_finished$\textbf{:} \Call{abort}{id} \Comment{eager cleanup, outside the latch: a doomed txn already \texttt{executed} has no thread left to abort it; going through \Call{abort}{} by id (not the txn object) makes an already-evicted victim an ordinary no-op}
 \EndProcedure
 
 \Statex
@@ -399,10 +402,16 @@ The shim locks at the granularity of a single record, identified by its primary 
 \EndProcedure
 
 \Statex
-\Procedure{mark\_must\_abort}{txn}
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{started}, \text{executed}\}, \text{must\_abort}}}
-        \State \textbf{return}
+\Procedure{mark\_must\_abort}{txn\_id} \Comment{returns true iff txn was \texttt{executed}: the caller must clean it up itself}
+    \State $txn \gets \text{transactions\_map}[txn\_id]$
+    \If{$txn == \text{null}$}
+        \State \textbf{return false} \Comment{unknown/already-evicted txn\_id: no-op}
     \EndIf
+    \If{\Call{CAS}{\text{txn.status}, \text{executed}, \text{must\_abort}}}
+        \State \textbf{return true}
+    \EndIf
+    \State \Call{CAS}{\text{txn.status}, \text{started}, \text{must\_abort}} \Comment{still running: its own thread aborts it at its next \Call{lock}{} or at the CAS in \Call{execute}{}}
+    \State \textbf{return false}
 \EndProcedure
 
 \end{algorithmic}

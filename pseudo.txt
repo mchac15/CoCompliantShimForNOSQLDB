@@ -402,6 +402,7 @@ procedure abort_transaction(txn):
     if not CAS(txn.status, {executed, prepared, must_abort, started}, aborted):
         return
 
+    doomed_finished = {}   // txn_ids of cascade victims that had already finished executing
     atomic(locks_map) {
         for each (k, mode, target_node) in txn.locks_acquired:
             chain = locks_map[k]
@@ -410,7 +411,8 @@ procedure abort_transaction(txn):
                 successor_node = target_node.next
                 while successor_node != null:
                     for each t in successor_node.holders:
-                        mark_must_abort(t)
+                        if mark_must_abort(t.txn_id):
+                            doomed_finished.add(t.txn_id)
                     successor_node = successor_node.next
 
             remove txn from target_node.holders
@@ -429,6 +431,19 @@ procedure abort_transaction(txn):
     // resolved: evicted like in commit(). Successors observe txn.status directly (they hold a
     // reference, not a map lookup), and a duplicate/late message for the evicted id is a no-op abort
 
+    // eager cleanup, outside the latch (so at most one key latch is ever held): a doomed txn that
+    // already finished executing has no thread left that would ever abort it, and waiting for the
+    // coordinator would leave its nodes in the chain (every new writer behind it aborts, and its own
+    // successors are not doomed until it aborts). We go through abort(id) here, the same txn_id-based
+    // entry point a foreign caller uses, instead of holding onto the txn object and calling
+    // abort_transaction(t) directly: by the time this runs the victim may already have been evicted
+    // by another cascade or by the coordinator, and abort(id)'s map lookup makes that the ordinary
+    // unknown/already-evicted no-op instead of a stale-reference special case. Aborting it now
+    // releases its locks and cascades transitively; its later prepare/commit/abort hit the
+    // unknown-id branches (prepare votes NO)
+    for each id in doomed_finished:
+        abort(id)
+
 procedure abort(txn_id):
     txn = transactions_map[txn_id]
     if txn == null:
@@ -437,11 +452,16 @@ procedure abort(txn_id):
     abort_transaction(txn)
 
 
-procedure mark_must_abort(txn_id):
+procedure mark_must_abort(txn_id) -> bool:
+    // returns true iff txn was executed: nobody runs it anymore, so the caller has to clean it up
+    // itself (see abort_transaction). Never touches prepared
     txn = transactions_map[txn_id]
 
     if txn == null:
-        return   // unknown/already-evicted txn_id: no-op, per the
-                 // evicted-id convention documented in abort_transaction()
-    if not CAS(txn.status, {started, executed}, must_abort):
-        return
+        return false   // unknown/already-evicted txn_id: no-op, per the
+                        // evicted-id convention documented in abort_transaction()
+    if CAS(txn.status, executed, must_abort):
+        return true
+    CAS(txn.status, started, must_abort)   // still running: its own thread aborts it at its next
+                                            // lock() or at the CAS in execute()
+    return false
