@@ -402,7 +402,7 @@ procedure abort_transaction(txn):
     if not CAS(txn.status, {executed, prepared, must_abort, started}, aborted):
         return
 
-    doomed_finished = {}   // txn_ids of cascade victims that had already finished executing
+    doomed_finished = {}   // cascade victims (txn objects) that had already finished executing
     atomic(locks_map) {
         for each (k, mode, target_node) in txn.locks_acquired:
             chain = locks_map[k]
@@ -411,8 +411,8 @@ procedure abort_transaction(txn):
                 successor_node = target_node.next
                 while successor_node != null:
                     for each t in successor_node.holders:
-                        if mark_must_abort(t.txn_id):
-                            doomed_finished.add(t.txn_id)
+                        if mark_must_abort(t):
+                            doomed_finished.add(t)
                     successor_node = successor_node.next
 
             remove txn from target_node.holders
@@ -434,15 +434,14 @@ procedure abort_transaction(txn):
     // eager cleanup, outside the latch (so at most one key latch is ever held): a doomed txn that
     // already finished executing has no thread left that would ever abort it, and waiting for the
     // coordinator would leave its nodes in the chain (every new writer behind it aborts, and its own
-    // successors are not doomed until it aborts). We go through abort(id) here, the same txn_id-based
-    // entry point a foreign caller uses, instead of holding onto the txn object and calling
-    // abort_transaction(t) directly: by the time this runs the victim may already have been evicted
-    // by another cascade or by the coordinator, and abort(id)'s map lookup makes that the ordinary
-    // unknown/already-evicted no-op instead of a stale-reference special case. Aborting it now
-    // releases its locks and cascades transitively; its later prepare/commit/abort hit the
-    // unknown-id branches (prepare votes NO)
-    for each id in doomed_finished:
-        abort(id)
+    // successors are not doomed until it aborts). We hold these as the live txn objects gathered
+    // during the cascade above (not ids): calling abort_transaction(t) directly is safe even if t
+    // has since been resolved by another concurrent cascade or by the coordinator, because its
+    // leading CAS simply fails on an already-{aborted,committed} status and returns, the same
+    // idempotent no-op as any other duplicate abort. Aborting it now releases its locks and cascades
+    // transitively; its later prepare/commit/abort hit the unknown-id branches (prepare votes NO)
+    for each t in doomed_finished:
+        abort_transaction(t)
 
 procedure abort(txn_id):
     txn = transactions_map[txn_id]
@@ -452,14 +451,12 @@ procedure abort(txn_id):
     abort_transaction(txn)
 
 
-procedure mark_must_abort(txn_id) -> bool:
+procedure mark_must_abort(txn) -> bool:
     // returns true iff txn was executed: nobody runs it anymore, so the caller has to clean it up
-    // itself (see abort_transaction). Never touches prepared
-    txn = transactions_map[txn_id]
-
-    if txn == null:
-        return false   // unknown/already-evicted txn_id: no-op, per the
-                        // evicted-id convention documented in abort_transaction()
+    // itself (see abort_transaction). Never touches prepared. Takes the txn object directly (like
+    // abort_transaction()): mark_must_abort is only ever called from within a cascade that already
+    // holds a live reference to the victim (via successor_node.holders), never from the coordinator,
+    // so there is no id-based external entry point for it to be consistent with
     if CAS(txn.status, executed, must_abort):
         return true
     CAS(txn.status, started, must_abort)   // still running: its own thread aborts it at its next
