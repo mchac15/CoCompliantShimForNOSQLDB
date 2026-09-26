@@ -347,6 +347,12 @@ procedure prepare(txn_id):
             break   // pred fully resolved with no abort among its holders
 
     if not CAS(txn.status, {executed, prepared}, prepared):
+        if txn.status in {prepared, committing, committed}:
+            // a concurrent duplicate prepare already CASed to prepared and voted YES (and the
+            // coordinator may even have moved on to commit). Voting NO now would contradict that
+            // vote, so just re-send it
+            send yes to 2PC controller
+            return
         // status moved out from under us (e.g. a late cascade mark_must_abort
         // landed after the wait loop finished) --- the txn never became
         // prepared, so it is always safe to abort it here and release its
