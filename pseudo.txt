@@ -158,7 +158,7 @@ procedure lock(k, mode, txn):
         // under the latch on every iteration instead of trusting this captured
         // reference once resolved
         wait until (∀ t in pred.holders,
-                t.status in {committed, aborted, executed, prepared, committing, must_abort})
+                t.status in {committed, executed, prepared, committing})
                 or txn.status == aborted or txn.status == must_abort
                 or pred != target_node.predecessor
                 or now() >= deadline
@@ -166,22 +166,22 @@ procedure lock(k, mode, txn):
         if pred != target_node.predecessor:
             continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
 
-        if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
-            abort_transaction(txn)
-            return MUST_ABORT
-
+        // no abort on an aborted / doomed predecessor holder here: such a holder does not satisfy the
+        // wait above, so this txn waits until it is spliced out (pred != target_node.predecessor).
+        // Whether this txn depends on the aborted holder is decided by the cascade, which marks
+        // exactly the dependents must_abort before the splice (see abort_transaction)
         if txn.status in {aborted, must_abort}:
             return MUST_ABORT
 
         if not (∀ t in pred.holders,
-                t.status in {committed, aborted, executed, prepared, committing, must_abort}):
+                t.status in {committed, executed, prepared, committing}):
             // the wait ended on the deadline: assume a deadlock (or a predecessor that never
             // finishes executing). Always safe: this txn has not executed and voted nothing, so it
             // just aborts. Costs liveness only, never CO or 2PC atomicity
             abort_transaction(txn)
             return MUST_ABORT
 
-        break   // pred fully resolved with no abort among its holders
+        break   // every holder of pred reached the speculation point
 
     // Deadlocks between running txns (T1 holds X and waits for Y while T2 holds Y and waits for X) are
     // broken by lock_timeout above; no wait-for graph is kept
@@ -263,7 +263,7 @@ procedure upgrade(k, txn):
             // new_node.predecessor under the latch on every iteration instead
             // of trusting a captured reference once resolved
             wait until (∀ t in pred.holders,
-                        t.status in {committed, aborted, executed, prepared, committing, must_abort})
+                        t.status in {committed, executed, prepared, committing})
                         or txn.status == aborted or txn.status == must_abort
                         or pred != new_node.predecessor
                         or now() >= deadline
@@ -271,19 +271,16 @@ procedure upgrade(k, txn):
             if pred != new_node.predecessor:
                 continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
 
-            if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
-                abort_transaction(txn)
-                return MUST_ABORT
-
+            // no abort on an aborted / doomed predecessor holder, same as in lock(): wait for its splice
             if txn.status in {aborted, must_abort}:
                 return MUST_ABORT
 
             if not (∀ t in pred.holders,
-                        t.status in {committed, aborted, executed, prepared, committing, must_abort}):
+                        t.status in {committed, executed, prepared, committing}):
                 abort_transaction(txn)   // deadline reached: same reasoning as in lock()
                 return MUST_ABORT
 
-            break   // pred fully resolved with no abort among its holders
+            break   // every holder of pred reached the speculation point
 
         // the wait above is bounded by lock_timeout, like in lock(): e.g. two readers of the same
         // shared node, one upgrading and waiting for the other, which waits on this txn via another key
@@ -323,7 +320,12 @@ procedure prepare(txn_id):
             // pred can be spliced out from under us while we wait; re-read
             // node.predecessor under the latch on every iteration instead of
             // trusting this captured reference once resolved
-            wait until (∀ t in pred.holders, t.status in {committed, aborted, must_abort})
+            // an aborted / doomed holder does not satisfy this wait either: wait until it is spliced out
+            // (pred != node.predecessor). If this txn depended on it, the cascade already marked it
+            // must_abort before the splice, which the status check below catches; if it did not (a
+            // blind writer behind an aborted writer, anyone behind an aborted reader), it goes on
+            // and still waits for whatever is now ahead of it
+            wait until (∀ t in pred.holders, t.status == committed)
                         or txn.status == aborted or txn.status == must_abort
                         or pred != node.predecessor
             // txn may have been cascade-aborted by a different key's
@@ -339,12 +341,7 @@ procedure prepare(txn_id):
             if pred != node.predecessor:
                 continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
 
-            if ∃ t in pred.holders with t.status == aborted or t.status == must_abort:
-                abort_transaction(txn)
-                send no to 2PC controller
-                return
-
-            break   // pred fully resolved with no abort among its holders
+            break   // every holder of pred committed
 
     if not CAS(txn.status, {executed, prepared}, prepared):
         if txn.status in {prepared, committing, committed}:
