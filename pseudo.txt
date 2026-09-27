@@ -456,7 +456,5 @@ procedure mark_must_abort(txn) -> bool:
     // abort_transaction()): mark_must_abort is only ever called from within a cascade that already
     // holds a live reference to the victim (via successor_node.holders), never from the coordinator,
     // so there is no id-based external entry point for it to be consistent with
-    before,after=CAS_returning(txn.status, {executed, prepared, must_abort, started}, must_abort)
-    if before==executed and after==must_abort:
-        return true
-    return false
+    before=CAS_returning(txn.status, {executed, started}, must_abort)
+    return before==executed
