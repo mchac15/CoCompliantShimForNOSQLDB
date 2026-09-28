@@ -1,0 +1,105 @@
+From 7cbbd4461fb2523fa00d0bb4f29943d5a701b52d Mon Sep 17 00:00:00 2001
+From: Matheo Chacon <matheochacon1@gmail.com>
+Date: Mon, 28 Sep 2026 17:05:28 +0200
+Subject: [PATCH] xa: let non-SQL XA data sources plug into DataSourceProxyXA
+
+- JdbcUtils: fall back to the JDBC subprotocol as dbType and to no Driver
+  for URLs Druid does not know (e.g. jdbc:coshim:...)
+- DataSourceProxyXA: protected createXAConnection hook, defaulting to
+  XAUtils.createXAConnection, so such data sources supply their own
+  XAConnection
+---
+ .../seata/rm/datasource/util/JdbcUtils.java   | 34 ++++++++++++++++---
+ .../rm/datasource/xa/DataSourceProxyXA.java   | 11 +++++-
+ 2 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/rm-datasource/src/main/java/org/apache/seata/rm/datasource/util/JdbcUtils.java b/rm-datasource/src/main/java/org/apache/seata/rm/datasource/util/JdbcUtils.java
+index cd48ecb95..d9bf995cb 100644
+--- a/rm-datasource/src/main/java/org/apache/seata/rm/datasource/util/JdbcUtils.java
++++ b/rm-datasource/src/main/java/org/apache/seata/rm/datasource/util/JdbcUtils.java
+@@ -49,7 +49,33 @@ public final class JdbcUtils {
+     private JdbcUtils() {}
+ 
+     public static String getDbType(String jdbcUrl) {
+-        return getDbTypeParser().parseFromJdbcUrl(jdbcUrl).toLowerCase();
++        String dbType = getDbTypeParser().parseFromJdbcUrl(jdbcUrl);
++        if (dbType == null) {
++            // not a database the parser knows (e.g. a non-SQL XA data source such as jdbc:coshim:...):
++            // fall back to the JDBC subprotocol
++            dbType = subProtocol(jdbcUrl);
++        }
++        return dbType.toLowerCase();
++    }
++
++    static String subProtocol(String jdbcUrl) {
++        String rest = jdbcUrl.startsWith("jdbc:") ? jdbcUrl.substring("jdbc:".length()) : jdbcUrl;
++        int end = rest.indexOf(':');
++        return end > 0 ? rest.substring(0, end) : rest;
++    }
++
++    /**
++     * Driver for the JDBC URL, or null for URLs no known driver handles (non-SQL XA data sources that
++     * supply their own XAConnection, see DataSourceProxyXA#createXAConnection).
++     */
++    static Driver resolveDriver(String jdbcUrl) throws SQLException {
++        String driverClassName;
++        try {
++            driverClassName = com.alibaba.druid.util.JdbcUtils.getDriverClassName(jdbcUrl);
++        } catch (SQLException unknownDriver) {
++            return null;
++        }
++        return loadDriver(driverClassName);
+     }
+ 
+     /**
+@@ -65,8 +91,7 @@ public final class JdbcUtils {
+         try (Connection connection = dataSource.getConnection()) {
+             String jdbcUrl = connection.getMetaData().getURL();
+             dataSourceResource.setResourceId(buildResourceId(jdbcUrl));
+-            String driverClassName = com.alibaba.druid.util.JdbcUtils.getDriverClassName(jdbcUrl);
+-            dataSourceResource.setDriver(loadDriver(driverClassName));
++            dataSourceResource.setDriver(resolveDriver(jdbcUrl));
+             dataSourceResource.setDbType(JdbcUtils.getDbType(jdbcUrl));
+         } catch (SQLException e) {
+             throw new IllegalStateException("can not init DataSourceResource with " + dataSource, e);
+@@ -82,8 +107,7 @@ public final class JdbcUtils {
+             try (Connection connection = xaConnection.getConnection()) {
+                 String jdbcUrl = connection.getMetaData().getURL();
+                 dataSourceResource.setResourceId(buildResourceId(jdbcUrl));
+-                String driverClassName = com.alibaba.druid.util.JdbcUtils.getDriverClassName(jdbcUrl);
+-                dataSourceResource.setDriver(loadDriver(driverClassName));
++                dataSourceResource.setDriver(resolveDriver(jdbcUrl));
+                 dataSourceResource.setDbType(JdbcUtils.getDbType(jdbcUrl));
+             } finally {
+                 if (xaConnection != null) {
+diff --git a/rm-datasource/src/main/java/org/apache/seata/rm/datasource/xa/DataSourceProxyXA.java b/rm-datasource/src/main/java/org/apache/seata/rm/datasource/xa/DataSourceProxyXA.java
+index caf105d51..d969d5b0a 100644
+--- a/rm-datasource/src/main/java/org/apache/seata/rm/datasource/xa/DataSourceProxyXA.java
++++ b/rm-datasource/src/main/java/org/apache/seata/rm/datasource/xa/DataSourceProxyXA.java
+@@ -158,13 +158,22 @@ public class DataSourceProxyXA extends AbstractDataSourceProxyXA {
+ 
+     private Connection getConnectionProxyXA(Connection connection) throws SQLException {
+         Connection physicalConn = connection.unwrap(Connection.class);
+-        XAConnection xaConnection = XAUtils.createXAConnection(physicalConn, this);
++        XAConnection xaConnection = createXAConnection(physicalConn);
+         ConnectionProxyXA connectionProxyXA =
+                 new ConnectionProxyXA(connection, xaConnection, this, RootContext.getXID());
+         connectionProxyXA.init();
+         return connectionProxyXA;
+     }
+ 
++    /**
++     * Creates the XA connection for a physical connection of the wrapped data source. By default the
++     * driver's native XA connection for {@link #getDbType()}; data sources whose driver Seata does not
++     * know (e.g. non-SQL stores) override this to supply their own.
++     */
++    protected XAConnection createXAConnection(Connection physicalConn) throws SQLException {
++        return XAUtils.createXAConnection(physicalConn, this);
++    }
++
+     // Should be auto-executed when the datasource is closed. Now for simplicity we let the application manually
+     // release the pending helpers.
+     public void releaseAllHelpers() throws SQLException {
+-- 
+2.55.0
+

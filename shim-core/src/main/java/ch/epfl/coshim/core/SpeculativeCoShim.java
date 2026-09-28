@@ -21,8 +21,23 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     }
 
     @Override
-    public Outcome execute(String txnId, TxnCode<K, V> code) {
-        throw new UnsupportedOperationException("TODO: pseudo.txt execute/get/put/lock/upgrade");
+    public boolean start(String txnId) {
+        throw new UnsupportedOperationException("TODO: pseudo.txt execute (registration)");
+    }
+
+    @Override
+    public V get(String txnId, K key) {
+        throw new UnsupportedOperationException("TODO: pseudo.txt get/lock");
+    }
+
+    @Override
+    public void put(String txnId, K key, V value) {
+        throw new UnsupportedOperationException("TODO: pseudo.txt put/lock/upgrade");
+    }
+
+    @Override
+    public Outcome end(String txnId) {
+        throw new UnsupportedOperationException("TODO: pseudo.txt execute (CAS started -> executed)");
     }
 
     @Override

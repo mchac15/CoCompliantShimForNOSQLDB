@@ -1,85 +1,108 @@
 # CoCompliantShimForNOSQLDB
 
 A speculative, Commitment-Ordering-compliant subtransaction shim for NoSQL key-value stores
-(protocol: [`pseudo.txt`](pseudo.txt), report: [`main.tex`](main.tex)), plugged into
-[Apache Seata](https://seata.apache.org/) as an XA participant. That lets us compare it with
-Sonata's MySQL/PostgreSQL shim, and run global transactions that mix both kinds of shim.
+(protocol: [`pseudo.txt`](pseudo.txt), report: [`main.tex`](main.tex)). It is exposed to
+[Apache Seata](https://seata.apache.org/) as an **XA data source**, the same way MySQL and
+PostgreSQL are in the Sonata fork. This lets us compare it with Sonata's MySQL/PG shim, and run
+global transactions that mix both kinds of shim.
 
 ## Modules
 
 | Module | Depends on | Contents |
 | --- | --- | --- |
 | `store-api` | nothing | `KvStore<K, V>`: the whole database behind `get` / `store`, plus `InMemoryKvStore` |
-| `shim-core` | `store-api` | `CoShim` (execute / prepare / commit / abort), `TxnCode`, `TxnContext`; `SpeculativeCoShim` is a **TODO stub** to be implemented from `pseudo.txt` |
-| `seata-adapter` | `shim-core`, Seata jars | Runs a `CoShim` as a Seata XA branch |
+| `shim-core` | `store-api` | `CoShim` (start / get / put / end / prepare / commit / abort, plus pseudo.txt's `execute`); `SpeculativeCoShim` is a **TODO stub** to be implemented from pseudo.txt; `NoCcShim` is a pass-through shim (no concurrency control) used as the benchmark baseline and in tests |
+| `coshim-jdbc` | `shim-core` | The shim as a JDBC "driver": `CoShimDataSource` (`DataSource` + `XADataSource`, URL `jdbc:coshim://<name>`), `CoShimXAResource`, `KvSession` (get/put instead of SQL). No Seata dependency |
+| `seata-xa` | `coshim-jdbc`, patched Seata | `DataSourceProxyCoShim`: the counterpart of `new DataSourceProxyXA(mysqlPool)` |
 
-`shim-core` and `store-api` know nothing about Seata. The adapter only uses Seata's public API
-and its SPI. No Seata source is copied or modified.
+## How MySQL/PG are integrated in the Sonata fork (and what we copy)
 
-## How the shim becomes an XA branch
+The fork's commits on top of Seata `2.x` do **not** add MySQL/PG as data sources; upstream Seata
+already has them:
 
-Seata's XA mode is JDBC-bound: `ResourceManagerXA` only accepts `AbstractDataSourceProxyXA`
-resources. So the shim is not wrapped as a `javax.sql.DataSource`. It is added as a new kind of
-XA resource instead:
+1. The app wraps its pool: `new DataSourceProxyXA(dataSource)`. The JDBC URL becomes the
+   resource id and the dbType.
+2. `XAUtils` asks the MySQL/PG driver for its native `XAConnection` / `XAResource`.
+3. `ConnectionProxyXA` drives that `XAResource`:
+   - `setAutoCommit(false)`: `branchRegister`, then `xa start`;
+   - the app runs SQL;
+   - `close()`: `xa end`, then `xa prepare` (phase 1).
+4. The TC's phase 2 goes through `ResourceManagerXA`: `xa commit`, or `xa rollback`.
 
-- **`ShimResource`**: a Seata `Resource` with `BranchType.XA` and id `coshim://<name>`.
-- **`RoutingResourceManagerXA`**: extends `ResourceManagerXA` and replaces it through
-  `META-INF/services` (`@LoadLevel(order = 100)`; Seata keeps one RM per branch type, the last
-  loaded wins).
-  - Shim resources get phase 2 mapped onto the shim: branchCommit calls `commit`, branchRollback
-    calls `abort`.
-  - Every other resource (stock XA and Sonata data sources) goes to the stock code unchanged.
-- **`ShimBranchExecutor.run(resource, code)`**: phase 1, mirroring `ConnectionProxyXA`:
-  1. register an XA branch with the TC, with no lock keys and the shim txn id as applicationData;
-  2. `execute`;
-  3. `prepare` (blocking vote). On FAILED or NO it reports `PhaseOne_Failed` and throws.
+Sonata (commit `559ee78eb`) is a hook inside this path. `ConnectionProxyXA.close()` does one
+dummy write right before `xa prepare`:
 
-Two properties follow:
+- **MySQL (S2PL):** upsert a random key into `sonata_dummy`.
+- **PG (SSI):** write a key that a prepared helper transaction has read.
 
-- **Same TC path as Sonata.** The TC sees ordinary XA branches (`XACore`) and takes no global
-  locks for them, so the shim's own concurrency control is the only one being measured, and one
-  global transaction can contain both shim and Sonata branches.
-- **The phases line up with pseudo.txt.** Seata XA prepares locally in phase 1, before the TM's
-  global commit, and the global-transaction timeout plays the coordinator's vote timeout
-  (assumption 4). A TC rollback that arrives before the shim has registered the txn is caught
-  by `ShimResource`'s phase-1 tracking, so no prepared txn is left holding locks.
+The database's own concurrency control then yields CO. It is enabled with
+`sonata.enableGlobalSerializability` and switched on per dbType. The other fork commits make
+rollback robust against MySQL/PG XA quirks.
+
+**Our shim plugs into the same path.** `XAResource` is the standard 2PC-participant interface,
+and it maps onto pseudo.txt:
+
+| XA call (from Seata's `ConnectionProxyXA` / `ResourceManagerXA`) | shim |
+| --- | --- |
+| `start(xid)` | `start`: txn registered, `started` |
+| `KvSession.get/put` on the connection | `get` / `put` |
+| `end(xid, TMSUCCESS)` | `end`: `started → executed` (failure → `XA_RBROLLBACK`) |
+| `prepare(xid)` | `prepare`: YES → `XA_OK`, NO → `XA_RBROLLBACK` |
+| `commit(xid)` | `commit` |
+| `rollback(xid)` | `abort` |
+
+So Seata runs the stock XA code, the same TC path (`XACore`), and no Seata global locks for both
+Sonata and shim branches. Heavy vs light is purely what runs behind the `XAResource`, and one
+global transaction can contain both.
 
 ```java
-KvStore<String, String> store = new InMemoryKvStore<>();
-ShimResource<String, String> orders =
-        new ShimResource<>("orders-kv", new SpeculativeCoShim<>(store, Duration.ofMillis(200)));
-CoShimSeata.register(orders);                       // after RMClient.init(appId, txServiceGroup)
+CoShimDataSource<String, String> kv =
+        new CoShimDataSource<>("orders-kv", new SpeculativeCoShim<>(new InMemoryKvStore<>(), Duration.ofMillis(200)));
+DataSource orders = new DataSourceProxyCoShim(kv);          // like new DataSourceProxyXA(mysqlPool)
 
-GlobalTransaction tx = GlobalTransactionContext.getCurrentOrCreate();
-tx.begin(60_000, "place-order");
-try {
-    new ShimBranchExecutor().run(orders, ctx -> ctx.put("order:1", ctx.get("stock:7")));
-    // ... more shim branches, or Sonata/MySQL XA work on a DataSourceProxyXA ...
-    tx.commit();
-} catch (Exception e) {
-    tx.rollback();
-}
+// inside a global transaction (@GlobalTransactional, or GlobalTransactionContext + begin/commit):
+try (Connection c = orders.getConnection()) {
+    c.setAutoCommit(false);                                 // branchRegister + xa start
+    KvSession<String, String> session = KvSession.from(c);
+    session.put("order:1", session.get("stock:7"));
+    c.commit();
+}                                                           // xa end + xa prepare (shim vote)
+// phase 2 (xa commit / xa rollback) is driven by the TC, as for MySQL/PG
 ```
+
+`CoShimXAResource` also guards one race that pseudo.txt's coordinator assumption rules out but
+Seata does not: a TC rollback arriving before `xa start`, or while phase 1 runs. See
+`BranchStates`; it keeps short-lived tombstones at the XA layer, not in the shim protocol.
+
+## Seata patch
+
+Seata only accepts data sources whose JDBC driver it knows. [`seata-patches/`](seata-patches)
+holds one small, generic patch on top of the Sonata fork:
+
+- `JdbcUtils`: for an unknown URL, fall back to the JDBC subprotocol as dbType (`coshim`) and to
+  no `Driver`, instead of failing.
+- `DataSourceProxyXA`: a `protected createXAConnection(physicalConn)` hook, defaulting to
+  `XAUtils`, which `DataSourceProxyCoShim` overrides.
+
+The Sonata code and the MySQL/PG behaviour are unchanged, and the fork's XA / `JdbcUtils` tests
+still pass.
 
 ## Building
 
-The adapter compiles against the Sonata fork of Seata (`2.6.0-SNAPSHOT`, not on Maven Central).
-Install it into `~/.m2` once, and again whenever the fork changes:
-
 ```sh
-cd ../incubator-seata            # branch integrate-sonata-in-xa-mode
-./mvnw install -DskipTests -pl rm-datasource,tm,mock-server -am
-cd -
-mvn verify                       # JDK 17+
+scripts/install-seata.sh      # clones ../incubator-seata (Sonata fork), applies seata-patches/, installs 2.6.0-SNAPSHOT into ~/.m2
+mvn verify                    # JDK 17+
 ```
 
-The adapter tests do not need a running TC: branch registration and reports are stubbed, as in
-Seata's own `XAModeTest2`. An application still needs Seata's `registry.conf` / `file.conf`
-(see `seata-adapter/src/test/resources`).
+The `seata-xa` tests drive Seata's real `DataSourceProxyXA` / `ConnectionProxyXA` /
+`ResourceManagerXA`, with only the TC round trips stubbed (as in Seata's own `XAModeTest2`). An
+application also needs Seata's `registry.conf` / `file.conf` (see `seata-xa/src/test/resources`)
+and Druid on the classpath, like any Seata XA application.
 
 ## Next steps
 
-- Implement `SpeculativeCoShim` from `pseudo.txt`.
+- Implement `SpeculativeCoShim` from pseudo.txt.
 - Add a real key-value backend behind `KvStore`.
-- Add an end-to-end run against `seata-mock-server` or a real TC, then a benchmark harness
-  comparing stock XA, Sonata, the shim, and mixed deployments.
+- Run end to end against `seata-mock-server` or a real TC, with a mixed global transaction (a
+  MySQL/Sonata branch and a coshim branch). Then build a benchmark comparing stock XA, Sonata,
+  `NoCcShim` (plumbing only) and `SpeculativeCoShim`.

@@ -13,14 +13,15 @@
     <modules>
         <module>store-api</module>
         <module>shim-core</module>
-        <module>seata-adapter</module>
+        <module>coshim-jdbc</module>
+        <module>seata-xa</module>
     </modules>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <!-- Built from the Sonata fork (../incubator-seata, branch integrate-sonata-in-xa-mode)
-             with `./mvnw install -DskipTests`; see README.md -->
+        <!-- The Sonata fork (branch integrate-sonata-in-xa-mode) + seata-patches/, installed into
+             ~/.m2 by scripts/install-seata.sh; see README.md -->
         <seata.version>2.6.0-SNAPSHOT</seata.version>
         <junit.version>5.10.2</junit.version>
         <slf4j.version>1.7.36</slf4j.version>
@@ -36,6 +37,11 @@
             <dependency>
                 <groupId>ch.epfl.coshim</groupId>
                 <artifactId>shim-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.epfl.coshim</groupId>
+                <artifactId>coshim-jdbc</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
