@@ -63,6 +63,9 @@ public class CoShimXAResource implements XAResource {
             abortObserved(txnId);
             throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " rolled back by the coordinator");
         }
+        // This connection now sends its get/put requests for txnId, until end(). One connection
+        // serves one branch at a time (as in JDBC/XA for any database); concurrent transactions use
+        // different connections (one per thread / global transaction), all sharing the same shim.
         connection.bind(txnId);
     }
 
@@ -102,13 +105,18 @@ public class CoShimXAResource implements XAResource {
             states.finished(txnId);   // the shim already aborted it
             throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " voted NO");
         }
-        states.prepared(txnId);
+        states.votedYes(txnId);
         // never XA_RDONLY: even a read-only branch holds its place in the lock chains until commit
         return XA_OK;
     }
 
     @Override
     public void commit(Xid xid, boolean onePhase) throws XAException {
+        // XA's one-phase optimisation: a transaction manager with a single participant may skip
+        // prepare and ask for commit(xid, onePhase = true) directly. The resource must then do both
+        // itself, so we still run the shim's prepare (wait for predecessors, vote) before committing;
+        // a NO vote throws XA_RBROLLBACK and nothing is committed. Seata always calls
+        // commit(xid, false) after its own phase-1 prepare, so with Seata this branch is never taken.
         if (onePhase) {
             prepare(xid);
         }

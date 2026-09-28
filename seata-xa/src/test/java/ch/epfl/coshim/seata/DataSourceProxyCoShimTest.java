@@ -13,7 +13,13 @@ import ch.epfl.coshim.jdbc.KvSession;
 import ch.epfl.coshim.store.InMemoryKvStore;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.apache.seata.core.context.RootContext;
 import org.apache.seata.core.model.BranchStatus;
 import org.apache.seata.core.model.BranchType;
@@ -144,6 +150,49 @@ class DataSourceProxyCoShimTest {
             assertThrows(SQLException.class, () -> KvSession.<String, String>from(c).put("x", "1"));
         }
         assertNull(store.get("x"));
+    }
+
+    @Test
+    void manyGlobalTransactionsRunConcurrentlyEachOnItsOwnConnection() throws Exception {
+        int n = 8;
+        CyclicBarrier allInPhaseOne = new CyclicBarrier(n);
+        ExecutorService pool = Executors.newFixedThreadPool(n);
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                int id = i;
+                futures.add(pool.submit(() -> {
+                    RootContext.bind("127.0.0.1:8091:" + (100 + id));   // thread-local, like in an app
+                    try (Connection c = proxy.getConnection()) {
+                        c.setAutoCommit(false);
+                        KvSession<String, String> kv = KvSession.from(c);
+                        kv.put("k" + id, "v" + id);
+                        // every branch is open at the same time: nothing serializes transactions
+                        allInPhaseOne.await(10, TimeUnit.SECONDS);
+                        assertEquals("v" + id, kv.get("k" + id));
+                        c.commit();
+                    } finally {
+                        RootContext.unbind();
+                    }
+                    return null;
+                }));
+            }
+            for (Future<?> f : futures) {
+                f.get(30, TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertEquals(n, rm.registrations.size());
+        for (TestResourceManagerXA.Registration reg : rm.registrations) {
+            assertEquals(
+                    BranchStatus.PhaseTwo_Committed,
+                    rm.branchCommit(BranchType.XA, reg.xid(), reg.branchId(), RESOURCE_ID, null));
+        }
+        for (int i = 0; i < n; i++) {
+            assertEquals("v" + i, store.get("k" + i));
+        }
     }
 
     @Test

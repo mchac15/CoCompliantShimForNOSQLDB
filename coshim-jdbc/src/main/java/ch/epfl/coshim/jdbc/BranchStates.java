@@ -5,39 +5,52 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 /**
- * XA-layer bookkeeping that the shim protocol deliberately does not keep (pseudo.txt: the
- * coordinator never sends anything for a txn before its execute, and there are no tombstones).
- * Seata does not guarantee that ordering: a TC rollback (e.g. global timeout) can reach the RM after
- * {@code branchRegister} but before {@code xa start}, or while phase 1 is still running. The shim's
- * abort is then a no-op or comes too early, and the branch would go on, vote YES and keep its locks
- * forever. Per branch:
+ * XA-layer bookkeeping for one race that pseudo.txt excludes by assumption, but Seata does not.
  *
- * <ul>
- *   <li>{@code ACTIVE}: between start and a successful prepare (phase 1 running);</li>
- *   <li>{@code PREPARED}: voted YES, waiting for phase 2;</li>
- *   <li>{@code ROLLED_BACK}: the TC rolled back while the branch was ACTIVE, or before it started
- *       (a tombstone). The phase-1 thread aborts the txn when it sees it; a later start is refused.</li>
- * </ul>
+ * <p>pseudo.txt (assumption 3) lets the coordinator send nothing for a txn before its execute, and
+ * keeps no tombstones. Seata's TC gives no such guarantee: a rollback (e.g. global timeout) can reach
+ * the RM after {@code branchRegister} but before {@code xa start}, or while phase 1 still runs. The
+ * shim's abort is then a no-op (unknown id) or lands too early, and the branch would go on, vote YES
+ * and keep its locks forever. This class remembers such rollbacks so the branch is refused/aborted.
  *
- * Entries are removed on commit, local rollback and when the phase-1 thread consumes a
- * ROLLED_BACK mark. Tombstones for branches that never start again (e.g. a retried TC rollback of a
- * finished branch) expire after {@link #TOMBSTONE_TTL}.
+ * <p>TODO: this is a first mitigation, not the final design. It lives outside the protocol and uses
+ * expiring tombstones (see {@link #pruneTombstones}). A further improvement is to handle the
+ * "decision before execute" case in the shim protocol itself (pseudo.txt), or to prove it cannot
+ * happen with Seata's XA flow, and then drop this class.
+ *
+ * <p>These are <b>not</b> the transaction statuses of pseudo.txt. {@code started}, {@code executed},
+ * {@code prepared}, {@code committing}, {@code committed}, {@code aborted} and {@code must_abort} live
+ * in the shim ({@code SpeculativeCoShim}'s transactions_map). This class only tracks, per XA branch,
+ * which XA phase the branch is in and whether the TC's rollback arrived during it:
+ *
+ * <pre>
+ *   branch phase          shim statuses during it              set by
+ *   IN_PHASE_ONE          started, executed, must_abort        xa start
+ *   VOTED_YES             prepared, committing                 xa prepare returned XA_OK
+ *   ROLLBACK_RECEIVED     (any, or txn not registered yet)     TC rollback during phase 1 / before start
+ *   (no entry)            committed, aborted, unknown id       commit, local rollback, failed phase 1
+ * </pre>
+ *
+ * The shim's own aborts ({@code aborted}, {@code must_abort} from a cascade, lock timeout) need no
+ * state here: the XA layer learns about them from the shim's answers (get/put throws, end returns
+ * FAILED, prepare votes NO) and drops the entry.
  */
 final class BranchStates {
 
     static final Duration TOMBSTONE_TTL = Duration.ofMinutes(10);
 
-    private enum State { ACTIVE, PREPARED, ROLLED_BACK }
+    private enum Phase { IN_PHASE_ONE, VOTED_YES, ROLLBACK_RECEIVED }
 
-    private record Entry(State state, long sinceNanos) {}
+    private record Entry(Phase phase, long sinceNanos) {}
 
-    private final ConcurrentMap<String, Entry> states = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Entry> branches = new ConcurrentHashMap<>();
 
     /** Before {@code shim.start}. @return false if the TC already rolled the branch back. */
     boolean activate(String txnId) {
-        Entry e = states.compute(txnId, (k, cur) -> cur == null ? new Entry(State.ACTIVE, System.nanoTime()) : cur);
-        if (e.state == State.ROLLED_BACK) {
-            states.remove(txnId);
+        Entry e = branches.compute(
+                txnId, (k, cur) -> cur == null ? new Entry(Phase.IN_PHASE_ONE, System.nanoTime()) : cur);
+        if (e.phase == Phase.ROLLBACK_RECEIVED) {
+            branches.remove(txnId);
             return false;
         }
         return true;
@@ -45,35 +58,47 @@ final class BranchStates {
 
     /** After each phase-1 step: did the TC roll the branch back meanwhile? */
     boolean isRolledBack(String txnId) {
-        Entry e = states.get(txnId);
-        return e != null && e.state == State.ROLLED_BACK;
+        Entry e = branches.get(txnId);
+        return e != null && e.phase == Phase.ROLLBACK_RECEIVED;
     }
 
     /** After a YES vote. */
-    void prepared(String txnId) {
-        states.computeIfPresent(txnId, (k, cur) -> cur.state == State.ACTIVE ? new Entry(State.PREPARED, cur.sinceNanos) : cur);
+    void votedYes(String txnId) {
+        branches.computeIfPresent(txnId, (k, cur) -> cur.phase == Phase.IN_PHASE_ONE
+                ? new Entry(Phase.VOTED_YES, cur.sinceNanos)
+                : cur);
     }
 
-    /** The branch is over (commit, local rollback, failed phase 1 observed by its own thread). */
+    /** The branch is over (commit, local rollback, or a failed phase 1 seen by its own thread). */
     void finished(String txnId) {
-        states.remove(txnId);
+        branches.remove(txnId);
     }
 
     /** A rollback coming from the TC (phase 2, or racing phase 1). */
     void rolledBackByCoordinator(String txnId) {
         long now = System.nanoTime();
-        states.compute(txnId, (k, cur) -> cur != null && cur.state == State.PREPARED
-                ? null                                    // normal phase 2: the abort that follows is enough
-                : new Entry(State.ROLLED_BACK, now));     // phase 1 running or not started yet
+        branches.compute(txnId, (k, cur) -> cur != null && cur.phase == Phase.VOTED_YES
+                ? null                                           // normal phase 2: the abort that follows is enough
+                : new Entry(Phase.ROLLBACK_RECEIVED, now));     // phase 1 running, or not started yet
         pruneTombstones(now);
     }
 
     int size() {
-        return states.size();
+        return branches.size();
     }
 
+    /**
+     * Drops ROLLBACK_RECEIVED entries older than {@link #TOMBSTONE_TTL}, so tombstones of branches that
+     * never start again (e.g. a retried TC rollback of an already finished branch) do not accumulate.
+     *
+     * <p>WARNING: not definitive, this can lead to an inconsistent state. If the {@code xa start} of a
+     * rolled-back branch arrives after its tombstone expired (a phase 1 stalled longer than the TTL),
+     * the branch is accepted, can vote YES and keeps its locks although the global transaction was
+     * rolled back. The TTL only makes this unlikely. See the TODO on the class.
+     */
     private void pruneTombstones(long now) {
         long ttl = TOMBSTONE_TTL.toNanos();
-        states.entrySet().removeIf(en -> en.getValue().state == State.ROLLED_BACK && now - en.getValue().sinceNanos > ttl);
+        branches.entrySet().removeIf(
+                en -> en.getValue().phase == Phase.ROLLBACK_RECEIVED && now - en.getValue().sinceNanos > ttl);
     }
 }

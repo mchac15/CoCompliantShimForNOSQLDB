@@ -9,15 +9,34 @@ import java.sql.SQLException;
 import java.sql.SQLTransactionRollbackException;
 
 /**
- * A "physical" connection to a coshim data source. It has no local transactions: work only happens
- * while an XA branch is associated with it ({@link CoShimXAResource#start} binds the shim txn id,
- * {@code end} unbinds it). Seata's {@code ConnectionProxyXA} wraps it like a MySQL/PG connection.
+ * A client connection to the shim: the channel over which one client sends its get/put requests.
+ * Seata's {@code ConnectionProxyXA} wraps it like a MySQL/PG connection.
+ *
+ * <p>It has no local transactions: requests are only accepted while an XA branch is associated with
+ * it ({@link CoShimXAResource#start} binds the branch's shim txn id, {@code end} unbinds it).
+ *
+ * <p>One connection carries one branch at a time, exactly like a JDBC connection to any database.
+ * That does not serialize transactions: every concurrent transaction (thread / global transaction)
+ * gets its own connection from {@link CoShimDataSource#getConnection()} (cheap, no I/O), and all
+ * connections share the same shim, whose lock chains order the conflicting ones.
  */
 public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implements KvSession<K, V> {
 
     private final CoShimDataSource<K, V> dataSource;
+
+    /** The branch this connection currently sends requests for, or null between branches. */
     private volatile String txnId;
+
+    /**
+     * Only a JDBC flag, never a commit trigger. true is the state of any JDBC connection outside a
+     * transaction, and Seata requires it (ConnectionProxyXA.init() rejects connections that start with
+     * autoCommit=false). Seata's proxy uses setAutoCommit(false) as "begin": it registers the branch
+     * and calls xa start; the proxy handles it and does not forward it here. Nothing is ever committed
+     * because of this flag: a branch commits only when the TC sends xa commit in phase 2, after every
+     * participant voted YES in xa prepare. A successful prepare is a vote, not a commit.
+     */
     private volatile boolean autoCommit = true;
+
     private volatile boolean closed;
 
     CoShimConnection(CoShimDataSource<K, V> dataSource) {
@@ -67,6 +86,11 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
         return dataSource.getShim();
     }
 
+    /**
+     * The branch the next request belongs to. Requests on a connection with no branch are rejected:
+     * the shim only runs transactions coordinated by 2PC. This is per connection, not global: other
+     * connections run their own branches at the same time.
+     */
     private String currentTxn() throws SQLException {
         if (closed) {
             throw new SQLException("connection is closed");

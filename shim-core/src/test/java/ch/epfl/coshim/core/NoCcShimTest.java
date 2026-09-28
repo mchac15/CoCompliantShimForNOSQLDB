@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import ch.epfl.coshim.store.InMemoryKvStore;
 import org.junit.jupiter.api.Test;
@@ -14,11 +15,11 @@ class NoCcShimTest {
     private final NoCcShim<String, String> shim = new NoCcShim<>(store);
 
     @Test
-    void executePrepareCommitAppliesBufferedWritesOnlyAtCommit() {
-        assertEquals(Outcome.SUCCEEDED, shim.execute("t1", ctx -> {
-            ctx.put("x", "1");
-            assertEquals("1", ctx.get("x"), "reads its own buffered write");
-        }));
+    void requestsThenPrepareCommitApplyBufferedWritesOnlyAtCommit() {
+        assertTrue(shim.start("t1"));
+        shim.put("t1", "x", "1");
+        assertEquals("1", shim.get("t1", "x"), "reads its own buffered write");
+        assertEquals(Outcome.SUCCEEDED, shim.end("t1"));
         assertNull(store.get("x"));
         assertEquals(Vote.YES, shim.prepare("t1"));
         shim.commit("t1");
@@ -27,7 +28,9 @@ class NoCcShimTest {
 
     @Test
     void abortDiscardsTheBuffer() {
-        shim.execute("t1", ctx -> ctx.put("x", "1"));
+        shim.start("t1");
+        shim.put("t1", "x", "1");
+        shim.end("t1");
         shim.abort("t1");
         shim.commit("t1");
         assertNull(store.get("x"));

@@ -66,8 +66,18 @@ public class CoShimDataSource<K, V> implements DataSource, XADataSource {
     }
 
     /**
-     * The XA connection for a connection obtained from {@link #getConnection()}: what Seata's
-     * {@code DataSourceProxyXA} asks the driver for (see the {@code createXAConnection} hook).
+     * Wraps a connection previously obtained from {@link #getConnection()} into an XA connection, so
+     * that XA calls (start/end/prepare/commit/rollback) can be issued for it.
+     *
+     * <p>Why this exists: Seata's {@code DataSourceProxyXA} does not ask the driver for an XA
+     * connection directly. It first takes a plain connection from the wrapped data source, then turns
+     * it into an XA connection. For MySQL/PG it does that with {@code XAUtils.createXAConnection(conn,
+     * dbType)}, which knows only SQL drivers. Our patch adds an overridable hook
+     * ({@code createXAConnection}) and {@code DataSourceProxyCoShim} overrides it to call this method.
+     * The XA connection wraps the same {@link CoShimConnection} the application uses, so the
+     * {@link CoShimXAResource} binds branches to the connection that actually sends the get/put
+     * requests. The ownership check keeps a connection of another coshim data source (another shim)
+     * from being enlisted here by mistake.
      */
     public CoShimXAConnection getXAConnection(Connection physicalConnection) throws SQLException {
         CoShimConnection<?, ?> connection = physicalConnection.unwrap(CoShimConnection.class);

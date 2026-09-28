@@ -1,14 +1,28 @@
 package ch.epfl.coshim.core;
 
 /**
- * A 2PC participant in front of one {@link ch.epfl.coshim.store.KvStore}: the entry points of
- * pseudo.txt, split the way XA drives a participant. pseudo.txt's {@code execute(txn_id, code)} is
- * {@link #start} + the code's {@link #get}/{@link #put} calls + {@link #end} (see {@link #execute}).
+ * A 2PC participant in front of one {@link ch.epfl.coshim.store.KvStore}: the requests of
+ * pseudo.txt. The shim never receives or runs client code. Clients reach it through a connection
+ * (here {@code coshim-jdbc}'s {@code CoShimConnection}, enlisted in XA branches by Seata) and send it
+ * one request at a time for the transaction bound to that connection:
+ *
+ * <pre>
+ *   start(t)                      pseudo.txt execute: register t, status started
+ *   get(t, k) / put(t, k, v) ...  pseudo.txt get / put, one request per operation
+ *   end(t)                        pseudo.txt execute: CAS started -> executed
+ *   prepare(t)                    pseudo.txt prepare (vote)
+ *   commit(t) / abort(t)          pseudo.txt commit / abort (coordinator decision)
+ * </pre>
+ *
+ * <p>Concurrency: many transactions run at the same time, each on its own client connection and
+ * thread. A request runs on the thread that sends it, and blocking waits (lock(), prepare()) block
+ * only that caller. The shim spawns no threads; its shared state (locks_map, transactions_map) is
+ * what makes concurrent transactions conflict and order correctly.
  *
  * <p>Coordinator contract (pseudo.txt, assumption 3): transaction ids are assigned by the
- * coordinator and {@link #start} is called at most once per id. Calls on an unknown or already
- * resolved id take the unknown-id branches: get/put/end fail, prepare votes NO, commit and abort are
- * no-ops.
+ * coordinator (here derived from the XA Xid), and {@link #start} is called at most once per id.
+ * Requests on an unknown or already resolved id take the unknown-id branches: get/put/end fail,
+ * prepare votes NO, commit and abort are no-ops.
  *
  * @param <K> key type
  * @param <V> value type
@@ -16,7 +30,7 @@ package ch.epfl.coshim.core;
 public interface CoShim<K, V> {
 
     /**
-     * Registers the transaction (status {@code started}); first half of pseudo.txt {@code execute}.
+     * Registers the transaction (status {@code started}).
      *
      * @return false if the id is already registered
      */
@@ -24,7 +38,7 @@ public interface CoShim<K, V> {
 
     /**
      * pseudo.txt {@code get(k)}: SHARED lock, then own buffered write, else the nearest predecessor
-     * write, else the store. May block.
+     * write, else the store. May block the calling thread.
      *
      * @return the value, or {@code null} if the key has none
      * @throws TxnAbortedException if the transaction must abort (pseudo.txt FAILED); its locks are
@@ -33,14 +47,15 @@ public interface CoShim<K, V> {
     V get(String txnId, K key);
 
     /**
-     * pseudo.txt {@code put(k, v)}: EXCLUSIVE lock (or upgrade), then buffer the write. May block.
+     * pseudo.txt {@code put(k, v)}: EXCLUSIVE lock (or upgrade), then buffer the write. May block the
+     * calling thread.
      *
      * @throws TxnAbortedException if the transaction must abort (pseudo.txt FAILED)
      */
     void put(String txnId, K key, V value);
 
     /**
-     * End of pseudo.txt {@code execute}: CAS {@code started → executed}. On failure (the txn was
+     * The client sent its last operation: CAS {@code started → executed}. On failure (the txn was
      * aborted or doomed meanwhile) it aborts the txn.
      */
     Outcome end(String txnId);
@@ -56,28 +71,4 @@ public interface CoShim<K, V> {
 
     /** pseudo.txt {@code abort(txn_id)}: aborts (cascading to dependents) and releases the locks. */
     void abort(String txnId);
-
-    /** pseudo.txt {@code execute(txn_id, code)}, expressed with the operations above. */
-    default Outcome execute(String txnId, TxnCode<K, V> code) {
-        if (!start(txnId)) {
-            return Outcome.FAILED;
-        }
-        try {
-            code.run(new TxnContext<>() {
-                @Override
-                public V get(K key) {
-                    return CoShim.this.get(txnId, key);
-                }
-
-                @Override
-                public void put(K key, V value) {
-                    CoShim.this.put(txnId, key, value);
-                }
-            });
-        } catch (TxnAbortedException e) {
-            abort(txnId);   // idempotent: the failing get/put has already aborted it
-            return Outcome.FAILED;
-        }
-        return end(txnId);
-    }
 }

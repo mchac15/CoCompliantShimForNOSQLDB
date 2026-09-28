@@ -11,6 +11,7 @@ import ch.epfl.coshim.store.InMemoryKvStore;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.sql.SQLTransactionRollbackException;
+import java.util.List;
 import javax.transaction.xa.XAException;
 import javax.transaction.xa.XAResource;
 import javax.transaction.xa.Xid;
@@ -142,6 +143,29 @@ class CoShimXAResourceTest {
         assertEquals(XAException.XA_RBROLLBACK, e.errorCode);
         assertEquals(0, dataSource.getBranchStates().size());
         assertNull(store.get("x"));
+    }
+
+    @Test
+    void branchesOnDifferentConnectionsAreActiveAtTheSameTime() throws Exception {
+        Xid xid2 = new TestXid("127.0.0.1:8091:43", "-8");
+        CoShimXAConnection a = dataSource.getXAConnection();
+        CoShimXAConnection b = dataSource.getXAConnection();
+        a.getXAResource().start(xid, XAResource.TMNOFLAGS);
+        b.getXAResource().start(xid2, XAResource.TMNOFLAGS);
+
+        // interleaved requests of two open transactions, each routed by its own connection
+        KvSession.<String, String>from(a.getConnection()).put("x", "a");
+        KvSession.<String, String>from(b.getConnection()).put("y", "b");
+        assertNull(KvSession.<String, String>from(a.getConnection()).get("y"), "b's write is not visible to a");
+
+        for (CoShimXAConnection c : List.of(a, b)) {
+            Xid x = c == a ? xid : xid2;
+            c.getXAResource().end(x, XAResource.TMSUCCESS);
+            c.getXAResource().prepare(x);
+            c.getXAResource().commit(x, false);
+        }
+        assertEquals("a", store.get("x"));
+        assertEquals("b", store.get("y"));
     }
 
     @Test
