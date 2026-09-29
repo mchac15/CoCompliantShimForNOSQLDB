@@ -46,6 +46,19 @@ class NoCcShimTest {
     }
 
     @Test
+    void duplicateEndNeverAbortsAPreparedTxnAndLateRequestsFail() {
+        shim.start("t1");
+        shim.put("t1", "x", "1");
+        shim.end("t1");
+        assertThrows(TxnAbortedException.class, () -> shim.put("t1", "y", "2"), "buffer is final after end");
+        assertEquals(Vote.YES, shim.prepare("t1"));
+        assertEquals(Outcome.SUCCEEDED, shim.end("t1"), "duplicate end");
+        shim.commit("t1");
+        assertEquals("1", store.get("x"), "still committable: prepared is final");
+        assertNull(store.get("y"));
+    }
+
+    @Test
     void startIsOncePerIdAndPrepareBeforeEndVotesNo() {
         shim.start("t1");
         assertFalse(shim.start("t1"));
