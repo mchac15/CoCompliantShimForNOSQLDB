@@ -12,10 +12,25 @@ import javax.sql.XADataSource;
 
 /**
  * A {@link CoShim} exposed as a JDBC data source, the way a MySQL/PG driver exposes a database: a
- * plain {@link DataSource} (for Seata's {@code DataSourceProxyXA}) and an {@link XADataSource}. Its
- * URL, {@code jdbc:coshim://<name>}, becomes the Seata resource id and gives dbType {@code coshim}.
+ * plain {@link DataSource} (for Seata's {@code DataSourceProxyXA}) and an {@link XADataSource}.
  *
- * <p>The shim lives in this JVM: all access to the store must go through this data source.
+ * <p>The URL {@code jdbc:coshim://<name>} is an <b>identity, not a network address</b>. Nothing
+ * connects to it: the shim is the {@link CoShim} object passed to the constructor, in this JVM, so
+ * there is no host or port to configure, in dev (localhost) or in production. Seata reads the URL for
+ * two things only: the resource id (the whole URL) and the dbType ({@code coshim}, the JDBC
+ * subprotocol).
+ *
+ * <p>The resource id is what the TC uses to route phase 2 (xa commit/rollback) back to an RM, and it
+ * falls back to any client registered with the same id. For MySQL/PG any client can finish a branch,
+ * because the database keeps the XA state. Here the state lives in this JVM's shim, so the name must
+ * be unique per shim instance: two application instances must not register the same
+ * {@code jdbc:coshim://<name>} with different in-process shims. Deriving it from the store and the
+ * instance (e.g. {@code "orders-kv@" + hostname}) is enough.
+ *
+ * <p>If the shim later becomes a separate server shared by several application instances, the URL
+ * becomes a real address, e.g. {@code jdbc:coshim://localhost:7000/orders-kv} in dev. The same id
+ * then designates the same shared shim for every client, exactly like a MySQL URL. dbType parsing
+ * does not change, because it only looks at the subprotocol.
  */
 public class CoShimDataSource<K, V> implements DataSource, XADataSource {
 
@@ -27,7 +42,10 @@ public class CoShimDataSource<K, V> implements DataSource, XADataSource {
     private volatile PrintWriter logWriter;
     private volatile int loginTimeout;
 
-    /** @param name unique name of this store among the application's data sources, e.g. "orders-kv" */
+    /**
+     * @param name identity of this shim instance, unique across every RM registered with the TC
+     *     (see the class comment), e.g. "orders-kv@app-1"
+     */
     public CoShimDataSource(String name, CoShim<K, V> shim) {
         this.url = URL_PREFIX + Objects.requireNonNull(name);
         this.shim = Objects.requireNonNull(shim);

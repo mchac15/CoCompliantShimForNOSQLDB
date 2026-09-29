@@ -1,4 +1,4 @@
-From 7cbbd4461fb2523fa00d0bb4f29943d5a701b52d Mon Sep 17 00:00:00 2001
+From 7951df0d69418e8874fb4595a08f93e6f23ef938 Mon Sep 17 00:00:00 2001
 From: Matheo Chacon <matheochacon1@gmail.com>
 Date: Mon, 28 Sep 2026 17:05:28 +0200
 Subject: [PATCH] xa: let non-SQL XA data sources plug into DataSourceProxyXA
@@ -73,19 +73,11 @@ index cd48ecb95..d9bf995cb 100644
              } finally {
                  if (xaConnection != null) {
 diff --git a/rm-datasource/src/main/java/org/apache/seata/rm/datasource/xa/DataSourceProxyXA.java b/rm-datasource/src/main/java/org/apache/seata/rm/datasource/xa/DataSourceProxyXA.java
-index caf105d51..d969d5b0a 100644
+index caf105d51..80835b1c4 100644
 --- a/rm-datasource/src/main/java/org/apache/seata/rm/datasource/xa/DataSourceProxyXA.java
 +++ b/rm-datasource/src/main/java/org/apache/seata/rm/datasource/xa/DataSourceProxyXA.java
-@@ -158,13 +158,22 @@ public class DataSourceProxyXA extends AbstractDataSourceProxyXA {
- 
-     private Connection getConnectionProxyXA(Connection connection) throws SQLException {
-         Connection physicalConn = connection.unwrap(Connection.class);
--        XAConnection xaConnection = XAUtils.createXAConnection(physicalConn, this);
-+        XAConnection xaConnection = createXAConnection(physicalConn);
-         ConnectionProxyXA connectionProxyXA =
-                 new ConnectionProxyXA(connection, xaConnection, this, RootContext.getXID());
-         connectionProxyXA.init();
-         return connectionProxyXA;
+@@ -156,9 +156,18 @@ public class DataSourceProxyXA extends AbstractDataSourceProxyXA {
+         return getConnectionProxyXA(connection);
      }
  
 +    /**
@@ -97,9 +89,13 @@ index caf105d51..d969d5b0a 100644
 +        return XAUtils.createXAConnection(physicalConn, this);
 +    }
 +
-     // Should be auto-executed when the datasource is closed. Now for simplicity we let the application manually
-     // release the pending helpers.
-     public void releaseAllHelpers() throws SQLException {
+     private Connection getConnectionProxyXA(Connection connection) throws SQLException {
+         Connection physicalConn = connection.unwrap(Connection.class);
+-        XAConnection xaConnection = XAUtils.createXAConnection(physicalConn, this);
++        XAConnection xaConnection = createXAConnection(physicalConn);
+         ConnectionProxyXA connectionProxyXA =
+                 new ConnectionProxyXA(connection, xaConnection, this, RootContext.getXID());
+         connectionProxyXA.init();
 -- 
 2.55.0
 

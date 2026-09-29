@@ -62,11 +62,23 @@ final class BranchStates {
         return e != null && e.phase == Phase.ROLLBACK_RECEIVED;
     }
 
-    /** After a YES vote. */
-    void votedYes(String txnId) {
-        branches.computeIfPresent(txnId, (k, cur) -> cur.phase == Phase.IN_PHASE_ONE
-                ? new Entry(Phase.VOTED_YES, cur.sinceNanos)
-                : cur);
+    /**
+     * After the shim voted YES, atomically with the check for a TC rollback (a rollback landing
+     * between a separate check and this update would otherwise leave a stale entry).
+     *
+     * @return true if the branch is now VOTED_YES; false if the TC rolled it back meanwhile, in which
+     *     case the entry is removed and the caller must abort the txn and fail the prepare
+     */
+    boolean votedYes(String txnId) {
+        boolean[] rolledBack = {false};
+        branches.computeIfPresent(txnId, (k, cur) -> {
+            if (cur.phase == Phase.ROLLBACK_RECEIVED) {
+                rolledBack[0] = true;
+                return null;
+            }
+            return new Entry(Phase.VOTED_YES, cur.sinceNanos);
+        });
+        return !rolledBack[0];
     }
 
     /** The branch is over (commit, local rollback, or a failed phase 1 seen by its own thread). */
@@ -74,12 +86,25 @@ final class BranchStates {
         branches.remove(txnId);
     }
 
-    /** A rollback coming from the TC (phase 2, or racing phase 1). */
+    /**
+     * A rollback coming from the TC (phase 2, or racing phase 1). The caller then calls shim.abort.
+     *
+     * <pre>
+     *   current entry        -> new entry           why
+     *   VOTED_YES            -> removed             normal phase 2: the shim knows the txn, its abort is enough
+     *   IN_PHASE_ONE         -> ROLLBACK_RECEIVED   phase 1 still running; the shim may not have registered the
+     *                                               txn yet (window inside xa start), so the phase-1 thread must
+     *                                               re-check and abort itself (start / votedYes)
+     *   ROLLBACK_RECEIVED    -> ROLLBACK_RECEIVED   duplicate/retried rollback, timestamp refreshed
+     *   none                 -> ROLLBACK_RECEIVED   before xa start (tombstone), or a retried rollback of a
+     *                                               finished branch (expires, see pruneTombstones)
+     * </pre>
+     */
     void rolledBackByCoordinator(String txnId) {
         long now = System.nanoTime();
         branches.compute(txnId, (k, cur) -> cur != null && cur.phase == Phase.VOTED_YES
-                ? null                                           // normal phase 2: the abort that follows is enough
-                : new Entry(Phase.ROLLBACK_RECEIVED, now));     // phase 1 running, or not started yet
+                ? null
+                : new Entry(Phase.ROLLBACK_RECEIVED, now));
         pruneTombstones(now);
     }
 

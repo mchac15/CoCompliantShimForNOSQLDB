@@ -1,9 +1,11 @@
 package ch.epfl.coshim.seata;
 
+import ch.epfl.coshim.jdbc.CoShimConnection;
 import ch.epfl.coshim.jdbc.CoShimDataSource;
 import java.sql.Connection;
 import java.sql.SQLException;
 import javax.sql.XAConnection;
+import org.apache.seata.rm.datasource.xa.ConnectionProxyXA;
 import org.apache.seata.rm.datasource.xa.DataSourceProxyXA;
 
 /**
@@ -44,5 +46,29 @@ public class DataSourceProxyCoShim extends DataSourceProxyXA {
     @Override
     protected XAConnection createXAConnection(Connection physicalConn) throws SQLException {
         return coShimDataSource.getXAConnection(physicalConn);
+    }
+
+    /**
+     * Inside a global transaction, the connection only accepts get/put once it is enlisted in the XA
+     * branch (setAutoCommit(false)). With SQL, Seata's statement templates enlist automatically; get/put
+     * go around them (KvSession unwraps to the physical connection), so we refuse instead of letting
+     * the requests run as local autocommit transactions outside the global transaction. Outside a
+     * global transaction the plain connection runs local transactions, as for MySQL/PG.
+     */
+    @Override
+    public Connection getConnection() throws SQLException {
+        return requireBranchIfEnlisted(super.getConnection());
+    }
+
+    @Override
+    public Connection getConnection(String username, String password) throws SQLException {
+        return requireBranchIfEnlisted(super.getConnection(username, password));
+    }
+
+    private static Connection requireBranchIfEnlisted(Connection connection) throws SQLException {
+        if (connection instanceof ConnectionProxyXA) {
+            connection.unwrap(CoShimConnection.class).requireXaBranch();
+        }
+        return connection;
     }
 }

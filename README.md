@@ -72,7 +72,31 @@ try (Connection c = orders.getConnection()) {
 
 `CoShimXAResource` also guards one race that pseudo.txt's coordinator assumption rules out but
 Seata does not: a TC rollback arriving before `xa start`, or while phase 1 runs. See
-`BranchStates`; it keeps short-lived tombstones at the XA layer, not in the shim protocol.
+`BranchStates`; it keeps short-lived tombstones at the XA layer, not in the shim protocol. It is a
+first mitigation (TODO).
+
+Outside a global transaction a connection runs **local transactions** with standard JDBC
+semantics (autocommit per request, or `commit()` / `rollback()`), like a MySQL/PG connection.
+Inside a global transaction, `DataSourceProxyCoShim` refuses get/put until the connection is
+enlisted with `setAutoCommit(false)`. Otherwise the requests would silently run outside the
+global transaction, because `KvSession` bypasses Seata's statement templates, which enlist SQL
+automatically.
+
+### Deployment notes
+
+- **The resource id must be unique per shim instance.** `jdbc:coshim://<name>` is an identity,
+  not an address. The TC routes phase 2 by resource id and may fall back to another client with
+  the same id. The shim state lives in one JVM, so give every instance its own name (e.g.
+  `orders-kv@app-1`). A future shared shim server would use a real address instead
+  (`jdbc:coshim://localhost:7000/orders-kv`).
+- **Spring (`seata.data-source-proxy-mode=XA`).** The auto-proxy wraps every plain `DataSource`
+  bean in a stock `DataSourceProxyXA`, which cannot create coshim XA connections ("xa not support
+  dbType: coshim"). So do not expose a bare `CoShimDataSource` bean. Instead, expose a
+  `DataSourceProxyCoShim` bean (declared return type `DataSource`; Seata logs a warning and
+  routes calls to it). Alternatively, add `CoShimDataSource` to `seata.excludes-for-auto-proxying`
+  and wrap it yourself.
+- **Never `XA_RDONLY`.** The TC skips phase 2 for read-only branches, but a shim branch keeps its
+  place in the lock chains until commit, so prepare always returns `XA_OK`.
 
 ## Seata patch
 
@@ -85,7 +109,8 @@ holds one small, generic patch on top of the Sonata fork:
   `XAUtils`, which `DataSourceProxyCoShim` overrides.
 
 The Sonata code and the MySQL/PG behaviour are unchanged, and the fork's XA / `JdbcUtils` tests
-still pass.
+still pass. The same patch applies to both the Sonata branch and upstream Seata `2.x`, so it could
+also be proposed upstream.
 
 ## Building
 

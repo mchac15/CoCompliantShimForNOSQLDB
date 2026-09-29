@@ -122,6 +122,7 @@ class CoShimXAResourceTest {
         dataSource.getXAConnection().getXAResource().rollback(xid);   // TC timeout raced ahead of xa start
 
         CoShimXAConnection xa = dataSource.getXAConnection();
+        ((CoShimConnection<?, ?>) xa.getConnection()).requireXaBranch();   // as DataSourceProxyCoShim does in a global txn
         XAException e = assertThrows(XAException.class, () -> xa.getXAResource().start(xid, XAResource.TMNOFLAGS));
         assertEquals(XAException.XA_RBROLLBACK, e.errorCode);
         assertThrows(SQLException.class, () -> KvSession.<String, String>from(xa.getConnection()).put("x", "1"));
@@ -169,8 +170,77 @@ class CoShimXAResourceTest {
     }
 
     @Test
-    void operationsOutsideABranchFail() {
-        assertThrows(SQLException.class, () -> dataSource.getConnection().get("x"));
+    void localRollbackOnTheStartingResourceLeavesNoState() throws Exception {
+        // ConnectionProxyXA's branch-execution timeout in close(): xa end(TMSUCCESS), then xa rollback on
+        // the same connection, without end(TMFAIL). It is local, not a coordinator rollback.
+        XAResource res = dataSource.getXAConnection().getXAResource();
+        res.start(xid, XAResource.TMNOFLAGS);
+        res.end(xid, XAResource.TMSUCCESS);
+        res.rollback(xid);
+        assertEquals(0, dataSource.getBranchStates().size(), "no tombstone for a local rollback");
+    }
+
+    @Test
+    void coordinatorRollbackLandingDuringPrepareFailsThePrepare() throws Exception {
+        CoShimDataSource<String, String>[] ds = new CoShimDataSource[1];
+        ds[0] = new CoShimDataSource<>("racy", new NoCcShim<>(store) {
+            @Override
+            public Vote prepare(String txnId) {
+                Vote vote = super.prepare(txnId);                       // shim votes YES ...
+                ((CoShimXAResource) ds[0].getXAConnection().getXAResource()).rollback(xid); // ... then the TC's rollback lands
+                return vote;
+            }
+        });
+        XAResource res = ds[0].getXAConnection().getXAResource();
+        res.start(xid, XAResource.TMNOFLAGS);
+        res.end(xid, XAResource.TMSUCCESS);
+        XAException e = assertThrows(XAException.class, () -> res.prepare(xid));
+        assertEquals(XAException.XA_RBROLLBACK, e.errorCode);
+        assertEquals(0, ds[0].getBranchStates().size(), "no stale entry");
+    }
+
+    @Test
+    void localAutocommitRequestsAreTheirOwnTransactions() throws Exception {
+        CoShimConnection<String, String> c = dataSource.getConnection();
+        c.put("x", "1");
+        assertEquals("1", store.get("x"), "committed right away");
+        assertEquals("1", c.get("x"));
+    }
+
+    @Test
+    void localTransactionCommitsOnCommitAndDiscardsOnRollback() throws Exception {
+        CoShimConnection<String, String> c = dataSource.getConnection();
+        c.setAutoCommit(false);
+        c.put("x", "1");
+        assertEquals("1", c.get("x"));
+        assertNull(store.get("x"));
+        c.commit();
+        assertEquals("1", store.get("x"));
+
+        c.put("y", "2");
+        c.rollback();
+        assertNull(store.get("y"));
+
+        c.put("z", "3");
+        c.setAutoCommit(true);   // JDBC: commits the transaction in progress
+        assertEquals("3", store.get("z"));
+    }
+
+    @Test
+    void xaStartIsRefusedWhileALocalTransactionIsOpen() throws Exception {
+        CoShimXAConnection xa = dataSource.getXAConnection();
+        xa.getConnection().setAutoCommit(false);
+        KvSession.<String, String>from(xa.getConnection()).put("x", "1");
+        XAException e = assertThrows(XAException.class, () -> xa.getXAResource().start(xid, XAResource.TMNOFLAGS));
+        assertEquals(XAException.XAER_OUTSIDE, e.errorCode);
+    }
+
+    @Test
+    void connectionRequiringABranchRefusesLocalRequests() throws Exception {
+        CoShimConnection<String, String> c = dataSource.getConnection();
+        c.requireXaBranch();
+        assertThrows(SQLException.class, () -> c.put("x", "1"));
+        assertNull(store.get("x"));
     }
 
     @Test

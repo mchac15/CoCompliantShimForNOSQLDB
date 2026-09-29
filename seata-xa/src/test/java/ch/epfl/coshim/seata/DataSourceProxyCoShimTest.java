@@ -196,10 +196,22 @@ class DataSourceProxyCoShimTest {
     }
 
     @Test
-    void outsideAGlobalTransactionTheConnectionIsNotEnlisted() throws Exception {
+    void outsideAGlobalTransactionTheConnectionRunsLocalTransactions() throws Exception {
         try (Connection c = proxy.getConnection()) {
-            assertFalse(c instanceof ConnectionProxyXA);
-            assertThrows(SQLException.class, () -> KvSession.<String, String>from(c).get("x"));
+            assertFalse(c instanceof ConnectionProxyXA, "the raw connection, as for MySQL/PG");
+            KvSession.<String, String>from(c).put("x", "1");   // autocommit
         }
+        assertEquals("1", store.get("x"));
+        assertTrue(rm.registrations.isEmpty(), "no branch");
+    }
+
+    @Test
+    void insideAGlobalTransactionRequestsBeforeEnlistmentAreRefused() throws Exception {
+        RootContext.bind(XID);
+        try (Connection c = proxy.getConnection()) {
+            // setAutoCommit(false) forgotten: must not run as a local autocommit write outside the global txn
+            assertThrows(SQLException.class, () -> KvSession.<String, String>from(c).put("x", "1"));
+        }
+        assertNull(store.get("x"));
     }
 }
