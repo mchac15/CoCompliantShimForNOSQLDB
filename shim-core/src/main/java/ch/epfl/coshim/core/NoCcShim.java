@@ -52,9 +52,11 @@ public class NoCcShim<K, V> implements CoShim<K, V> {
     @Override
     public Outcome end(String txnId) {
         Txn<K, V> txn = transactions.get(txnId);
-        if (txn == null || txn.status != Status.STARTED) {
-            abort(txnId);
+        if (txn == null) {
             return Outcome.FAILED;
+        }
+        if (txn.status != Status.STARTED) {
+            return Outcome.SUCCEEDED;   // duplicate end: already executed or prepared, never abort it
         }
         txn.status = Status.EXECUTED;
         return Outcome.SUCCEEDED;

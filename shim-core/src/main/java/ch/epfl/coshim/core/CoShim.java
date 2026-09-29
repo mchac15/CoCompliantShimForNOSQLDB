@@ -7,9 +7,9 @@ package ch.epfl.coshim.core;
  * one request at a time for the transaction bound to that connection:
  *
  * <pre>
- *   start(t)                      pseudo.txt execute: register t, status started
+ *   start(t)                      pseudo.txt start: register t, status started
  *   get(t, k) / put(t, k, v) ...  pseudo.txt get / put, one request per operation
- *   end(t)                        pseudo.txt execute: CAS started -> executed
+ *   end(t)                        pseudo.txt end: CAS started -> executed
  *   prepare(t)                    pseudo.txt prepare (vote)
  *   commit(t) / abort(t)          pseudo.txt commit / abort (coordinator decision)
  * </pre>
@@ -42,7 +42,8 @@ public interface CoShim<K, V> {
      *
      * @return the value, or {@code null} if the key has none
      * @throws TxnAbortedException if the transaction must abort (pseudo.txt FAILED); its locks are
-     *     already released
+     *     already released. Also thrown, without aborting, for a request arriving after {@link #end}:
+     *     the write buffer is final once the txn is executed
      */
     V get(String txnId, K key);
 
@@ -55,8 +56,12 @@ public interface CoShim<K, V> {
     void put(String txnId, K key, V value);
 
     /**
-     * The client sent its last operation: CAS {@code started → executed}. On failure (the txn was
-     * aborted or doomed meanwhile) it aborts the txn.
+     * pseudo.txt {@code end(txn_id)}: the client sent its last operation, CAS {@code started →
+     * executed}. If the txn was aborted or doomed meanwhile (a cascade or foreign abort landed after
+     * the last request), it runs abort_transaction and returns FAILED; an unknown id also returns
+     * FAILED. A duplicate end on a txn that is already executed / prepared / committing / committed
+     * returns SUCCEEDED and changes nothing: aborting it could abort a prepared txn ("prepared is
+     * final").
      */
     Outcome end(String txnId);
 
