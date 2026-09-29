@@ -9,7 +9,7 @@ Data Structures:
         // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers
     locks_map: ConcurrentHashMap<key, chain>   // one chain per key, generations of holders
 
-    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
+    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, write_buffer: key -> value }
     status ∈ {started, executed, prepared, committing, committed, aborted, must_abort}
 
     transactions_map: ConcurrentHashMap<txn_id, txn>
@@ -31,9 +31,10 @@ Store:
         // 2. No crashes: crash recovery is out of scope. The shim is assumed not to crash between
         //    voting YES and the coordinator's decision (nothing is logged, so a crash there would
         //    lose a prepared txn and break 2PC atomicity).
-        // 3. Coordinator: txn_ids are assigned by the coordinator. It calls execute at most once per
-        //    txn_id and sends no prepare/commit/abort for a txn_id before its execute has been
-        //    delivered. Garbage collection of txn state is its responsibility too: the shim drops a txn
+        // 3. Coordinator: txn_ids are assigned by the coordinator. It calls start at most once per
+        //    txn_id, sends end at most once, after the txn's last get/put, and sends no
+        //    get/put/end/prepare/commit/abort for a txn_id before its start has been delivered.
+        //    Garbage collection of txn state is its responsibility too: the shim drops a txn
         //    from transactions_map once it is committed or aborted, and later or duplicate messages for
         //    that id take the unknown-id branches (prepare votes NO, commit/abort are no-ops).
         // 4. Deadlocks: only the execution-phase waits (lock(), upgrade()) are bounded, by lock_timeout.
@@ -42,32 +43,59 @@ Store:
         //    vote timeout) and not handled by the shim.
 
 
-procedure execute(txn_id, code):
-    txn = new txn with txn_id, locks_acquired={}, status=started, code=code
+Requests:
+    // The shim never receives or runs client code. Each shim is a separate node that accepts many
+    // concurrent connections, only from the coordinator side (the 2PC participants). A connection carries
+    // one transaction at a time, as a sequence of requests: start(txn_id), then one get/put(txn_id, ...)
+    // per operation, then end(txn_id) once the client sent its last operation; prepare/commit/abort(txn_id)
+    // carry the coordinator's decision. Many transactions run concurrently on different connections.
+    // Each request runs on the thread handling its connection and blocks only that thread, so the
+    // requests of one txn never run concurrently with each other: the only foreign threads that touch a
+    // running txn are cascades (mark_must_abort / abort_transaction from another txn's abort) and the
+    // coordinator's abort()/prepare()
+
+
+procedure start(txn_id):
+    txn = new txn with txn_id, locks_acquired={}, status=started, write_buffer={}
     if transactions_map.putIfAbsent(txn.txn_id, txn) != null
         return FAILED   // txn_id already registered (collision / duplicate)
 
+    return SUCCEEDED
 
-    execution_failed = false
-    txn.code calls get(k, txn) or put(k, v, txn) multiple times
 
-    if during execution, return value of get/put is FAILED, then stop execution
-        and set execution_failed = true
+procedure end(txn_id):
+    // the client sent its last get/put: the write buffer is final from here on
+    txn = transactions_map[txn_id]
+    if txn == null:
+        // unknown/already-evicted txn_id: never started, or already aborted (a FAILED get/put, a
+        // cascade's eager cleanup, a coordinator abort) and evicted
+        return FAILED
 
-    // may block inside a get/put on a predecessor; a FAILED result
-    // requires the handler to stop calling get/put and return immediately
-    if execution_failed or not CAS(txn.status, started, executed):
-        // a get/put that returned FAILED already ran abort_transaction, but the CAS can also fail
-        // because a cascade / foreign abort landed after the last get/put, and then nobody has
-        // released the locks yet. abort_transaction is idempotent (its CAS fails on an already
-        // aborted txn), so always call it here
+    if not CAS(txn.status, started, executed):
+        if txn.status in {executed, prepared, committing, committed}:
+            // duplicate/late end (assumption 3: sent at most once): the txn already executed. Never
+            // abort here: a prepared txn has voted YES and must stay able to commit
+            return SUCCEEDED
+        // aborted or must_abort. A get/put that returned FAILED already ran abort_transaction, but the
+        // CAS can also fail because a cascade / foreign abort landed after the last get/put, and then
+        // nobody has released the locks yet (no request of this txn is running anymore).
+        // abort_transaction is idempotent (its CAS fails on an already aborted txn), so always call it here
         abort_transaction(txn)
         return FAILED
 
     return SUCCEEDED
 
 
-procedure get(k, txn):
+procedure get(txn_id, k):
+    txn = transactions_map[txn_id]
+    if txn == null:
+        // unknown/already-evicted txn_id: never started, or already aborted and evicted
+        return NULL, FAILED
+    if txn.status in {executed, prepared, committing, committed}:
+        // request after end(): the write buffer is final once executed, so refuse it and leave the txn
+        // as it is (never abort a prepared txn, it voted YES). The only FAILED that does not come from an
+        // abort_transaction; every other FAILED means the txn is aborted and its locks released
+        return NULL, FAILED
     result = lock(k, SHARED, txn)
     if result == MUST_ABORT:
         abort_transaction(txn)
@@ -95,7 +123,12 @@ procedure get(k, txn):
     return store.read(k), SUCCEEDED
 
 
-procedure put(k, v, txn):
+procedure put(txn_id, k, v):
+    txn = transactions_map[txn_id]
+    if txn == null:
+        return FAILED   // unknown/already-evicted txn_id, same as in get()
+    if txn.status in {executed, prepared, committing, committed}:
+        return FAILED   // request after end(), same as in get()
     result = lock(k, EXCLUSIVE, txn)
     if result == MUST_ABORT:
         abort_transaction(txn)
@@ -456,5 +489,7 @@ procedure mark_must_abort(txn) -> bool:
     // abort_transaction()): mark_must_abort is only ever called from within a cascade that already
     // holds a live reference to the victim (via successor_node.holders), never from the coordinator,
     // so there is no id-based external entry point for it to be consistent with
+    // A started victim is still running: the thread handling its connection aborts it at its next
+    // get/put (lock() / upgrade() see must_abort) or at the CAS in end()
     before=CAS_returning(txn.status, {executed, started}, must_abort)
     return before==executed
