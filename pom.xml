@@ -13,6 +13,7 @@
     <modules>
         <module>store-api</module>
         <module>shim-core</module>
+        <module>shim-net</module>
         <module>coshim-jdbc</module>
         <module>seata-xa</module>
     </modules>
@@ -42,6 +43,11 @@
             <dependency>
                 <groupId>ch.epfl.coshim</groupId>
                 <artifactId>coshim-jdbc</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.epfl.coshim</groupId>
+                <artifactId>shim-net</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

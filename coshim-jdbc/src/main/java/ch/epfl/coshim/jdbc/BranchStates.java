@@ -16,7 +16,10 @@ import java.util.concurrent.ConcurrentMap;
  * <p>TODO: this is a first mitigation, not the final design. It lives outside the protocol and uses
  * expiring tombstones (see {@link #pruneTombstones}). A further improvement is to handle the
  * "decision before execute" case in the shim protocol itself (pseudo.txt), or to prove it cannot
- * happen with Seata's XA flow, and then drop this class.
+ * happen with Seata's XA flow, and then drop this class. With the shim as a separate node shared by
+ * several application instances (shim-net), this matters more: this state lives in one RM, but the
+ * TC may route the early rollback to another instance of the same resource id, which then records
+ * the tombstone where the phase-1 thread never looks. The guard belongs on the node.
  *
  * <p>These are <b>not</b> the transaction statuses of pseudo.txt. {@code started}, {@code executed},
  * {@code prepared}, {@code committing}, {@code committed}, {@code aborted} and {@code must_abort} live

@@ -14,23 +14,22 @@ import javax.sql.XADataSource;
  * A {@link CoShim} exposed as a JDBC data source, the way a MySQL/PG driver exposes a database: a
  * plain {@link DataSource} (for Seata's {@code DataSourceProxyXA}) and an {@link XADataSource}.
  *
- * <p>The URL {@code jdbc:coshim://<name>} is an <b>identity, not a network address</b>. Nothing
- * connects to it: the shim is the {@link CoShim} object passed to the constructor, in this JVM, so
- * there is no host or port to configure, in dev (localhost) or in production. Seata reads the URL for
- * two things only: the resource id (the whole URL) and the dbType ({@code coshim}, the JDBC
- * subprotocol).
+ * <p>Seata reads the URL {@code jdbc:coshim://<name>} for two things: the resource id (the whole URL)
+ * and the dbType ({@code coshim}, the JDBC subprotocol). The data source itself never connects to
+ * the URL; it sends requests to the {@link CoShim} passed to the constructor. There are two
+ * deployments:
  *
- * <p>The resource id is what the TC uses to route phase 2 (xa commit/rollback) back to an RM, and it
- * falls back to any client registered with the same id. For MySQL/PG any client can finish a branch,
- * because the database keeps the XA state. Here the state lives in this JVM's shim, so the name must
- * be unique per shim instance: two application instances must not register the same
- * {@code jdbc:coshim://<name>} with different in-process shims. Deriving it from the store and the
- * instance (e.g. {@code "orders-kv@" + hostname}) is enough.
- *
- * <p>If the shim later becomes a separate server shared by several application instances, the URL
- * becomes a real address, e.g. {@code jdbc:coshim://localhost:7000/orders-kv} in dev. The same id
- * then designates the same shared shim for every client, exactly like a MySQL URL. dbType parsing
- * does not change, because it only looks at the subprotocol.
+ * <ul>
+ *   <li><b>Shim as a separate node</b> (the intended one): the CoShim is a
+ *       {@code shim-net RemoteCoShim} talking to a {@code CoShimServer}, and the name is the node's
+ *       address and store, e.g. {@code "localhost:7000/orders-kv"} in dev. Every application instance
+ *       uses the same URL for the same node, exactly like a MySQL URL. That is correct because the TC
+ *       routes phase 2 by resource id and may pick any client registered with it, and every client
+ *       reaches the same node, which holds the transaction state.</li>
+ *   <li><b>In-process shim</b> (tests, single-JVM setups): the CoShim lives in this JVM, so its state is
+ *       local. The name must then be unique per instance (e.g. {@code "orders-kv@" + hostname}),
+ *       otherwise the TC could route phase 2 to another instance that does not know the txn.</li>
+ * </ul>
  */
 public class CoShimDataSource<K, V> implements DataSource, XADataSource {
 
@@ -43,8 +42,8 @@ public class CoShimDataSource<K, V> implements DataSource, XADataSource {
     private volatile int loginTimeout;
 
     /**
-     * @param name identity of this shim instance, unique across every RM registered with the TC
-     *     (see the class comment), e.g. "orders-kv@app-1"
+     * @param name the shim's identity for Seata (see the class comment): the node's
+     *     {@code "host:port/store"} for a remote shim, or a per-instance name for an in-process one
      */
     public CoShimDataSource(String name, CoShim<K, V> shim) {
         this.url = URL_PREFIX + Objects.requireNonNull(name);

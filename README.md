@@ -12,6 +12,7 @@ global transactions that mix both kinds of shim.
 | --- | --- | --- |
 | `store-api` | nothing | `KvStore<K, V>`: the whole database behind `get` / `store`, plus `InMemoryKvStore` |
 | `shim-core` | `store-api` | `CoShim`: the requests a shim receives from client connections (start / get / put / end / prepare / commit / abort). It never runs client code; `SpeculativeCoShim` is a **TODO stub** to be implemented from pseudo.txt; `NoCcShim` is a pass-through shim (no concurrency control) used as the benchmark baseline and in tests |
+| `shim-net` | `shim-core` | **Each shim is a separate node**: `CoShimServer` serves one `CoShim` over TCP to the participants only (shared-token handshake, optional client allowlist); `RemoteCoShim` is the client the RMs use; `CoShimNode` runs a node |
 | `coshim-jdbc` | `shim-core` | The shim as a JDBC "driver": `CoShimDataSource` (`DataSource` + `XADataSource`, URL `jdbc:coshim://<name>`), `CoShimXAResource`, `KvSession` (get/put instead of SQL). No Seata dependency |
 | `seata-xa` | `coshim-jdbc`, patched Seata | `DataSourceProxyCoShim`: the counterpart of `new DataSourceProxyXA(mysqlPool)` |
 
@@ -55,10 +56,22 @@ So Seata runs the stock XA code, the same TC path (`XACore`), and no Seata globa
 Sonata and shim branches. Heavy vs light is purely what runs behind the `XAResource`, and one
 global transaction can contain both.
 
+```
+  application JVM (Seata TM + RM)                          shim node (one per store)
+  DataSourceProxyCoShim ─ ConnectionProxyXA ─ CoShimXAResource
+                                     └─ RemoteCoShim ── TCP, token ──▶ CoShimServer ─ SpeculativeCoShim ─ KvStore
+  Seata TC ◀──── branch register / phase 2 ────▶ RM (never talks to the node itself)
+```
+
+```sh
+COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode 7000 nocc [allowed RM hosts...]
+```
+
 ```java
-CoShimDataSource<String, String> kv =
-        new CoShimDataSource<>("orders-kv", new SpeculativeCoShim<>(new InMemoryKvStore<>(), Duration.ofMillis(200)));
-DataSource orders = new DataSourceProxyCoShim(kv);          // like new DataSourceProxyXA(mysqlPool)
+RemoteCoShim<String, String> shim = new RemoteCoShim<>(
+        new InetSocketAddress("localhost", 7000), System.getenv("COSHIM_TOKEN"), Codec.UTF8, Codec.UTF8).verify();
+DataSource orders = new DataSourceProxyCoShim(
+        new CoShimDataSource<>("localhost:7000/orders-kv", shim));   // like new DataSourceProxyXA(mysqlPool)
 
 // inside a global transaction (@GlobalTransactional, or GlobalTransactionContext + begin/commit):
 try (Connection c = orders.getConnection()) {
@@ -84,11 +97,19 @@ automatically.
 
 ### Deployment notes
 
-- **The resource id must be unique per shim instance.** `jdbc:coshim://<name>` is an identity,
-  not an address. The TC routes phase 2 by resource id and may fall back to another client with
-  the same id. The shim state lives in one JVM, so give every instance its own name (e.g.
-  `orders-kv@app-1`). A future shared shim server would use a real address instead
-  (`jdbc:coshim://localhost:7000/orders-kv`).
+- **Each shim is a separate node** (`shim-net`). It accepts many concurrent connections, one
+  thread each, but only from the participants: a connection must present the node's shared
+  token, and can be restricted to an allowlist of RM hosts. The Seata TC never connects to it;
+  as for MySQL/PG, the TC talks to the RMs and they talk to the node.
+- **Resource id = the node's address** (`jdbc:coshim://host:port/store`), the same for every
+  application instance, like a MySQL URL. The TC routes phase 2 by resource id and may pick any
+  RM registered with it. That's fine, because every RM reaches the same node, which holds the
+  transaction state. Only an in-process shim (tests) needs a per-instance name.
+- **Early-rollback guard is still per RM** (`BranchStates`). With several application instances,
+  a TC rollback racing phase 1 may reach another instance. Moving the guard onto the node is the
+  TODO on `BranchStates`.
+- **The wire is not encrypted yet.** The token authenticates, but for untrusted networks, run the
+  node behind TLS (or add it to `CoShimServer`).
 - **Spring (`seata.data-source-proxy-mode=XA`).** The auto-proxy wraps every plain `DataSource`
   bean in a stock `DataSourceProxyXA`, which cannot create coshim XA connections ("xa not support
   dbType: coshim"). So do not expose a bare `CoShimDataSource` bean. Instead, expose a
