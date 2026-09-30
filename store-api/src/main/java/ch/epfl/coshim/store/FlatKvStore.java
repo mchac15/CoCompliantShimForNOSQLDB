@@ -1,5 +1,7 @@
 package ch.epfl.coshim.store;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -23,6 +25,14 @@ public class FlatKvStore<K, V> implements KvStore<TableKey<K>, V> {
     @Override
     public void store(TableKey<K> key, V value) {
         store.store(plain(key), value);
+    }
+
+    /** Forwards the batch as one batch, so the wrapped store can still send it in one request. */
+    @Override
+    public void storeAll(Map<TableKey<K>, V> entries) {
+        Map<K, V> plain = new HashMap<>();
+        entries.forEach((key, value) -> plain.put(plain(key), value));
+        store.storeAll(plain);
     }
 
     private K plain(TableKey<K> key) {

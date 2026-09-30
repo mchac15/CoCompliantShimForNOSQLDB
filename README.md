@@ -130,6 +130,12 @@ automatically.
   embed the store in the node's process when it is embeddable. The path is then application →
   node, one hop, like application → MySQL. A store on another machine adds a network round trip
   to those calls.
+- **The shim must be the only writer of its store.** A key-value store has no concurrency control
+  of its own, so a process writing to it directly bypasses the shim's locks: commits overwrite
+  its writes blindly (lost updates) and reads are no longer protected. Let the store listen only
+  to its node (localhost, or embedded). Applications that do not use Seata still go through the
+  shim, with local transactions on the coshim data source. Commits reach the store as one batch
+  (`KvStore.storeAll`).
 - **Tombstone TTL is not definitive.** If a start arrives after its tombstone expired (a phase 1
   stalled longer than the TTL), the branch is accepted although the global transaction was
   rolled back.

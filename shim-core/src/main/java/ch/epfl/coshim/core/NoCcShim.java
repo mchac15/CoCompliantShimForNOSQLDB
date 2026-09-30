@@ -110,7 +110,7 @@ public class NoCcShim<K, V> implements CoShim<K, V> {
         if (txn == null || txn.status != Status.PREPARED) {
             return;
         }
-        txn.writeBuffer.forEach(store::store);
+        store.storeAll(txn.writeBuffer);   // one batch per commit
         transactions.remove(txnId, txn);
     }
 
