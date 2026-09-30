@@ -147,14 +147,26 @@ procedure get(txn_id, k):
     // executed, so its buffer is final. If the writer already committed, its
     // buffer was applied to the store before its node was spliced out of the
     // chain, so no such node is found and reading the store is correct.
+    doomed=false
     atomic(locks_map) {
-        if k in locks_map:
+        // re-check under the latch, as in lock(): a foreign abort_transaction() (coordinator abort(),
+        // prepare() on a still started txn) may have landed since lock() returned and spliced this
+        // txn's node out. A spliced node is no longer relinked, so its predecessor can be a node that
+        // has since been emptied and spliced too (its writer committed), with no holder to read from.
+        // abort_transaction CASes to aborted before it splices, so a status seen here that is neither
+        // aborted nor must_abort means the node is still in the chain until the latch is released
+        if txn.status in {aborted, must_abort}:
+            doomed=true
+        else if k in locks_map:
             current_node=txn.locks_acquired[k].target_node
             while current_node!=null and current_node.mode!=EXCLUSIVE:
                 current_node=current_node.predecessor
             if current_node!=null:
                 actual_value=(the sole holder of current_node).write_buffer[k]   // an EXCLUSIVE node has one holder
     }
+    if doomed:
+        abort_transaction(txn)   // outside the latch; idempotent, releases the locks of a must_abort txn
+        return NULL, FAILED
     if actual_value!=null:
         return actual_value, SUCCEEDED
     return store.read(k), SUCCEEDED

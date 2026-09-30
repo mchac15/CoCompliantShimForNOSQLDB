@@ -111,8 +111,11 @@ The shim locks at the granularity of a single record, identified by its table an
     \EndIf
     \State $actual\_value \gets \text{null}$ \Comment{null $=$ no predecessor version; values are assumed non-null}
     \Statex \Comment{speculative read: nearest EXCLUSIVE node at or before own node; its buffer is final since \Call{lock}{} waits for \texttt{executed}. If none, the writer committed and the store is correct}
+    \State $doomed \gets \text{false}$
     \State \textbf{atomic}(locks\_map) \{
-    \If{$k \in \text{locks\_map}$}
+    \If{$txn.\text{status} \in \{\text{aborted}, \text{must\_abort}\}$}
+        \State $doomed \gets \text{true}$ \Comment{re-check under the latch, as in \Call{lock}{}: a foreign abort since \Call{lock}{} returned may have spliced the own node out; its stale predecessor can be an emptied node with no holder. abort\_transaction CASes to aborted before splicing, so any other status means the node is still in the chain}
+    \ElsIf{$k \in \text{locks\_map}$}
         \State $current\_node \gets txn.\text{locks\_acquired}[k].\text{target\_node}$
         \While{$current\_node \neq \text{null}$ \textbf{and} $current\_node.\text{mode} \neq \text{EXCLUSIVE}$}
             \State $current\_node \gets current\_node.\text{predecessor}$
@@ -122,6 +125,10 @@ The shim locks at the granularity of a single record, identified by its table an
         \EndIf
     \EndIf
     \}
+    \If{$doomed$}
+        \State \Call{abort\_transaction}{txn} \Comment{outside the latch; idempotent, releases the locks of a must\_abort txn}
+        \State \textbf{return NULL, FAILED}
+    \EndIf
     \If{$actual\_value \neq \text{null}$}
         \State \textbf{return} $actual\_value$, SUCCEEDED
     \EndIf
