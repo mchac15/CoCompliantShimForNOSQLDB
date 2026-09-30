@@ -41,14 +41,16 @@ public final class CoShimNode {
         }
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 7000;
         String kind = args.length > 1 ? args[1] : "nocc";
-        String[] names = (args.length > 2 ? args[2] : "default").split(",");
+        // A comma-separated list, e.g. "shop,billing": the node hosts one database (and one shim) per
+        // name. With no argument it hosts a single database called "default".
+        String[] databaseNames = (args.length > 2 ? args[2] : "default").split(",");
         Set<InetAddress> allowed = new HashSet<>();
         for (int i = 3; i < args.length; i++) {
             allowed.add(InetAddress.getByName(args[i]));
         }
 
         Map<String, CoShim<TableKey<String>, String>> databases = new LinkedHashMap<>();
-        for (String name : names) {
+        for (String name : databaseNames) {
             KvStore<TableKey<String>, String> store = new InMemoryKvStore<>();
             databases.put(name, switch (kind) {
                 case "speculative" -> new SpeculativeCoShim<>(store, Duration.ofMillis(200));
