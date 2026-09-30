@@ -8,11 +8,21 @@ Data Structures:
         // chain.last_node() = tail. "append n" makes n the new tail (and the head if the chain was empty);
         // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers
     locks_map: ConcurrentHashMap<key, chain>   // one chain per key, generations of holders
+        // a key k stands for (table, key): one shim manages all the tables of its database
 
-    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, code , write_buffer: key -> value }
+    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, write_buffer: key -> value,
+           expires_at }   // expires_at: only set on a tombstone (see abort()), null otherwise
     status ∈ {started, executed, prepared, committing, committed, aborted, must_abort}
 
     transactions_map: ConcurrentHashMap<txn_id, txn>
+        // also holds the tombstones: a tombstone for txn_id is a txn entry with status=aborted, no locks,
+        // an empty write_buffer and expires_at set. It records "the coordinator aborted this id before the
+        // shim ever saw its start" (see abort()). Kept in this map rather than in a separate one so that
+        // (1) abort()'s "known txn or else tombstone" and start()'s "no entry, tombstone included" are each a
+        // single atomic operation on the same map entry (computeIfAbsent / putIfAbsent), and (2) every other
+        // request on a tombstoned id needs no new branch: it finds an aborted txn without locks
+    tombstone_ttl: duration   // lifetime of a tombstone, to be chosen >= the coordinator's maximum global
+                              // transaction timeout (see gc_tombstones())
     // atomic(locks_map) { ... } is one critical section over the chains. An implementation may use
     // per-key latches (one at a time) as long as the status re-check in lock()/upgrade() and the update of
     // txn.locks_acquired stay atomic with respect to abort_transaction() reading locks_acquired (e.g. both
@@ -31,43 +41,98 @@ Store:
         // 2. No crashes: crash recovery is out of scope. The shim is assumed not to crash between
         //    voting YES and the coordinator's decision (nothing is logged, so a crash there would
         //    lose a prepared txn and break 2PC atomicity).
-        // 3. Coordinator: txn_ids are assigned by the coordinator. It calls execute at most once per
-        //    txn_id and sends no prepare/commit/abort for a txn_id before its execute has been
-        //    delivered. Garbage collection of txn state is its responsibility too: the shim drops a txn
-        //    from transactions_map once it is committed or aborted, and later or duplicate messages for
-        //    that id take the unknown-id branches (prepare votes NO, commit/abort are no-ops).
+        // 3. Coordinator: txn_ids are assigned by the coordinator. It calls start at most once per
+        //    txn_id, sends end at most once, and sends no get/put/end/prepare/commit for a txn_id
+        //    before its start has been delivered. The get/put/end of one txn are sent one at a time:
+        //    each only after the response to the previous one, so they never overlap and end comes
+        //    after the last get/put has returned. The shim does not check this. If end overtook a
+        //    running put, a successor could read the key before the write is in the buffer, and the
+        //    write could land after the YES vote. The client driver enforces it (coshim-jdbc serializes
+        //    the requests of a connection); a client bypassing the driver is outside this assumption.
+        //    abort/prepare/commit are not covered: they may arrive while a get/put is running.
+        //    An abort MAY arrive before the start (e.g. a global timeout right after the branch was
+        //    registered): the shim then records a tombstone so that the late start fails, instead of
+        //    running, voting YES and holding locks for a global transaction that was rolled back.
+        //    The shim drops a txn from transactions_map once it is committed or aborted, and later or
+        //    duplicate messages for that id take the unknown-id branches (prepare votes NO, commit is a
+        //    no-op, get/put/end fail, abort leaves a tombstone). Tombstones are garbage-collected by
+        //    the shim itself after tombstone_ttl; the coordinator does not have to clean anything up.
         // 4. Deadlocks: only the execution-phase waits (lock(), upgrade()) are bounded, by lock_timeout.
         //    The waits in prepare() have no timeout: a cross-shim cycle at prepare (T1 before T2 on one
         //    shim, T2 before T1 on another) is a 2PC-level deadlock, left to the coordinator (e.g. its
         //    vote timeout) and not handled by the shim.
 
 
-procedure execute(txn_id, code):
-    txn = new txn with txn_id, locks_acquired={}, status=started, code=code
+Requests:
+    // Deployment: one shim per data source, where a data source = a node + a database name. The shim
+    // node is colocated with the store or standalone next to it. One server can host several databases,
+    // each with its own shim, i.e. its own locks_map / transactions_map: nothing is shared between shims.
+    // A shim manages all the tables of its database: a key k stands for (table, key).
+    // The shim never receives or runs client code. Each shim accepts many
+    // concurrent connections, only from the coordinator side (the 2PC participants). A connection carries
+    // one transaction at a time, as a sequence of requests: start(txn_id), then one get/put(txn_id, ...)
+    // per operation, then end(txn_id) once the client sent its last operation; prepare/commit/abort(txn_id)
+    // carry the coordinator's decision. Many transactions run concurrently on different connections.
+    // Each request runs on the thread handling its connection and blocks only that thread. A txn is
+    // identified by its txn_id, not by a connection: its requests may use different connections, so
+    // the connection alone does not keep them from overlapping. What does is assumption 3 (get/put/end
+    // of one txn one at a time, enforced by the client driver). Given it, the only foreign threads that
+    // touch a running txn are cascades (mark_must_abort / abort_transaction from another txn's abort)
+    // and the coordinator's abort()/prepare()
+
+
+procedure start(txn_id):
+    txn = new txn with txn_id, locks_acquired={}, status=started, write_buffer={}
+    // putIfAbsent is atomic with abort()'s computeIfAbsent on the same entry: either this start
+    // registers first and the abort finds (and aborts) the txn, or the abort leaves its tombstone first
+    // and this start finds it. There is no window where the abort misses the txn and the start misses
+    // the tombstone. An implementation with a separate tombstone map must keep exactly this: tombstone
+    // check + registration, and lookup + tombstone insertion, under the same per-id critical section
     if transactions_map.putIfAbsent(txn.txn_id, txn) != null
-        return FAILED   // txn_id already registered (collision / duplicate)
+        // txn_id already registered (collision / duplicate), or tombstoned: the coordinator already
+        // aborted this id, the txn must never run. A tombstone past its expires_at that gc_tombstones()
+        // has not removed yet still rejects the start (conservative)
+        return FAILED
+
+    return SUCCEEDED
 
 
-    execution_failed = false
-    txn.code calls get(k, txn) or put(k, v, txn) multiple times
+procedure end(txn_id):
+    // the client sent its last get/put: the write buffer is final from here on
+    txn = transactions_map[txn_id]
+    if txn == null:
+        // unknown/already-evicted txn_id: never started, or already aborted (a FAILED get/put, a
+        // cascade's eager cleanup, a coordinator abort) and evicted. A tombstoned id is found instead,
+        // with status aborted: the CAS below fails and abort_transaction is a no-op (FAILED as well)
+        return FAILED
 
-    if during execution, return value of get/put is FAILED, then stop execution
-        and set execution_failed = true
-
-    // may block inside a get/put on a predecessor; a FAILED result
-    // requires the handler to stop calling get/put and return immediately
-    if execution_failed or not CAS(txn.status, started, executed):
-        // a get/put that returned FAILED already ran abort_transaction, but the CAS can also fail
-        // because a cascade / foreign abort landed after the last get/put, and then nobody has
-        // released the locks yet. abort_transaction is idempotent (its CAS fails on an already
-        // aborted txn), so always call it here
+    if not CAS(txn.status, started, executed):
+        if txn.status in {executed, prepared, committing, committed}:
+            // duplicate/late end (assumption 3: sent at most once): the txn already executed. Never
+            // abort here: a prepared txn has voted YES and must stay able to commit
+            return SUCCEEDED
+        // aborted or must_abort. A get/put that returned FAILED already ran abort_transaction, but the
+        // CAS can also fail because a cascade / foreign abort landed after the last get/put, and then
+        // nobody has released the locks yet (no request of this txn is running anymore).
+        // abort_transaction is idempotent (its CAS fails on an already aborted txn), so always call it here
         abort_transaction(txn)
         return FAILED
 
     return SUCCEEDED
 
 
-procedure get(k, txn):
+procedure get(txn_id, k):
+    txn = transactions_map[txn_id]
+    if txn == null:
+        // unknown/already-evicted txn_id: never started, or already aborted and evicted.
+        // A tombstoned id is found with status aborted: lock() returns MUST_ABORT before touching any
+        // chain, so it fails the same way and a tombstone never gets a lock
+        return NULL, FAILED
+    if txn.status in {executed, prepared, committing, committed}:
+        // request after end(): the write buffer is final once executed, so refuse it and leave the txn
+        // as it is (never abort a prepared txn, it voted YES). The only FAILED that does not come from an
+        // abort_transaction; every other FAILED means the txn is aborted and its locks released
+        return NULL, FAILED
     result = lock(k, SHARED, txn)
     if result == MUST_ABORT:
         abort_transaction(txn)
@@ -95,7 +160,12 @@ procedure get(k, txn):
     return store.read(k), SUCCEEDED
 
 
-procedure put(k, v, txn):
+procedure put(txn_id, k, v):
+    txn = transactions_map[txn_id]
+    if txn == null:
+        return FAILED   // unknown/already-evicted txn_id, same as in get()
+    if txn.status in {executed, prepared, committing, committed}:
+        return FAILED   // request after end(), same as in get()
     result = lock(k, EXCLUSIVE, txn)
     if result == MUST_ABORT:
         abort_transaction(txn)
@@ -304,7 +374,8 @@ procedure prepare(txn_id):
 
     if txn.status not in {executed, prepared}:
         // covers the already-aborted case too: cascade abort sets
-        // txn.status directly, so no predecessor dereference is needed here
+        // txn.status directly, so no predecessor dereference is needed here.
+        // Also the branch a tombstoned id takes (status aborted): NO, and abort_transaction is a no-op
         send no to 2PC controller
         abort_transaction(txn)
         return
@@ -370,7 +441,7 @@ procedure commit(txn_id):
     // longer take the txn (abort_transaction's CAS excludes it), and a successor's prepare cannot
     // pass before the writes are applied, since this txn is only spliced out of the chains below
     if not CAS(txn.status, prepared, committing):
-        return
+        return   // includes a tombstoned id (status aborted): no-op
 
     for (key,value) in txn.write_buffer:
         store.write(key, value)
@@ -428,7 +499,8 @@ procedure abort_transaction(txn):
 
     transactions_map.remove(txn.txn_id)
     // resolved: evicted like in commit(). Successors observe txn.status directly (they hold a
-    // reference, not a map lookup), and a duplicate/late message for the evicted id is a no-op abort
+    // reference, not a map lookup). A duplicate/late abort for the evicted id releases nothing: it only
+    // leaves a tombstone (see abort())
 
     // eager cleanup, outside the latch (so at most one key latch is ever held): a doomed txn that
     // already finished executing has no thread left that would ever abort it, and waiting for the
@@ -443,11 +515,41 @@ procedure abort_transaction(txn):
         abort_transaction(t)
 
 procedure abort(txn_id):
-    txn = transactions_map[txn_id]
-    if txn == null:
-        return   // unknown/already-evicted txn_id: no-op, per the
-                 // evicted-id convention documented in abort_transaction()
+    // known txn: unchanged (abort_transaction, eviction). Unknown id: leave a tombstone. The
+    // coordinator does not guarantee that its abort comes after the start (assumption 3): without the
+    // tombstone this abort would be a no-op, the late start would register the txn, it would execute,
+    // vote YES and hold its locks forever although the global transaction was rolled back.
+    // computeIfAbsent makes "look the txn up, else insert the tombstone" one atomic step on the map
+    // entry, atomic with start()'s putIfAbsent (see start())
+    txn = transactions_map.computeIfAbsent(txn_id,
+              new txn with txn_id, locks_acquired={}, status=aborted, write_buffer={},
+                           expires_at=now() + tombstone_ttl)
+    if txn is the tombstone just inserted:
+        return
+    // a registered txn, or an older tombstone (duplicate abort: its expires_at is not refreshed). On a
+    // tombstone abort_transaction is a no-op: its leading CAS fails on aborted, so it neither touches a
+    // chain nor evicts the tombstone
     abort_transaction(txn)
+
+    // A tombstone is never removed by a request, only by gc_tombstones(): a start that hits it fails and
+    // leaves it in place, and most tombstones never meet a start at all: a retried abort of a txn that
+    // was already aborted and evicted, or the abort the coordinator sends after a failed phase 1 to a
+    // shim that voted NO (and evicted the txn) leave one too, since an evicted id cannot be told from a
+    // never-started one. tombstone_ttl is what bounds all of them.
+    // Invariants: a tombstone is only ever created for an id with no entry, so it never replaces or
+    // aborts a registered txn (prepared stays final); it holds no lock and sits in no chain, so there is
+    // nothing to cascade or splice and no node can leak
+
+
+procedure gc_tombstones():   // runs periodically, in the background
+    for each (txn_id, t) in transactions_map:
+        if t.expires_at != null and now() >= t.expires_at:
+            transactions_map.remove(txn_id, t)   // conditional on the entry still being this tombstone
+    // Not definitive: once the tombstone is gone, a start for that id is accepted although the global
+    // transaction was rolled back (the txn then holds its locks until the coordinator contacts it
+    // again, if ever). Choosing tombstone_ttl >= the coordinator's maximum global transaction timeout
+    // only makes this unlikely: a start delayed for longer than that is not excluded by an
+    // asynchronous network
 
 
 procedure mark_must_abort(txn) -> bool:
@@ -456,5 +558,7 @@ procedure mark_must_abort(txn) -> bool:
     // abort_transaction()): mark_must_abort is only ever called from within a cascade that already
     // holds a live reference to the victim (via successor_node.holders), never from the coordinator,
     // so there is no id-based external entry point for it to be consistent with
+    // A started victim is still running: the thread handling its connection aborts it at its next
+    // get/put (lock() / upgrade() see must_abort) or at the CAS in end()
     before=CAS_returning(txn.status, {executed, started}, must_abort)
     return before==executed
