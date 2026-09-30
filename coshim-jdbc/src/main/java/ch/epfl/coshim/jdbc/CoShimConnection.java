@@ -34,6 +34,19 @@ import java.util.UUID;
  * database. That does not serialize transactions: every concurrent transaction (thread / global
  * transaction) gets its own connection from {@link CoShimDataSource#getConnection()} (cheap, no I/O),
  * and all connections share the same shim, whose lock chains order the conflicting ones.
+ *
+ * <p>Requests are serialized per connection. The shim assumes that the get/put/end of one
+ * transaction never overlap and that end arrives only after the last get/put has returned
+ * (pseudo.txt, assumption 3); otherwise another transaction can read a write that is not in the
+ * buffer yet, or a write lands after the vote. Nothing else guarantees it: the branch binding is a
+ * field of this connection, not of a thread, and {@code RemoteCoShim} sends each request on any
+ * pooled socket. So a get/put, and the end of the transaction (xa end, or {@link #commit()} of a
+ * local one), hold {@link #requests} until the shim's response is back, and an application that
+ * shares the connection between threads makes them wait for each other. Aborts are never
+ * serialized: xa rollback, {@link #rollback()} and the TC's phase 2 must be able to abort a
+ * transaction whose request is blocked in the shim. A request whose outcome is unknown (the shim
+ * node was unreachable mid-request, or answered with an error) may still be running on the shim, so
+ * its transaction can no longer end successfully: see {@link #failedTxnId}.
  */
 public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implements KvSession<K, V> {
 
@@ -61,6 +74,18 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
 
     /** See {@link #requireXaBranch()}. */
     private volatile boolean xaBranchRequired;
+
+    /** Held by a get/put and by the end of a transaction, until the shim has answered: see the class comment. */
+    private final Object requests = new Object();
+
+    /**
+     * The transaction (XA branch or local) one of whose requests has an unknown outcome, or null.
+     * Such a request may still be running on the shim, so the transaction must not end successfully:
+     * the xa end of the branch fails without reaching the shim (the TC then rolls it back), and a
+     * local transaction is aborted at once. Transaction ids are unique, so a stale value never
+     * matches a later transaction.
+     */
+    private volatile String failedTxnId;
 
     CoShimConnection(CoShimDataSource<K, V> dataSource) {
         this.dataSource = dataSource;
@@ -93,6 +118,22 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
         this.xaBranchRequired = true;
     }
 
+    /**
+     * xa end(TMSUCCESS) of {@code txnId}: unbinds it and sends the shim's end, after any get/put of
+     * this connection still in flight has returned.
+     *
+     * @return FAILED if the shim aborted the branch, or if one of its requests has an unknown outcome
+     */
+    Outcome endBranch(String txnId) {
+        synchronized (requests) {
+            unbind(txnId);
+            if (txnId.equals(failedTxnId)) {
+                return Outcome.FAILED;
+            }
+            return shim().end(txnId);
+        }
+    }
+
     /** True while a local transaction is in progress (xa start is then refused, XAER_OUTSIDE). */
     boolean inLocalTransaction() {
         return localTxnId != null;
@@ -123,8 +164,17 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
         R send(String txnId);
     }
 
-    /** Sends one request in the connection's current transaction (XA branch, local, or autocommit). */
+    /**
+     * Sends one request in the connection's current transaction (XA branch, local, or autocommit),
+     * holding {@link #requests} until the shim has answered.
+     */
     private <R> R request(Request<R> request) throws SQLException {
+        synchronized (requests) {
+            return requestSerialized(request);
+        }
+    }
+
+    private <R> R requestSerialized(Request<R> request) throws SQLException {
         if (closed) {
             throw new SQLException("connection is closed");
         }
@@ -134,6 +184,9 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
                 return request.send(branch);
             } catch (TxnAbortedException e) {
                 throw new SQLTransactionRollbackException(e.getMessage(), e);
+            } catch (RuntimeException e) {
+                failedTxnId = branch;   // outcome unknown: xa end will fail, the TC rolls the branch back
+                throw e;
             }
         }
         if (xaBranchRequired) {
@@ -149,6 +202,9 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
             } catch (TxnAbortedException e) {
                 shim().abort(id);
                 throw new SQLTransactionRollbackException(e.getMessage(), e);
+            } catch (RuntimeException e) {
+                abortUnknownOutcome(id, e);   // never ended: the request may still be running on the shim
+                throw e;
             }
         }
         String local = localTxnId;
@@ -161,6 +217,25 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
         } catch (TxnAbortedException e) {
             localTxnId = null;   // the shim aborted it and released its locks
             throw new SQLTransactionRollbackException(e.getMessage(), e);
+        } catch (RuntimeException e) {
+            localTxnId = null;
+            abortUnknownOutcome(local, e);
+            throw e;
+        }
+    }
+
+    /**
+     * A request of the local transaction {@code id} has an unknown outcome: this connection is its
+     * coordinator, so it aborts it right away instead of ever ending it. An abort is safe while the
+     * request may still be running on the shim. Best effort: if the shim is unreachable the abort
+     * fails too and is recorded on {@code cause}.
+     */
+    private void abortUnknownOutcome(String id, RuntimeException cause) {
+        failedTxnId = id;
+        try {
+            shim().abort(id);
+        } catch (RuntimeException abortFailed) {
+            cause.addSuppressed(abortFailed);
         }
     }
 
@@ -197,15 +272,20 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
         return autoCommit;
     }
 
-    /** Commits the local transaction, if any. An XA branch is committed by the TC, never here. */
+    /**
+     * Commits the local transaction, if any, after any get/put of this connection still in flight has
+     * returned. An XA branch is committed by the TC, never here.
+     */
     @Override
     public void commit() throws SQLException {
-        String local = localTxnId;
-        if (txnId != null || local == null) {
-            return;
+        synchronized (requests) {
+            String local = localTxnId;
+            if (txnId != null || local == null) {
+                return;
+            }
+            localTxnId = null;
+            commitLocal(local);
         }
-        localTxnId = null;
-        commitLocal(local);
     }
 
     /**

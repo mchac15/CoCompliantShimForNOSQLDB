@@ -68,14 +68,19 @@ public class CoShimXAResource implements XAResource {
     @Override
     public void end(Xid xid, int flags) throws XAException {
         String txnId = txnId(xid);
-        connection.unbind(txnId);
         if (flags == TMFAIL) {
-            return;   // rollback(xid) follows
+            // rollback(xid) follows. Not serialized with the connection's requests: the abort must
+            // reach the shim even while a get/put of the branch is blocked there
+            connection.unbind(txnId);
+            return;
         }
         if (flags != TMSUCCESS) {
+            connection.unbind(txnId);
             throw xaError(XAException.XAER_INVAL, "only TMSUCCESS/TMFAIL are supported (no suspend)");
         }
-        if (shim.end(txnId) == Outcome.FAILED) {
+        // waits for a get/put of the branch still in flight on another thread: the shim's end must
+        // come after the last get/put has returned (see CoShimConnection)
+        if (connection.endBranch(txnId) == Outcome.FAILED) {
             throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " was aborted");
         }
     }
