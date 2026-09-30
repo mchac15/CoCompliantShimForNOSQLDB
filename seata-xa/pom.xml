@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>ch.epfl.coshim</groupId>
+        <artifactId>coshim-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>seata-xa</artifactId>
+    <name>seata-xa</name>
+    <description>Registers a coshim data source with Seata's XA mode, next to MySQL/PG (Sonata) data sources</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>ch.epfl.coshim</groupId>
+            <artifactId>coshim-jdbc</artifactId>
+        </dependency>
+        <!-- patched Sonata fork: see seata-patches/ and scripts/install-seata.sh -->
+        <dependency>
+            <groupId>org.apache.seata</groupId>
+            <artifactId>seata-rm-datasource</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.seata</groupId>
+            <artifactId>seata-tm</artifactId>
+        </dependency>
+        <!-- optional in seata-rm-datasource, required by any XA data source: JdbcUtils resolves
+             resourceId / dbType from the JDBC URL through Druid -->
+        <dependency>
+            <groupId>org.apache.seata</groupId>
+            <artifactId>seata-sqlparser-druid</artifactId>
+            <version>${seata.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>druid</artifactId>
+            <version>1.2.25</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
