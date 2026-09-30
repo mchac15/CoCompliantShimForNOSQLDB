@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import ch.epfl.coshim.core.NoCcShim;
 import ch.epfl.coshim.core.Vote;
+import ch.epfl.coshim.store.FlatKvStore;
 import ch.epfl.coshim.store.InMemoryKvStore;
 import ch.epfl.coshim.store.TableKey;
 import java.nio.charset.StandardCharsets;
@@ -88,6 +89,17 @@ class CoShimXAResourceTest {
         c.put("stock", "1", "a stock level");
         assertEquals("an order", c.get("orders", "1"));
         assertEquals("a stock level", c.get("stock", "1"));
+    }
+
+    @Test
+    void tablesAreOptionalPlainKeysWorkOnAStoreWithoutTables() throws Exception {
+        InMemoryKvStore<String, String> plainStore = new InMemoryKvStore<>();   // a store with no table notion
+        CoShimDataSource<String, String> flat =
+                new CoShimDataSource<>("localhost:7000/flat", new NoCcShim<>(new FlatKvStore<>(plainStore)));
+        CoShimConnection<String, String> c = flat.getConnection();
+        c.put("x", "1");
+        assertEquals("1", c.get("x"));
+        assertEquals("1", plainStore.get("x"), "stored under the plain key");
     }
 
     @Test

@@ -4,7 +4,10 @@ import ch.epfl.coshim.store.TableKey;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
-/** Wire encoding of a (table, key) pair: int table length, table (UTF-8), key bytes. */
+/**
+ * Wire encoding of an optionally table-qualified key: int table length (-1 = no table), table
+ * (UTF-8), key bytes.
+ */
 public final class TableKeyCodec<K> implements Codec<TableKey<K>> {
 
     private final Codec<K> keyCodec;
@@ -15,22 +18,28 @@ public final class TableKeyCodec<K> implements Codec<TableKey<K>> {
 
     @Override
     public byte[] encode(TableKey<K> value) {
-        byte[] table = value.table().getBytes(StandardCharsets.UTF_8);
+        byte[] table = value.hasTable() ? value.table().getBytes(StandardCharsets.UTF_8) : null;
         byte[] key = keyCodec.encode(value.key());
-        return ByteBuffer.allocate(Integer.BYTES + table.length + key.length)
-                .putInt(table.length)
-                .put(table)
-                .put(key)
-                .array();
+        ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES + (table == null ? 0 : table.length) + key.length);
+        buffer.putInt(table == null ? -1 : table.length);
+        if (table != null) {
+            buffer.put(table);
+        }
+        return buffer.put(key).array();
     }
 
     @Override
     public TableKey<K> decode(byte[] bytes) {
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
-        byte[] table = new byte[buffer.getInt()];
-        buffer.get(table);
+        int tableLength = buffer.getInt();
+        String table = null;
+        if (tableLength >= 0) {
+            byte[] tableBytes = new byte[tableLength];
+            buffer.get(tableBytes);
+            table = new String(tableBytes, StandardCharsets.UTF_8);
+        }
         byte[] key = new byte[buffer.remaining()];
         buffer.get(key);
-        return new TableKey<>(new String(table, StandardCharsets.UTF_8), keyCodec.decode(key));
+        return new TableKey<>(table, keyCodec.decode(key));
     }
 }

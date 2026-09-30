@@ -59,8 +59,14 @@ global transaction can contain both.
 ### One shim per data source
 
 A **data source is a node plus a database name**, and each has exactly one shim (its own lock
-chains and transactions). A shim manages all the **tables** of its database: a protocol key is a
-`(table, key)` pair. A node can host a single database (standalone, or colocated with its store)
+chains and transactions).
+
+**Tables are optional.** A protocol key is a plain key (`kv.get(key)`) or, for stores that have
+tables, a `(table, key)` pair (`kv.get(table, key)`); one shim covers all the tables of its
+database. A store with no table abstraction goes behind `FlatKvStore`, which takes plain keys as
+they are and rejects table keys.
+
+A node can host a single database (standalone, or colocated with its store)
 or several; that is a deployment choice, like one MySQL server hosting several logical databases.
 MySQL/PG never go through these nodes: they remain their own servers, reached through their JDBC
 drivers with Sonata's hook in the RM.
@@ -119,6 +125,11 @@ automatically.
   every application instance, like a MySQL URL. The TC routes phase 2 by resource id and may pick
   any RM registered with it. That's fine, because every RM reaches the same shim, which holds the
   transaction state. Only an in-process shim (tests) needs a per-instance name.
+- **Colocate the node with its store.** The shim reaches the store only through `KvStore`: reads
+  that miss the write buffers, and the writes at commit. Put the node on the store's machine, or
+  embed the store in the node's process when it is embeddable. The path is then application →
+  node, one hop, like application → MySQL. A store on another machine adds a network round trip
+  to those calls.
 - **Tombstone TTL is not definitive.** If a start arrives after its tombstone expired (a phase 1
   stalled longer than the TTL), the branch is accepted although the global transaction was
   rolled back.
