@@ -42,8 +42,14 @@ Store:
         //    voting YES and the coordinator's decision (nothing is logged, so a crash there would
         //    lose a prepared txn and break 2PC atomicity).
         // 3. Coordinator: txn_ids are assigned by the coordinator. It calls start at most once per
-        //    txn_id, sends end at most once, after the txn's last get/put, and sends no
-        //    get/put/end/prepare/commit for a txn_id before its start has been delivered.
+        //    txn_id, sends end at most once, and sends no get/put/end/prepare/commit for a txn_id
+        //    before its start has been delivered. The get/put/end of one txn are sent one at a time:
+        //    each only after the response to the previous one, so they never overlap and end comes
+        //    after the last get/put has returned. The shim does not check this. If end overtook a
+        //    running put, a successor could read the key before the write is in the buffer, and the
+        //    write could land after the YES vote. The client driver enforces it (coshim-jdbc serializes
+        //    the requests of a connection); a client bypassing the driver is outside this assumption.
+        //    abort/prepare/commit are not covered: they may arrive while a get/put is running.
         //    An abort MAY arrive before the start (e.g. a global timeout right after the branch was
         //    registered): the shim then records a tombstone so that the late start fails, instead of
         //    running, voting YES and holding locks for a global transaction that was rolled back.
@@ -67,10 +73,12 @@ Requests:
     // one transaction at a time, as a sequence of requests: start(txn_id), then one get/put(txn_id, ...)
     // per operation, then end(txn_id) once the client sent its last operation; prepare/commit/abort(txn_id)
     // carry the coordinator's decision. Many transactions run concurrently on different connections.
-    // Each request runs on the thread handling its connection and blocks only that thread, so the
-    // requests of one txn never run concurrently with each other: the only foreign threads that touch a
-    // running txn are cascades (mark_must_abort / abort_transaction from another txn's abort) and the
-    // coordinator's abort()/prepare()
+    // Each request runs on the thread handling its connection and blocks only that thread. A txn is
+    // identified by its txn_id, not by a connection: its requests may use different connections, so
+    // the connection alone does not keep them from overlapping. What does is assumption 3 (get/put/end
+    // of one txn one at a time, enforced by the client driver). Given it, the only foreign threads that
+    // touch a running txn are cascades (mark_must_abort / abort_transaction from another txn's abort)
+    // and the coordinator's abort()/prepare()
 
 
 procedure start(txn_id):
