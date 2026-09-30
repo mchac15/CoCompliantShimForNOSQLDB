@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>ch.epfl.coshim</groupId>
+        <artifactId>coshim-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>shim-net</artifactId>
+    <name>shim-net</name>
+    <description>Each shim as a separate node: TCP server wrapping a CoShim, and the RemoteCoShim client used by the RMs</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>ch.epfl.coshim</groupId>
+            <artifactId>shim-core</artifactId>
+        </dependency>
+    </dependencies>
+</project>

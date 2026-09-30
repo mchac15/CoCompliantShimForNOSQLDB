@@ -1,6 +1,7 @@
 package ch.epfl.coshim.jdbc;
 
 import ch.epfl.coshim.core.CoShim;
+import ch.epfl.coshim.store.TableKey;
 import java.io.PrintWriter;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -11,42 +12,43 @@ import javax.sql.DataSource;
 import javax.sql.XADataSource;
 
 /**
- * A {@link CoShim} exposed as a JDBC data source, the way a MySQL/PG driver exposes a database: a
- * plain {@link DataSource} (for Seata's {@code DataSourceProxyXA}) and an {@link XADataSource}.
+ * One data source = one shim = one database on one node, exposed to JDBC the way a MySQL/PG driver
+ * exposes a database: a plain {@link DataSource} (for Seata's {@code DataSourceProxyXA}) and an
+ * {@link XADataSource}. The shim manages all the tables of that database; applications address them
+ * through {@link KvSession} ({@code get(table, key)} / {@code put(table, key, value)}).
  *
- * <p>The URL {@code jdbc:coshim://<name>} is an <b>identity, not a network address</b>. Nothing
- * connects to it: the shim is the {@link CoShim} object passed to the constructor, in this JVM, so
- * there is no host or port to configure, in dev (localhost) or in production. Seata reads the URL for
- * two things only: the resource id (the whole URL) and the dbType ({@code coshim}, the JDBC
- * subprotocol).
+ * <p>Seata reads the URL {@code jdbc:coshim://<name>} for two things: the resource id (the whole URL)
+ * and the dbType ({@code coshim}, the JDBC subprotocol). The data source itself never connects to
+ * the URL; it sends requests to the {@link CoShim} passed to the constructor. There are two
+ * deployments:
  *
- * <p>The resource id is what the TC uses to route phase 2 (xa commit/rollback) back to an RM, and it
- * falls back to any client registered with the same id. For MySQL/PG any client can finish a branch,
- * because the database keeps the XA state. Here the state lives in this JVM's shim, so the name must
- * be unique per shim instance: two application instances must not register the same
- * {@code jdbc:coshim://<name>} with different in-process shims. Deriving it from the store and the
- * instance (e.g. {@code "orders-kv@" + hostname}) is enough.
- *
- * <p>If the shim later becomes a separate server shared by several application instances, the URL
- * becomes a real address, e.g. {@code jdbc:coshim://localhost:7000/orders-kv} in dev. The same id
- * then designates the same shared shim for every client, exactly like a MySQL URL. dbType parsing
- * does not change, because it only looks at the subprotocol.
+ * <ul>
+ *   <li><b>Shim on a node</b> (the intended one): the CoShim is a {@code shim-net RemoteCoShim} bound
+ *       to one database of a {@code CoShimServer}, and the name is the node's address and the database
+ *       name, e.g. {@code "localhost:7000/orders"} in dev, like a MySQL URL. Every application instance
+ *       uses the same URL for the same database. That is correct because the TC routes phase 2 by
+ *       resource id and may pick any client registered with it, and every client reaches the same
+ *       shim, which holds the transaction state.</li>
+ *   <li><b>In-process shim</b> (tests, single-JVM setups): the CoShim lives in this JVM, so its state is
+ *       local. The name must then be unique per instance (e.g. {@code "orders@" + hostname}),
+ *       otherwise the TC could route phase 2 to another instance that does not know the txn.</li>
+ * </ul>
  */
 public class CoShimDataSource<K, V> implements DataSource, XADataSource {
 
     public static final String URL_PREFIX = "jdbc:coshim://";
 
     private final String url;
-    private final CoShim<K, V> shim;
-    private final BranchStates branchStates = new BranchStates();
+    private final CoShim<TableKey<K>, V> shim;
     private volatile PrintWriter logWriter;
     private volatile int loginTimeout;
 
     /**
-     * @param name identity of this shim instance, unique across every RM registered with the TC
-     *     (see the class comment), e.g. "orders-kv@app-1"
+     * @param name the data source's identity for Seata (see the class comment): the node's
+     *     {@code "host:port/database"} for a remote shim, or a per-instance name for an in-process one
+     * @param shim the shim of that database
      */
-    public CoShimDataSource(String name, CoShim<K, V> shim) {
+    public CoShimDataSource(String name, CoShim<TableKey<K>, V> shim) {
         this.url = URL_PREFIX + Objects.requireNonNull(name);
         this.shim = Objects.requireNonNull(shim);
     }
@@ -55,12 +57,8 @@ public class CoShimDataSource<K, V> implements DataSource, XADataSource {
         return url;
     }
 
-    public CoShim<K, V> getShim() {
+    public CoShim<TableKey<K>, V> getShim() {
         return shim;
-    }
-
-    BranchStates getBranchStates() {
-        return branchStates;
     }
 
     @Override

@@ -7,7 +7,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import ch.epfl.coshim.core.NoCcShim;
 import ch.epfl.coshim.core.Vote;
+import ch.epfl.coshim.store.FlatKvStore;
 import ch.epfl.coshim.store.InMemoryKvStore;
+import ch.epfl.coshim.store.TableKey;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.sql.SQLTransactionRollbackException;
@@ -37,22 +39,28 @@ class CoShimXAResourceTest {
         }
     }
 
+    private static final String T = "orders";
+
     private final Xid xid = new TestXid("127.0.0.1:8091:42", "-7");
 
-    private InMemoryKvStore<String, String> store;
-    private NoCcShim<String, String> shim;
+    private InMemoryKvStore<TableKey<String>, String> store;
+    private NoCcShim<TableKey<String>, String> shim;
     private CoShimDataSource<String, String> dataSource;
 
     @BeforeEach
     void setUp() {
         store = new InMemoryKvStore<>();
         shim = new NoCcShim<>(store);
-        dataSource = new CoShimDataSource<>("orders-kv", shim);
+        dataSource = new CoShimDataSource<>("localhost:7000/shop", shim);
+    }
+
+    private String stored(String table, String key) {
+        return store.get(new TableKey<>(table, key));
     }
 
     @Test
     void urlIsTheResourceIdentity() throws SQLException {
-        assertEquals("jdbc:coshim://orders-kv", dataSource.getConnection().getMetaData().getURL());
+        assertEquals("jdbc:coshim://localhost:7000/shop", dataSource.getConnection().getMetaData().getURL());
     }
 
     @Test
@@ -62,42 +70,52 @@ class CoShimXAResourceTest {
         KvSession<String, String> session = KvSession.from(xa.getConnection());
 
         res.start(xid, XAResource.TMNOFLAGS);
-        session.put("x", "1");
-        assertEquals("1", session.get("x"));
+        session.put(T, "x", "1");
+        assertEquals("1", session.get(T, "x"));
         res.end(xid, XAResource.TMSUCCESS);
         assertEquals(XAResource.XA_OK, res.prepare(xid));
-        assertNull(store.get("x"));
+        assertNull(stored(T, "x"));
 
         // phase 2 arrives on a fresh connection, as with Seata's ResourceManagerXA
         dataSource.getXAConnection().getXAResource().commit(xid, false);
-        assertEquals("1", store.get("x"));
-        assertEquals(0, dataSource.getBranchStates().size());
+        assertEquals("1", stored(T, "x"));
+        assertEquals(0, shim.size());
+    }
+
+    @Test
+    void tablesOfTheDatabaseAreSeparateKeySpaces() throws Exception {
+        CoShimConnection<String, String> c = dataSource.getConnection();
+        c.put("orders", "1", "an order");
+        c.put("stock", "1", "a stock level");
+        assertEquals("an order", c.get("orders", "1"));
+        assertEquals("a stock level", c.get("stock", "1"));
+    }
+
+    @Test
+    void tablesAreOptionalPlainKeysWorkOnAStoreWithoutTables() throws Exception {
+        InMemoryKvStore<String, String> plainStore = new InMemoryKvStore<>();   // a store with no table notion
+        CoShimDataSource<String, String> flat =
+                new CoShimDataSource<>("localhost:7000/flat", new NoCcShim<>(new FlatKvStore<>(plainStore)));
+        CoShimConnection<String, String> c = flat.getConnection();
+        c.put("x", "1");
+        assertEquals("1", c.get("x"));
+        assertEquals("1", plainStore.get("x"), "stored under the plain key");
     }
 
     @Test
     void phaseTwoRollbackDiscardsWrites() throws Exception {
-        XAResource res = dataSource.getXAConnection().getXAResource();
+        CoShimXAConnection xa = dataSource.getXAConnection();
+        XAResource res = xa.getXAResource();
         res.start(xid, XAResource.TMNOFLAGS);
+        KvSession.<String, String>from(xa.getConnection()).put(T, "x", "1");
         res.end(xid, XAResource.TMSUCCESS);
         res.prepare(xid);
 
         XAResource fresh = dataSource.getXAConnection().getXAResource();
         fresh.end(xid, XAResource.TMFAIL);   // what ConnectionProxyXA.xaRollback does first
         fresh.rollback(xid);
-        assertEquals(Vote.NO, shim.prepare(CoShimXAResource.txnId(xid)), "txn is gone from the shim");
-        assertEquals(0, dataSource.getBranchStates().size());
-    }
-
-    @Test
-    void localPhaseOneRollbackLeavesNoState() throws Exception {
-        CoShimXAConnection xa = dataSource.getXAConnection();
-        XAResource res = xa.getXAResource();
-        res.start(xid, XAResource.TMNOFLAGS);
-        KvSession.<String, String>from(xa.getConnection()).put("x", "1");
-        res.end(xid, XAResource.TMFAIL);
-        res.rollback(xid);
-        assertEquals(0, dataSource.getBranchStates().size());
-        assertNull(store.get("x"));
+        assertNull(stored(T, "x"));
+        assertEquals(0, shim.size(), "aborting a known txn leaves no tombstone");
     }
 
     @Test
@@ -114,36 +132,47 @@ class CoShimXAResourceTest {
         res.end(xid, XAResource.TMSUCCESS);
         XAException e = assertThrows(XAException.class, () -> res.prepare(xid));
         assertEquals(XAException.XA_RBROLLBACK, e.errorCode);
-        assertEquals(0, ds.getBranchStates().size());
     }
 
     @Test
     void coordinatorRollbackBeforeStartRefusesTheStart() throws Exception {
         dataSource.getXAConnection().getXAResource().rollback(xid);   // TC timeout raced ahead of xa start
+        assertEquals(1, shim.size(), "the shim keeps a tombstone");
 
         CoShimXAConnection xa = dataSource.getXAConnection();
         ((CoShimConnection<?, ?>) xa.getConnection()).requireXaBranch();   // as DataSourceProxyCoShim does in a global txn
         XAException e = assertThrows(XAException.class, () -> xa.getXAResource().start(xid, XAResource.TMNOFLAGS));
         assertEquals(XAException.XA_RBROLLBACK, e.errorCode);
-        assertThrows(SQLException.class, () -> KvSession.<String, String>from(xa.getConnection()).put("x", "1"));
-        assertEquals(0, dataSource.getBranchStates().size(), "the tombstone is consumed");
+        assertThrows(SQLException.class, () -> KvSession.<String, String>from(xa.getConnection()).put(T, "x", "1"));
     }
 
     @Test
-    void coordinatorRollbackDuringPhaseOneAbortsAndFailsTheBranch() throws Exception {
+    void coordinatorRollbackDuringPhaseOneFailsEveryLaterStep() throws Exception {
         CoShimXAConnection xa = dataSource.getXAConnection();
         XAResource res = xa.getXAResource();
         KvSession<String, String> session = KvSession.from(xa.getConnection());
         res.start(xid, XAResource.TMNOFLAGS);
-        session.put("x", "1");
+        session.put(T, "x", "1");
 
         dataSource.getXAConnection().getXAResource().rollback(xid);   // TC rollback on another connection
 
-        assertThrows(SQLTransactionRollbackException.class, () -> session.put("y", "2"));
+        assertThrows(SQLTransactionRollbackException.class, () -> session.put(T, "y", "2"));
         XAException e = assertThrows(XAException.class, () -> res.end(xid, XAResource.TMSUCCESS));
         assertEquals(XAException.XA_RBROLLBACK, e.errorCode);
-        assertEquals(0, dataSource.getBranchStates().size());
-        assertNull(store.get("x"));
+        assertThrows(XAException.class, () -> res.prepare(xid));
+        assertNull(stored(T, "x"));
+    }
+
+    @Test
+    void coordinatorRollbackLandingAfterTheYesVoteStillAbortsTheTxn() throws Exception {
+        XAResource res = dataSource.getXAConnection().getXAResource();
+        res.start(xid, XAResource.TMNOFLAGS);
+        res.end(xid, XAResource.TMSUCCESS);
+        assertEquals(XAResource.XA_OK, res.prepare(xid));
+
+        dataSource.getXAConnection().getXAResource().rollback(xid);
+        dataSource.getXAConnection().getXAResource().commit(xid, false);   // a late/duplicate commit is a no-op
+        assertEquals(0, shim.size());
     }
 
     @Test
@@ -155,9 +184,9 @@ class CoShimXAResourceTest {
         b.getXAResource().start(xid2, XAResource.TMNOFLAGS);
 
         // interleaved requests of two open transactions, each routed by its own connection
-        KvSession.<String, String>from(a.getConnection()).put("x", "a");
-        KvSession.<String, String>from(b.getConnection()).put("y", "b");
-        assertNull(KvSession.<String, String>from(a.getConnection()).get("y"), "b's write is not visible to a");
+        KvSession.<String, String>from(a.getConnection()).put(T, "x", "a");
+        KvSession.<String, String>from(b.getConnection()).put(T, "y", "b");
+        assertNull(KvSession.<String, String>from(a.getConnection()).get(T, "y"), "b's write is not visible to a");
 
         for (CoShimXAConnection c : List.of(a, b)) {
             Xid x = c == a ? xid : xid2;
@@ -165,72 +194,42 @@ class CoShimXAResourceTest {
             c.getXAResource().prepare(x);
             c.getXAResource().commit(x, false);
         }
-        assertEquals("a", store.get("x"));
-        assertEquals("b", store.get("y"));
-    }
-
-    @Test
-    void localRollbackOnTheStartingResourceLeavesNoState() throws Exception {
-        // ConnectionProxyXA's branch-execution timeout in close(): xa end(TMSUCCESS), then xa rollback on
-        // the same connection, without end(TMFAIL). It is local, not a coordinator rollback.
-        XAResource res = dataSource.getXAConnection().getXAResource();
-        res.start(xid, XAResource.TMNOFLAGS);
-        res.end(xid, XAResource.TMSUCCESS);
-        res.rollback(xid);
-        assertEquals(0, dataSource.getBranchStates().size(), "no tombstone for a local rollback");
-    }
-
-    @Test
-    void coordinatorRollbackLandingDuringPrepareFailsThePrepare() throws Exception {
-        CoShimDataSource<String, String>[] ds = new CoShimDataSource[1];
-        ds[0] = new CoShimDataSource<>("racy", new NoCcShim<>(store) {
-            @Override
-            public Vote prepare(String txnId) {
-                Vote vote = super.prepare(txnId);                       // shim votes YES ...
-                ((CoShimXAResource) ds[0].getXAConnection().getXAResource()).rollback(xid); // ... then the TC's rollback lands
-                return vote;
-            }
-        });
-        XAResource res = ds[0].getXAConnection().getXAResource();
-        res.start(xid, XAResource.TMNOFLAGS);
-        res.end(xid, XAResource.TMSUCCESS);
-        XAException e = assertThrows(XAException.class, () -> res.prepare(xid));
-        assertEquals(XAException.XA_RBROLLBACK, e.errorCode);
-        assertEquals(0, ds[0].getBranchStates().size(), "no stale entry");
+        assertEquals("a", stored(T, "x"));
+        assertEquals("b", stored(T, "y"));
     }
 
     @Test
     void localAutocommitRequestsAreTheirOwnTransactions() throws Exception {
         CoShimConnection<String, String> c = dataSource.getConnection();
-        c.put("x", "1");
-        assertEquals("1", store.get("x"), "committed right away");
-        assertEquals("1", c.get("x"));
+        c.put(T, "x", "1");
+        assertEquals("1", stored(T, "x"), "committed right away");
+        assertEquals("1", c.get(T, "x"));
     }
 
     @Test
     void localTransactionCommitsOnCommitAndDiscardsOnRollback() throws Exception {
         CoShimConnection<String, String> c = dataSource.getConnection();
         c.setAutoCommit(false);
-        c.put("x", "1");
-        assertEquals("1", c.get("x"));
-        assertNull(store.get("x"));
+        c.put(T, "x", "1");
+        assertEquals("1", c.get(T, "x"));
+        assertNull(stored(T, "x"));
         c.commit();
-        assertEquals("1", store.get("x"));
+        assertEquals("1", stored(T, "x"));
 
-        c.put("y", "2");
+        c.put(T, "y", "2");
         c.rollback();
-        assertNull(store.get("y"));
+        assertNull(stored(T, "y"));
 
-        c.put("z", "3");
+        c.put(T, "z", "3");
         c.setAutoCommit(true);   // JDBC: commits the transaction in progress
-        assertEquals("3", store.get("z"));
+        assertEquals("3", stored(T, "z"));
     }
 
     @Test
     void xaStartIsRefusedWhileALocalTransactionIsOpen() throws Exception {
         CoShimXAConnection xa = dataSource.getXAConnection();
         xa.getConnection().setAutoCommit(false);
-        KvSession.<String, String>from(xa.getConnection()).put("x", "1");
+        KvSession.<String, String>from(xa.getConnection()).put(T, "x", "1");
         XAException e = assertThrows(XAException.class, () -> xa.getXAResource().start(xid, XAResource.TMNOFLAGS));
         assertEquals(XAException.XAER_OUTSIDE, e.errorCode);
     }
@@ -239,8 +238,8 @@ class CoShimXAResourceTest {
     void connectionRequiringABranchRefusesLocalRequests() throws Exception {
         CoShimConnection<String, String> c = dataSource.getConnection();
         c.requireXaBranch();
-        assertThrows(SQLException.class, () -> c.put("x", "1"));
-        assertNull(store.get("x"));
+        assertThrows(SQLException.class, () -> c.put(T, "x", "1"));
+        assertNull(stored(T, "x"));
     }
 
     @Test

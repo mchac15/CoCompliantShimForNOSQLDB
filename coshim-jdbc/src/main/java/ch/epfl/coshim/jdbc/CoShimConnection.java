@@ -4,6 +4,7 @@ import ch.epfl.coshim.core.CoShim;
 import ch.epfl.coshim.core.Outcome;
 import ch.epfl.coshim.core.TxnAbortedException;
 import ch.epfl.coshim.core.Vote;
+import ch.epfl.coshim.store.TableKey;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
@@ -100,19 +101,21 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
     // ---- KvSession ----
 
     @Override
-    public V get(K key) throws SQLException {
-        return request(id -> shim().get(id, key));
+    public V get(String table, K key) throws SQLException {
+        TableKey<K> tableKey = new TableKey<>(table, key);
+        return request(id -> shim().get(id, tableKey));
     }
 
     @Override
-    public void put(K key, V value) throws SQLException {
+    public void put(String table, K key, V value) throws SQLException {
+        TableKey<K> tableKey = new TableKey<>(table, key);
         request(id -> {
-            shim().put(id, key, value);
+            shim().put(id, tableKey, value);
             return null;
         });
     }
 
-    private CoShim<K, V> shim() {
+    private CoShim<TableKey<K>, V> shim() {
         return dataSource.getShim();
     }
 

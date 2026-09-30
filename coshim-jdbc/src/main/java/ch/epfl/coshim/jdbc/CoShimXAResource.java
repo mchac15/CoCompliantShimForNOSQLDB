@@ -23,27 +23,21 @@ import javax.transaction.xa.Xid;
  * </pre>
  *
  * The shim txn id is derived from the Xid (Seata: global xid + branch id), so a phase-2 call on a
- * fresh connection finds the same txn. {@link BranchStates} covers a TC rollback racing phase 1.
+ * fresh connection, or from another application instance, finds the same txn on the shim.
+ *
+ * <p>This class keeps no transaction state of its own. In particular a rollback from the TC that
+ * arrives before xa start, or while phase 1 is still running, is handled by the shim: its abort
+ * either aborts the registered txn or leaves a tombstone that makes the later start fail (see
+ * {@link CoShim}). Every phase-1 step after that fails on the shim's answer.
  */
 public class CoShimXAResource implements XAResource {
 
     private final CoShimConnection<?, ?> connection;
     private final CoShim<?, ?> shim;
-    private final BranchStates states;
-
-    /**
-     * The branch this resource started. A rollback of it on this resource comes from Seata's own
-     * phase-1 code on the same connection (ConnectionProxyXA.rollback(), a failed xa start, or the
-     * branch-execution timeout in close()), so it is local. The TC's rollbacks (phase 2, or racing
-     * phase 1) always arrive on a fresh connection, because ResourceManagerXA only reuses ("holds")
-     * connections for MySQL < 8.0.29 / MariaDB, never for dbType coshim.
-     */
-    private volatile String startedHere;
 
     CoShimXAResource(CoShimConnection<?, ?> connection) {
         this.connection = connection;
         this.shim = connection.getDataSource().getShim();
-        this.states = connection.getDataSource().getBranchStates();
     }
 
     /** The shim txn id of an XA branch. */
@@ -61,21 +55,13 @@ public class CoShimXAResource implements XAResource {
             throw xaError(XAException.XAER_OUTSIDE, "connection has a local transaction in progress");
         }
         String txnId = txnId(xid);
-        if (!states.activate(txnId)) {
-            throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " was already rolled back by the coordinator");
-        }
         if (!shim.start(txnId)) {
-            throw xaError(XAException.XAER_DUPID, "branch " + txnId + " already started");
-        }
-        startedHere = txnId;
-        if (states.isRolledBack(txnId)) {
-            // the TC's rollback ran between activate and shim.start: its abort found nothing
-            abortObserved(txnId);
-            throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " rolled back by the coordinator");
+            // the coordinator already rolled the branch back (tombstone on the shim), or a duplicate start
+            throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " was rolled back before it started");
         }
         // This connection now sends its get/put requests for txnId, until end(). One connection
         // serves one branch at a time (as in JDBC/XA for any database); concurrent transactions use
-        // different connections (one per thread / global transaction), all sharing the same shim.
+        // different connections (one per thread / global transaction), all reaching the same shim.
         connection.bind(txnId);
     }
 
@@ -89,29 +75,16 @@ public class CoShimXAResource implements XAResource {
         if (flags != TMSUCCESS) {
             throw xaError(XAException.XAER_INVAL, "only TMSUCCESS/TMFAIL are supported (no suspend)");
         }
-        Outcome outcome = shim.end(txnId);
-        if (states.isRolledBack(txnId)) {
-            abortObserved(txnId);
-            throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " rolled back by the coordinator");
-        }
-        if (outcome == Outcome.FAILED) {
-            states.finished(txnId);   // the shim already aborted it
-            throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " was aborted by the shim");
+        if (shim.end(txnId) == Outcome.FAILED) {
+            throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " was aborted");
         }
     }
 
     @Override
     public int prepare(Xid xid) throws XAException {
         String txnId = txnId(xid);
-        Vote vote = shim.prepare(txnId);
-        if (vote == Vote.NO) {
-            states.finished(txnId);   // the shim already aborted it
+        if (shim.prepare(txnId) == Vote.NO) {
             throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " voted NO");
-        }
-        if (!states.votedYes(txnId)) {
-            // the TC rolled back while prepare ran (its entry is already removed)
-            shim.abort(txnId);
-            throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " rolled back by the coordinator");
         }
         // never XA_RDONLY: even a read-only branch holds its place in the lock chains until commit
         return XA_OK;
@@ -127,27 +100,16 @@ public class CoShimXAResource implements XAResource {
         if (onePhase) {
             prepare(xid);
         }
-        String txnId = txnId(xid);
-        shim.commit(txnId);
-        states.finished(txnId);
+        shim.commit(txnId(xid));
     }
 
     @Override
     public void rollback(Xid xid) {
-        String txnId = txnId(xid);
-        if (txnId.equals(startedHere)) {
-            startedHere = null;
-            states.finished(txnId);
-        } else {
-            states.rolledBackByCoordinator(txnId);
-        }
-        shim.abort(txnId);
+        shim.abort(txnId(xid));
     }
 
     @Override
-    public void forget(Xid xid) {
-        states.finished(txnId(xid));
-    }
+    public void forget(Xid xid) {}
 
     @Override
     public Xid[] recover(int flag) {
@@ -167,11 +129,6 @@ public class CoShimXAResource implements XAResource {
     @Override
     public boolean setTransactionTimeout(int seconds) {
         return false;
-    }
-
-    private void abortObserved(String txnId) {
-        shim.abort(txnId);
-        states.finished(txnId);
     }
 
     private static XAException xaError(int errorCode, String message) {
