@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import ch.epfl.coshim.store.InMemoryKvStore;
+import java.time.Duration;
 import org.junit.jupiter.api.Test;
 
 class NoCcShimTest {
@@ -56,6 +57,32 @@ class NoCcShimTest {
         shim.commit("t1");
         assertEquals("1", store.get("x"), "still committable: prepared is final");
         assertNull(store.get("y"));
+    }
+
+    @Test
+    void abortBeforeStartLeavesATombstoneThatRefusesTheStart() {
+        shim.abort("t1");   // the coordinator rolled the branch back before its start arrived
+        assertFalse(shim.start("t1"));
+        assertThrows(TxnAbortedException.class, () -> shim.put("t1", "x", "1"));
+        assertEquals(Outcome.FAILED, shim.end("t1"));
+        assertEquals(Vote.NO, shim.prepare("t1"));
+        shim.commit("t1");
+        assertNull(store.get("x"));
+    }
+
+    @Test
+    void abortOfAKnownTxnLeavesNoTombstone() {
+        shim.start("t1");
+        shim.abort("t1");
+        assertEquals(0, shim.size());
+    }
+
+    @Test
+    void tombstonesExpireAfterTheTtl() {
+        NoCcShim<String, String> expiring = new NoCcShim<>(store, Duration.ZERO);
+        expiring.abort("t1");
+        assertEquals(0, expiring.size(), "expired right away with a zero TTL");
+        assertTrue(expiring.start("t1"), "the documented caveat: a start after expiry is accepted");
     }
 
     @Test

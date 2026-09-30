@@ -10,10 +10,10 @@ global transactions that mix both kinds of shim.
 
 | Module | Depends on | Contents |
 | --- | --- | --- |
-| `store-api` | nothing | `KvStore<K, V>`: the whole database behind `get` / `store`, plus `InMemoryKvStore` |
+| `store-api` | nothing | `KvStore<K, V>`: the whole database behind `get` / `store`, plus `InMemoryKvStore`; `TableKey` (table, key): a shim manages several tables of its database |
 | `shim-core` | `store-api` | `CoShim`: the requests a shim receives from client connections (start / get / put / end / prepare / commit / abort). It never runs client code; `SpeculativeCoShim` is a **TODO stub** to be implemented from pseudo.txt; `NoCcShim` is a pass-through shim (no concurrency control) used as the benchmark baseline and in tests |
-| `shim-net` | `shim-core` | **Each shim is a separate node**: `CoShimServer` serves one `CoShim` over TCP to the participants only (shared-token handshake, optional client allowlist); `RemoteCoShim` is the client the RMs use; `CoShimNode` runs a node |
-| `coshim-jdbc` | `shim-core` | The shim as a JDBC "driver": `CoShimDataSource` (`DataSource` + `XADataSource`, URL `jdbc:coshim://<name>`), `CoShimXAResource`, `KvSession` (get/put instead of SQL). No Seata dependency |
+| `shim-net` | `shim-core` | **Shim nodes**: `CoShimServer` hosts one or more databases, one `CoShim` each, and serves them over TCP to the participants only (shared-token handshake, optional client allowlist); `RemoteCoShim` is the client the RMs use, bound to one database; `CoShimNode` runs a node |
+| `coshim-jdbc` | `shim-core` | The shim as a JDBC "driver": `CoShimDataSource` (`DataSource` + `XADataSource`, URL `jdbc:coshim://host:port/database`), `CoShimXAResource`, `KvSession` (`get(table, key)` / `put(table, key, value)` instead of SQL). No Seata dependency |
 | `seata-xa` | `coshim-jdbc`, patched Seata | `DataSourceProxyCoShim`: the counterpart of `new DataSourceProxyXA(mysqlPool)` |
 
 ## How MySQL/PG are integrated in the Sonata fork (and what we copy)
@@ -56,37 +56,51 @@ So Seata runs the stock XA code, the same TC path (`XACore`), and no Seata globa
 Sonata and shim branches. Heavy vs light is purely what runs behind the `XAResource`, and one
 global transaction can contain both.
 
+### One shim per data source
+
+A **data source is a node plus a database name**, and each has exactly one shim (its own lock
+chains and transactions). A shim manages all the **tables** of its database: a protocol key is a
+`(table, key)` pair. A node can host a single database (standalone, or colocated with its store)
+or several; that is a deployment choice, like one MySQL server hosting several logical databases.
+MySQL/PG never go through these nodes: they remain their own servers, reached through their JDBC
+drivers with Sonata's hook in the RM.
+
 ```
-  application JVM (Seata TM + RM)                          shim node (one per store)
-  DataSourceProxyCoShim ─ ConnectionProxyXA ─ CoShimXAResource
-                                     └─ RemoteCoShim ── TCP, token ──▶ CoShimServer ─ SpeculativeCoShim ─ KvStore
+  application JVM (Seata TM + RM)                           shim node  host:7000
+  DataSourceProxyCoShim("host:7000/shop") ─ ConnectionProxyXA ─ CoShimXAResource
+                   └─ RemoteCoShim(database "shop") ── TCP, token ──▶ CoShimServer ─┬─ shim "shop" ─ KvStore (tables orders, stock, …)
+                                                                                    └─ shim "billing" ─ KvStore
   Seata TC ◀──── branch register / phase 2 ────▶ RM (never talks to the node itself)
 ```
 
 ```sh
-COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode 7000 nocc [allowed RM hosts...]
+COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode 7000 nocc shop,billing [allowed RM hosts...]
 ```
 
 ```java
-RemoteCoShim<String, String> shim = new RemoteCoShim<>(
-        new InetSocketAddress("localhost", 7000), System.getenv("COSHIM_TOKEN"), Codec.UTF8, Codec.UTF8).verify();
-DataSource orders = new DataSourceProxyCoShim(
-        new CoShimDataSource<>("localhost:7000/orders-kv", shim));   // like new DataSourceProxyXA(mysqlPool)
+RemoteCoShim<TableKey<String>, String> shim = new RemoteCoShim<>(
+        new InetSocketAddress("localhost", 7000), "shop", System.getenv("COSHIM_TOKEN"),
+        new TableKeyCodec<>(Codec.UTF8), Codec.UTF8).verify();
+DataSource shop = new DataSourceProxyCoShim(
+        new CoShimDataSource<>("localhost:7000/shop", shim));   // like new DataSourceProxyXA(mysqlPool)
 
 // inside a global transaction (@GlobalTransactional, or GlobalTransactionContext + begin/commit):
-try (Connection c = orders.getConnection()) {
+try (Connection c = shop.getConnection()) {
     c.setAutoCommit(false);                                 // branchRegister + xa start
-    KvSession<String, String> session = KvSession.from(c);
-    session.put("order:1", session.get("stock:7"));
+    KvSession<String, String> kv = KvSession.from(c);
+    kv.put("orders", "order:1", kv.get("stock", "item:7"));  // two tables, one branch
     c.commit();
 }                                                           // xa end + xa prepare (shim vote)
 // phase 2 (xa commit / xa rollback) is driven by the TC, as for MySQL/PG
 ```
 
-`CoShimXAResource` also guards one race that pseudo.txt's coordinator assumption rules out but
-Seata does not: a TC rollback arriving before `xa start`, or while phase 1 runs. See
-`BranchStates`; it keeps short-lived tombstones at the XA layer, not in the shim protocol. It is a
-first mitigation (TODO).
+**Tombstones.** pseudo.txt originally assumed the coordinator sends nothing for a txn before its
+start. Seata does not guarantee that: a TC rollback (e.g. a global timeout) can arrive before
+`xa start`. The shim handles it itself. An `abort` for an id it does not know leaves a tombstone,
+and `start` refuses a tombstoned id, atomically with the registration. Tombstones expire after a
+TTL (at least the global transaction timeout). Because this lives on the shim, it also works
+when the TC routes the rollback through a different application instance. `CoShimXAResource`
+keeps no transaction state of its own.
 
 Outside a global transaction a connection runs **local transactions** with standard JDBC
 semantics (autocommit per request, or `commit()` / `rollback()`), like a MySQL/PG connection.
@@ -97,17 +111,17 @@ automatically.
 
 ### Deployment notes
 
-- **Each shim is a separate node** (`shim-net`). It accepts many concurrent connections, one
-  thread each, but only from the participants: a connection must present the node's shared
-  token, and can be restricted to an allowlist of RM hosts. The Seata TC never connects to it;
-  as for MySQL/PG, the TC talks to the RMs and they talk to the node.
-- **Resource id = the node's address** (`jdbc:coshim://host:port/store`), the same for every
-  application instance, like a MySQL URL. The TC routes phase 2 by resource id and may pick any
-  RM registered with it. That's fine, because every RM reaches the same node, which holds the
+- **Shim nodes** (`shim-net`). A node accepts many concurrent connections, one thread each, but
+  only from the participants: a connection must present the node's shared token and name a
+  database the node hosts, and can be restricted to an allowlist of RM hosts. The Seata TC never
+  connects to it; as for MySQL/PG, the TC talks to the RMs and they talk to the node.
+- **Resource id = node address + database** (`jdbc:coshim://host:port/database`), the same for
+  every application instance, like a MySQL URL. The TC routes phase 2 by resource id and may pick
+  any RM registered with it. That's fine, because every RM reaches the same shim, which holds the
   transaction state. Only an in-process shim (tests) needs a per-instance name.
-- **Early-rollback guard is still per RM** (`BranchStates`). With several application instances,
-  a TC rollback racing phase 1 may reach another instance. Moving the guard onto the node is the
-  TODO on `BranchStates`.
+- **Tombstone TTL is not definitive.** If a start arrives after its tombstone expired (a phase 1
+  stalled longer than the TTL), the branch is accepted although the global transaction was
+  rolled back.
 - **The wire is not encrypted yet.** The token authenticates, but for untrusted networks, run the
   node behind TLS (or add it to `CoShimServer`).
 - **Spring (`seata.data-source-proxy-mode=XA`).** The auto-proxy wraps every plain `DataSource`

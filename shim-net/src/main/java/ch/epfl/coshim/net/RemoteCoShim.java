@@ -32,14 +32,21 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
 
     private final InetSocketAddress node;
+    private final String database;
     private final String token;
     private final Codec<K> keyCodec;
     private final Codec<V> valueCodec;
     private final ConcurrentLinkedQueue<Connection> idle = new ConcurrentLinkedQueue<>();
     private volatile boolean closed;
 
-    public RemoteCoShim(InetSocketAddress node, String token, Codec<K> keyCodec, Codec<V> valueCodec) {
+    /**
+     * @param node the shim node
+     * @param database the database on that node; every request of this client goes to its shim
+     */
+    public RemoteCoShim(
+            InetSocketAddress node, String database, String token, Codec<K> keyCodec, Codec<V> valueCodec) {
         this.node = Objects.requireNonNull(node);
+        this.database = Objects.requireNonNull(database);
         this.token = Objects.requireNonNull(token);
         this.keyCodec = Objects.requireNonNull(keyCodec);
         this.valueCodec = Objects.requireNonNull(valueCodec);
@@ -141,10 +148,12 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
             c.out.writeInt(Protocol.MAGIC);
             c.out.writeInt(Protocol.VERSION);
             c.out.writeUTF(token);
+            c.out.writeUTF(database);
             c.out.flush();
             if (c.in.readByte() != Protocol.HELLO_OK) {
                 c.closeQuietly();
-                throw new SecurityException("shim node " + node + " rejected the connection (token / allowlist)");
+                throw new SecurityException("shim node " + node + " rejected the connection to database '" + database
+                        + "' (wrong token, unknown database, or client not allowed)");
             }
             return c;
         } catch (IOException e) {

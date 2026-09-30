@@ -8,7 +8,9 @@ import java.util.Objects;
  * The speculative CO-compliant shim of pseudo.txt (S2PL + speculation at {@code executed}).
  *
  * <p>TODO: not implemented yet. This template only wires it into Seata; translate pseudo.txt here
- * (LockNode, chain, locks_map, transactions_map, lock/upgrade/abort_transaction/mark_must_abort).
+ * (LockNode, chain, locks_map, transactions_map, lock/upgrade/abort_transaction/mark_must_abort),
+ * including the tombstones for an abort that arrives before start (see {@link CoShim} and
+ * {@link NoCcShim} for a reference of that part).
  */
 public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
 

@@ -13,6 +13,7 @@ import ch.epfl.coshim.core.Vote;
 import ch.epfl.coshim.store.InMemoryKvStore;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -29,13 +30,23 @@ class CoShimServerTest {
     private RemoteCoShim<String, String> client;
 
     private void startNode(NoCcShim<String, String> shim, Set<InetAddress> allowed) throws Exception {
-        server = new CoShimServer<>(shim, Codec.UTF8, Codec.UTF8,
+        startNode(Map.of("shop", shim), allowed);
+    }
+
+    private void startNode(Map<String, NoCcShim<String, String>> databases, Set<InetAddress> allowed)
+            throws Exception {
+        server = new CoShimServer<>(databases, Codec.UTF8, Codec.UTF8,
                 new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), TOKEN, allowed);
     }
 
     private RemoteCoShim<String, String> connect(String token) {
+        return connect("shop", token);
+    }
+
+    private RemoteCoShim<String, String> connect(String database, String token) {
         return new RemoteCoShim<>(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), server.getPort()), token, Codec.UTF8, Codec.UTF8);
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), server.getPort()),
+                database, token, Codec.UTF8, Codec.UTF8);
     }
 
     @AfterEach
@@ -71,6 +82,43 @@ class CoShimServerTest {
         client = connect(TOKEN);
         assertThrows(TxnAbortedException.class, () -> client.get("unknown", "x"));
         assertEquals(Vote.NO, client.prepare("unknown"), "the connection is still usable afterwards");
+    }
+
+    @Test
+    void abortBeforeStartIsRememberedByTheNode() throws Exception {
+        startNode(new NoCcShim<>(store), Set.of());
+        client = connect(TOKEN);
+        client.abort("t1");   // the TC's rollback, possibly relayed by another RM instance
+        assertFalse(client.start("t1"));
+        assertEquals(Vote.NO, client.prepare("t1"));
+    }
+
+    @Test
+    void databasesOnOneNodeHaveSeparateShimsAndStores() throws Exception {
+        InMemoryKvStore<String, String> ordersStore = new InMemoryKvStore<>();
+        InMemoryKvStore<String, String> stockStore = new InMemoryKvStore<>();
+        startNode(Map.of("orders", new NoCcShim<>(ordersStore), "stock", new NoCcShim<>(stockStore)), Set.of());
+        client = connect("orders", TOKEN);
+        try (RemoteCoShim<String, String> stock = connect("stock", TOKEN)) {
+            // the same txn id and key on two databases are unrelated
+            assertTrue(client.start("t1"));
+            assertTrue(stock.start("t1"));
+            client.put("t1", "k", "order");
+            stock.put("t1", "k", "level");
+            for (RemoteCoShim<String, String> db : java.util.List.of(client, stock)) {
+                db.end("t1");
+                db.prepare("t1");
+                db.commit("t1");
+            }
+        }
+        assertEquals("order", ordersStore.get("k"));
+        assertEquals("level", stockStore.get("k"));
+    }
+
+    @Test
+    void unknownDatabaseIsRejected() throws Exception {
+        startNode(new NoCcShim<>(store), Set.of());
+        assertThrows(SecurityException.class, () -> connect("nope", TOKEN).verify());
     }
 
     @Test

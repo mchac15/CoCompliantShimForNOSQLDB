@@ -14,6 +14,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -22,8 +23,12 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * A shim node: one {@link CoShim} (in front of one store) served over TCP to the transaction
- * participants, i.e. the Seata RMs running the coshim JDBC driver ({@link RemoteCoShim}).
+ * A shim node, served over TCP to the transaction participants, i.e. the Seata RMs running the coshim
+ * JDBC driver ({@link RemoteCoShim}). A node hosts one or more databases, and there is exactly one
+ * {@link CoShim} per database: a data source is (this node, a database name). A connection selects
+ * its database in the handshake and is bound to that database's shim for its lifetime, so databases
+ * are fully separate (their own lock chains and transactions). How many databases a node hosts is a
+ * deployment choice: one node per database, or several databases on one server.
  *
  * <p>Access: the node accepts many concurrent connections, but only from participants. Every
  * connection must authenticate with the node's shared token, compared in constant time, before
@@ -40,7 +45,7 @@ public class CoShimServer<K, V> implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(CoShimServer.class.getName());
 
-    private final CoShim<K, V> shim;
+    private final Map<String, CoShim<K, V>> databases;
     private final Codec<K> keyCodec;
     private final Codec<V> valueCodec;
     private final byte[] token;
@@ -54,19 +59,20 @@ public class CoShimServer<K, V> implements AutoCloseable {
     private volatile boolean closed;
 
     /**
+     * @param databases database name -> the shim of that database
      * @param bind address to listen on; port 0 picks a free port (see {@link #getPort()})
      * @param token shared secret the participants must present; must not be empty
      * @param allowedClients client addresses allowed to connect, or empty for any authenticated client
      */
     public CoShimServer(
-            CoShim<K, V> shim,
+            Map<String, ? extends CoShim<K, V>> databases,
             Codec<K> keyCodec,
             Codec<V> valueCodec,
             InetSocketAddress bind,
             String token,
             Set<InetAddress> allowedClients)
             throws IOException {
-        this.shim = Objects.requireNonNull(shim);
+        this.databases = Map.copyOf(databases);
         this.keyCodec = Objects.requireNonNull(keyCodec);
         this.valueCodec = Objects.requireNonNull(valueCodec);
         if (token == null || token.isEmpty()) {
@@ -103,7 +109,8 @@ public class CoShimServer<K, V> implements AutoCloseable {
             socket.setTcpNoDelay(true);
             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-            if (!authenticate(socket, in)) {
+            CoShim<K, V> shim = authenticate(socket, in);
+            if (shim == null) {
                 out.writeByte(Protocol.HELLO_DENIED);
                 out.flush();
                 LOG.warning("rejected connection from " + socket.getRemoteSocketAddress());
@@ -118,7 +125,7 @@ public class CoShimServer<K, V> implements AutoCloseable {
                 } catch (EOFException clientClosed) {
                     return;
                 }
-                handle(op, in, out);
+                handle(shim, op, in, out);
                 out.flush();
             }
         } catch (IOException e) {
@@ -128,18 +135,23 @@ public class CoShimServer<K, V> implements AutoCloseable {
         }
     }
 
-    private boolean authenticate(Socket socket, DataInputStream in) throws IOException {
+    /** @return the shim of the database the client asked for, or null if the client is rejected */
+    private CoShim<K, V> authenticate(Socket socket, DataInputStream in) throws IOException {
         if (!allowedClients.isEmpty() && !allowedClients.contains(socket.getInetAddress())) {
-            return false;
+            return null;
         }
         if (in.readInt() != Protocol.MAGIC || in.readInt() != Protocol.VERSION) {
-            return false;
+            return null;
         }
         byte[] presented = in.readUTF().getBytes(StandardCharsets.UTF_8);
-        return MessageDigest.isEqual(presented, token);
+        String database = in.readUTF();
+        if (!MessageDigest.isEqual(presented, token)) {
+            return null;
+        }
+        return databases.get(database);   // unknown database: rejected too
     }
 
-    private void handle(byte op, DataInputStream in, DataOutputStream out) throws IOException {
+    private void handle(CoShim<K, V> shim, byte op, DataInputStream in, DataOutputStream out) throws IOException {
         String txnId = in.readUTF();
         K key = null;
         V value = null;
