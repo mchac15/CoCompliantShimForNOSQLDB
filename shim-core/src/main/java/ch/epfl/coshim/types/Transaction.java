@@ -1,19 +1,27 @@
 package ch.epfl.coshim.types;
 
 import java.sql.Timestamp;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
+/**
+ * A txn of pseudo.txt. Its monitor ({@code synchronized (txn)}) guards {@code status} and {@code
+ * locks_acquired}, so that the status re-check in lock()/upgrade() and the update of
+ * locks_acquired are atomic with respect to abort_transaction(): it moves the status to aborted
+ * under this monitor and only then reads {@link #locksSnapshot()}. Lock order: a chain latch first,
+ * then the txn monitor, never the reverse.
+ */
 public class Transaction<K, V> {
   private final String transactionId;
-  private final Map<K, LockType<K>> locksAcquired;
+  private final Map<K, LockType<K, V>> locksAcquired;
   private final Map<K, V> writeSet;
   private final Map<K, V> readSet;
   private final Timestamp expirationTime;
-  private final Object statusLock = new Object();
   private Status status;
 
-  Transaction(String transactionId, Status status, Timestamp expirationTime) {
+  public Transaction(String transactionId, Status status, Timestamp expirationTime) {
     this.transactionId = transactionId;
     this.locksAcquired = new HashMap<>();
     this.status = status;
@@ -26,14 +34,26 @@ public class Transaction<K, V> {
     return transactionId;
   }
 
-  public Map<K, LockType<K>> getLocksAcquired() {
-    return locksAcquired;
+  public synchronized LockType<K, V> getLock(K key) {
+    return locksAcquired.get(key);
   }
 
-  public Status getStatus() {
-    synchronized (statusLock) {
-      return status;
-    }
+  synchronized void putLock(K key, LockType<K, V> lockType) {
+    locksAcquired.put(key, lockType);
+  }
+
+  /** Copy of locks_acquired, for commit/abort to release the locks one key latch at a time. */
+  public synchronized Map<K, LockType<K, V>> locksSnapshot() {
+    return new HashMap<>(locksAcquired);
+  }
+
+  public synchronized Status getStatus() {
+    return status;
+  }
+
+  /** aborted or must_abort. */
+  public synchronized boolean isDoomed() {
+    return status == Status.ABORTED || status == Status.MUST_ABORT;
   }
 
   public Map<K, V> getWriteSet() {
@@ -48,10 +68,6 @@ public class Transaction<K, V> {
     return expirationTime;
   }
 
-  public void addLock(K key, LockType<K> lockType) {
-    locksAcquired.put(key, lockType);
-  }
-
   public void addToWriteSet(K key, V value) {
     writeSet.put(key, value);
   }
@@ -60,22 +76,23 @@ public class Transaction<K, V> {
     readSet.put(key, value);
   }
 
-  public Status compareAndSwapStatus(Status status) {
-    Status oldStatus;
-    synchronized (statusLock) {
-      oldStatus = this.status;
-      this.status = status;
+  /**
+   * CAS_returning of pseudo.txt: moves to {@code to} only if the current status is in {@code from}.
+   * Returns the status before the call; the CAS succeeded iff {@code from} contains it.
+   */
+  public synchronized Status compareAndSwapStatus(Set<Status> from, Status to) {
+    Status before = status;
+    if (from.contains(before)) {
+      status = to;
     }
-    return oldStatus;
+    return before;
   }
 
-  private void setStatus(Status status) {
-    synchronized (statusLock) {
-      this.status = status;
-    }
+  public boolean compareAndSwapStatus(Status from, Status to) {
+    return compareAndSwapStatus(EnumSet.of(from), to) == from;
   }
 
-  static enum Status {
+  public static enum Status {
     STARTED,
     EXECUTED,
     PREPARED,
