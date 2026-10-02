@@ -5,33 +5,29 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * One generation of holders on a key. Every field is guarded by the latch of {@link #getChain()}:
- * read and write it only inside {@code synchronized (node.getChain())}.
+ * One generation of holders on a key. A passive record: only the key's {@link Chain} reads or
+ * modifies it, under its latch.
  */
 public class LockNode<K, V> {
-  private final Chain<K, V> chain;
+  private final K key;
   private LockType.LockMode mode;
   private LockNode<K, V> next;
   private LockNode<K, V> prev;
   private final Set<Transaction<K, V>> holders = new HashSet<>();
   private boolean upgraded;
 
-  LockNode(Chain<K, V> chain, LockType.LockMode mode, Transaction<K, V> holder) {
-    this.chain = chain;
+  LockNode(K key, LockType.LockMode mode, Transaction<K, V> holder) {
+    this.key = key;
     this.mode = mode;
     this.holders.add(holder);
     this.upgraded = false;
   }
 
-  public Chain<K, V> getChain() {
-    return chain;
+  K getKey() {
+    return key;
   }
 
-  public K getKey() {
-    return chain.getKey();
-  }
-
-  public LockNode<K, V> getNext() {
+  LockNode<K, V> getNext() {
     return next;
   }
 
@@ -39,7 +35,7 @@ public class LockNode<K, V> {
     this.next = next;
   }
 
-  public LockNode<K, V> getPrev() {
+  LockNode<K, V> getPrev() {
     return prev;
   }
 
@@ -47,7 +43,7 @@ public class LockNode<K, V> {
     this.prev = prev;
   }
 
-  public LockType.LockMode getMode() {
+  LockType.LockMode getMode() {
     return mode;
   }
 
@@ -55,8 +51,7 @@ public class LockNode<K, V> {
     this.mode = mode;
   }
 
-  /** Read-only view; iterate it under the chain latch only. */
-  public Set<Transaction<K, V>> getHolders() {
+  Set<Transaction<K, V>> getHolders() {
     return Collections.unmodifiableSet(holders);
   }
 
@@ -68,7 +63,17 @@ public class LockNode<K, V> {
     holders.remove(transaction);
   }
 
-  public boolean isUpgraded() {
+  /** ∀ t in holders, t.status ∈ statuses. */
+  boolean allHoldersIn(Set<Transaction.Status> statuses) {
+    for (Transaction<K, V> t : holders) {
+      if (!statuses.contains(t.getStatus())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  boolean isUpgraded() {
     return upgraded;
   }
 

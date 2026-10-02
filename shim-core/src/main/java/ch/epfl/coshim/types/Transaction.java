@@ -1,6 +1,7 @@
 package ch.epfl.coshim.types;
 
 import java.sql.Timestamp;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
@@ -8,10 +9,10 @@ import java.util.Set;
 
 /**
  * A txn of pseudo.txt. Its monitor ({@code synchronized (txn)}) guards {@code status} and {@code
- * locks_acquired}, so that the status re-check in lock()/upgrade() and the update of
- * locks_acquired are atomic with respect to abort_transaction(): it moves the status to aborted
- * under this monitor and only then reads {@link #locksSnapshot()}. Lock order: a chain latch first,
- * then the txn monitor, never the reverse.
+ * locks_acquired}. Only a running (started) txn acquires locks, and the {@link Chain} checks that
+ * under this monitor, so locks_acquired is frozen as soon as the status leaves started: commit and
+ * abort iterate it without copying. Lock order: a chain latch first, then the txn monitor, never
+ * the reverse.
  */
 public class Transaction<K, V> {
   private final String transactionId;
@@ -38,17 +39,31 @@ public class Transaction<K, V> {
     return locksAcquired.get(key);
   }
 
-  synchronized void putLock(K key, LockType<K, V> lockType) {
+  /** Callers hold this monitor and checked {@link #isRunning()} under it. */
+  void putLock(K key, LockType<K, V> lockType) {
+    assert Thread.holdsLock(this) && status == Status.STARTED;
     locksAcquired.put(key, lockType);
   }
 
-  /** Copy of locks_acquired, for commit/abort to release the locks one key latch at a time. */
-  public synchronized Map<K, LockType<K, V>> locksSnapshot() {
-    return new HashMap<>(locksAcquired);
+  /**
+   * locks_acquired, read-only and without copying: once the status left started nothing adds to it
+   * anymore. Reading the status under the monitor also makes every earlier putLock visible.
+   */
+  Map<K, LockType<K, V>> frozenLocks() {
+    synchronized (this) {
+      if (status == Status.STARTED) {
+        throw new IllegalStateException("txn " + transactionId + " is still running");
+      }
+    }
+    return Collections.unmodifiableMap(locksAcquired);
   }
 
   public synchronized Status getStatus() {
     return status;
+  }
+
+  public synchronized boolean isRunning() {
+    return status == Status.STARTED;
   }
 
   /** aborted or must_abort. */
@@ -78,7 +93,8 @@ public class Transaction<K, V> {
 
   /**
    * CAS_returning of pseudo.txt: moves to {@code to} only if the current status is in {@code from}.
-   * Returns the status before the call; the CAS succeeded iff {@code from} contains it.
+   * Returns the status before the call; the CAS succeeded iff {@code from} contains it. After a
+   * successful CAS, call {@link LocksMap#statusChanged} so that waiters re-check.
    */
   public synchronized Status compareAndSwapStatus(Set<Status> from, Status to) {
     Status before = status;
