@@ -306,6 +306,40 @@ class LocksMapTest {
     assertFalse(f.get(2, TimeUnit.SECONDS));
   }
 
+  // ---- get()'s speculative read ----
+
+  @Test
+  void readReturnsTheNearestWriterAheadOrNullForTheStore() {
+    // X(w1) <- X(w2) <- S(r): r reads w2's buffer, not w1's
+    Transaction<String, String> w1 = txn("w1");
+    Transaction<String, String> w2 = txn("w2");
+    Transaction<String, String> r = txn("r");
+    Transaction<String, String> first = txn("first");
+    enqueue(w1, LockMode.EXCLUSIVE);
+    w1.addToWriteSet("x", "v1");
+    enqueue(w2, LockMode.EXCLUSIVE);
+    w2.addToWriteSet("x", "v2");
+    enqueue(r, LockMode.SHARED);
+
+    assertEquals(LocksMap.ReadResult.of("v2"), locks.read("x", r));
+
+    assertNotNull(locks.enqueue("y", first, LockMode.SHARED));
+    assertEquals(LocksMap.ReadResult.of(null), locks.read("y", first), "no writer ahead: store");
+  }
+
+  @Test
+  void readReturnsTheCachedValueThenDoomedAfterAForeignAbort() {
+    Transaction<String, String> r = txn("r");
+    enqueue(r, LockMode.SHARED);
+    r.addToReadSet("x", "cached");
+    assertEquals(LocksMap.ReadResult.of("cached"), locks.read("x", r));
+
+    set(r, Status.ABORTED);
+    locks.abortAndRelease(r);
+
+    assertTrue(locks.read("x", r).isDoomed());
+  }
+
   @Test
   void casDoesNotOverwriteAStatusOutsideTheExpectedSet() {
     Transaction<String, String> t = new Transaction<>("t", Status.PREPARED, null);

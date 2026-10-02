@@ -12,20 +12,15 @@ import java.util.concurrent.TimeUnit;
  * in the required commit order. The chain owns its {@link LockNode}s: every change to them goes
  * through the methods below.
  *
- * <p>The chain object is the key's latch: each non-private method is {@code synchronized} and is one
- * whole critical section of pseudo.txt, so callers never take the latch themselves. Waiters {@code
- * wait()} on it, and every change that can satisfy a wait predicate ends with {@code notifyAll()}.
+ * <p>Latching: {@link LocksMap} calls the methods that modify the chain ({@link #acquire}, {@link
+ * #upgrade}, {@link #release}, {@link #abortAndRelease}) only inside {@code locksMap.compute(key,
+ * ...)}, so they run under the key's map entry, and each of them is also {@code synchronized} on the
+ * chain. Readers ({@link #awaitPredecessor}, {@link #read}) only take the chain's monitor, which is
+ * enough to see a consistent chain, and waiters {@code wait()} on it: every change that can satisfy
+ * a wait predicate ends with {@code notifyAll()}. Lock order: map entry, then chain, then txn.
  */
 class Chain<K, V> {
   private static final Set<Status> MARKABLE = EnumSet.of(Status.STARTED, Status.EXECUTED);
-
-  static enum AcquireResult {
-    ACQUIRED,
-    /** txn is no longer started: it must not take new locks (doomed, or a put after end). */
-    NOT_RUNNING,
-    /** This chain was emptied and removed from locks_map: retry on the key's current chain. */
-    RETIRED
-  }
 
   static enum UpgradeResult {
     /** txn is no longer started, or read-modify-write against read-modify-write: txn aborts. */
@@ -48,7 +43,6 @@ class Chain<K, V> {
   private LockNode<K, V> head;
   /** The last node of the chain (pseudo.txt's chain.last_node()), kept to append in O(1). */
   private LockNode<K, V> lastNode;
-  private boolean retired;
 
   Chain(K key) {
     this.key = key;
@@ -74,14 +68,13 @@ class Chain<K, V> {
    * The critical section of lock(k, mode, txn): re-checks that txn is still running (a foreign
    * abort_transaction may have released its locks meanwhile, or end() ran), joins the last node if
    * both are SHARED or appends a new node, and records it in txn.locks_acquired.
+   *
+   * @return false if txn is no longer started (nothing was changed): it must abort
    */
-  synchronized AcquireResult acquire(Transaction<K, V> txn, LockMode mode) {
-    if (retired) {
-      return AcquireResult.RETIRED;
-    }
+  synchronized boolean acquire(Transaction<K, V> txn, LockMode mode) {
     synchronized (txn) {
       if (!txn.isRunning()) {
-        return AcquireResult.NOT_RUNNING;
+        return false;
       }
       LockNode<K, V> target;
       if (lastNode != null && mode == LockMode.SHARED && lastNode.getMode() == LockMode.SHARED) {
@@ -92,7 +85,7 @@ class Chain<K, V> {
         append(target);
       }
       txn.putLock(key, new LockType<>(mode, target));
-      return AcquireResult.ACQUIRED;
+      return true;
     }
   }
 
@@ -176,9 +169,32 @@ class Chain<K, V> {
   }
 
   /**
+   * get()'s critical section, for a txn that holds key: DOOMED if txn is aborted / must_abort (a
+   * foreign abort_transaction may have spliced its node out since lock() returned); else the value
+   * txn already read (read_buffer); else the write of the nearest EXCLUSIVE node at or before txn's
+   * own node; else a null value (no predecessor version: read the store, a committed writer applied
+   * its buffer before being spliced out). Reading that holder's buffer is safe: lock() only returned
+   * once it was executed, so its buffer is final.
+   */
+  synchronized LocksMap.ReadResult<V> read(Transaction<K, V> txn) {
+    if (txn.isDoomed()) {
+      return LocksMap.ReadResult.doomed();
+    }
+    if (txn.getReadSet().containsKey(key)) {
+      return LocksMap.ReadResult.of(txn.getReadSet().get(key));
+    }
+    LockNode<K, V> n = txn.getLock(key).node();
+    while (n != null && n.getMode() != LockMode.EXCLUSIVE) {
+      n = n.getPrev();
+    }
+    // an EXCLUSIVE node has exactly one holder
+    return LocksMap.ReadResult.of(n == null ? null : n.getHolders().iterator().next().getWriteSet().get(key));
+  }
+
+  /**
    * commit()'s release on this key: removes txn from node, splices node out if it is now empty.
    *
-   * @return true iff the chain is now empty and retired: the caller removes it from locks_map
+   * @return true iff the chain is now empty: the caller removes it from locks_map
    */
   synchronized boolean release(Transaction<K, V> txn, LockNode<K, V> node) {
     return releaseLocked(txn, node);
@@ -191,7 +207,7 @@ class Chain<K, V> {
    *
    * @param marked receives every txn this call moved to must_abort (to wake them up)
    * @param doomedFinished receives those of them that were executed (the caller aborts them)
-   * @return true iff the chain is now empty and retired, as in {@link #release}
+   * @return true iff the chain is now empty, as in {@link #release}
    */
   synchronized boolean abortAndRelease(
       Transaction<K, V> txn,
@@ -223,10 +239,7 @@ class Chain<K, V> {
       unlink(node);
     }
     notifyAll();
-    if (head == null) {
-      retired = true;
-    }
-    return retired;
+    return head == null;
   }
 
   /** "append n": links n behind the last node; n becomes the last node (and the head if empty). */
