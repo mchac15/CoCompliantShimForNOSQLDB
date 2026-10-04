@@ -1,6 +1,5 @@
 package ch.epfl.coshim.types;
 
-import java.sql.Timestamp;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -19,16 +18,16 @@ public class Transaction<K, V> {
   private final Map<K, LockType<K, V>> locksAcquired;
   private final Map<K, V> writeSet;
   private final Map<K, V> readSet;
-  private final Timestamp expirationTime;
+  private final long expirationTime;
   private Status status;
 
-  public Transaction(String transactionId, Status status, Timestamp expirationTime) {
+  public Transaction(String transactionId, Status status, long expirationTime) {
     this.transactionId = transactionId;
     this.locksAcquired = new HashMap<>();
     this.status = status;
     this.writeSet = new HashMap<>();
     this.readSet = new HashMap<>();
-    this.expirationTime = expirationTime;
+    this.expirationTime = expirationTime + System.currentTimeMillis();
   }
 
   public String getTransactionId() {
@@ -79,7 +78,7 @@ public class Transaction<K, V> {
     return readSet;
   }
 
-  public Timestamp getExpirationTime() {
+  public long getExpirationTime() {
     return expirationTime;
   }
 
@@ -91,21 +90,31 @@ public class Transaction<K, V> {
     readSet.put(key, value);
   }
 
+  public void setStatus(Status newStatus) {
+    synchronized (this) {
+      this.status = newStatus;
+    }
+  }
+
+  public String getId() {
+    return transactionId;
+  }
+
   /**
    * CAS_returning of pseudo.txt: moves to {@code to} only if the current status is in {@code from}.
    * Returns the status before the call; the CAS succeeded iff {@code from} contains it. After a
    * successful CAS, call {@link LocksMap#statusChanged} so that waiters re-check.
    */
-  public synchronized Status compareAndSwapStatus(Set<Status> from, Status to) {
+  public synchronized boolean compareAndSwapStatus(Set<Status> from, Status to) {
     Status before = status;
     if (from.contains(before)) {
       status = to;
     }
-    return before;
+    return from.contains(before);
   }
 
   public boolean compareAndSwapStatus(Status from, Status to) {
-    return compareAndSwapStatus(EnumSet.of(from), to) == from;
+    return compareAndSwapStatus(EnumSet.of(from), to);
   }
 
   public static enum Status {
