@@ -179,6 +179,25 @@ The `seata-xa` tests drive Seata's real `DataSourceProxyXA` / `ConnectionProxyXA
 application also needs Seata's `registry.conf` / `file.conf` (see `seata-xa/src/test/resources`)
 and Druid on the classpath, like any Seata XA application.
 
+## Benchmark: speculative vs non-speculative
+
+`bench` runs Acta's Micro workload in one JVM against two shims, with an in-process 2PC
+coordinator that follows Seata's XA order (per branch: start, gets/puts, end, prepare; then a
+`--commit-delay-ms` for the TC round trip, then commit). No Seata, no network: the two variants
+differ only in the speculation point. With `--rmw true` (default) every write is `get + 1` and the
+run ends with an audit (sum of all values = committed txns × branches × writes).
+
+```sh
+scripts/bench-compare.sh                                   # the simple test, both variants
+scripts/bench-compare.sh --reps 3 --skew 0.99 --threads 100 --lock-timeout-ms 100
+```
+
+Options: `--threads --table-size --branches --reads --writes --skew --shim-b-percent --rmw
+--warmup-s --measure-s --commit-delay-ms --lock-timeout-ms --txn-timeout-ms`. Every run is appended
+to `bench-results/<timestamp>.csv` (or `CSV=...`); the script prints a comparison table and exits 1
+if a run warned or failed its audit. `MicroBenchTest` runs both variants briefly under heavy
+contention as part of `mvn verify`.
+
 ## Next steps
 
 - Benchmark speculative vs non-speculative (`CoShimNode --shim`) end to end on the Acta Micro workload.

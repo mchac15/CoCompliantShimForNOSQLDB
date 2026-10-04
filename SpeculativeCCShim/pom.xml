@@ -16,6 +16,7 @@
         <module>shim-net</module>
         <module>coshim-jdbc</module>
         <module>seata-xa</module>
+        <module>bench</module>
     </modules>
 
     <properties>
