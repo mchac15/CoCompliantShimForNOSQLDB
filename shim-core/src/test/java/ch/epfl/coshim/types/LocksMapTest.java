@@ -246,6 +246,54 @@ class LocksMapTest {
     assertTrue(finished.isEmpty(), "b was still running: its own thread aborts it");
   }
 
+  // ---- non-speculative baseline ----
+
+  @Test
+  void nonSpeculativeLockWaitsForThePredecessorToCommitNotJustToExecute() throws Exception {
+    LocksMap<String, String> s2pl = new LocksMap<>(false);
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    assertEquals(LockResult.ACQUIRED, s2pl.lock("x", a, LockMode.EXCLUSIVE, LONG));
+    CompletableFuture<LockResult> f =
+        CompletableFuture.supplyAsync(() -> s2pl.lock("x", b, LockMode.SHARED, LONG));
+
+    a.compareAndSwapStatus(EnumSet.allOf(Status.class), Status.EXECUTED);
+    s2pl.statusChanged(a);
+    assertBlocked(f);
+    a.compareAndSwapStatus(EnumSet.allOf(Status.class), Status.PREPARED);
+    s2pl.statusChanged(a);
+    assertBlocked(f);
+
+    a.compareAndSwapStatus(EnumSet.allOf(Status.class), Status.COMMITTING);
+    s2pl.release(a);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  @Test
+  void nonSpeculativeAbortReleasesTheWaitersWithoutMarkingThem() throws Exception {
+    LocksMap<String, String> s2pl = new LocksMap<>(false);
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    Transaction<String, String> c = txn("c");
+    s2pl.lock("x", a, LockMode.EXCLUSIVE, LONG);
+    a.compareAndSwapStatus(EnumSet.allOf(Status.class), Status.EXECUTED);
+    s2pl.statusChanged(a);
+    CompletableFuture<LockResult> fb =
+        CompletableFuture.supplyAsync(() -> s2pl.lock("x", b, LockMode.SHARED, LONG));
+    CompletableFuture<LockResult> fc =
+        CompletableFuture.supplyAsync(() -> s2pl.lock("x", c, LockMode.EXCLUSIVE, LONG));
+    assertBlocked(fb);
+    assertBlocked(fc);
+
+    a.compareAndSwapStatus(EnumSet.allOf(Status.class), Status.ABORTED);
+    assertTrue(s2pl.abortAndRelease(a).isEmpty());
+
+    assertEquals(LockResult.ACQUIRED, fb.get(2, TimeUnit.SECONDS));
+    assertEquals(Status.STARTED, b.getStatus(), "b never read a's buffer: nothing to cascade");
+    assertEquals(Status.STARTED, c.getStatus());
+    assertBlocked(fc);   // c is still behind b, which has not committed
+  }
+
   @Test
   void cascadeReturnsFinishedVictimsNeverTouchesPreparedAndStopsAtABlindWriter() {
     // X(a) <- S(e, p) <- X(w, blind) <- S(r)

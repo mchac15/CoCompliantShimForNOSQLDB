@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.InMemoryKvStore;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
@@ -72,6 +73,79 @@ class SpeculativeCoShimTest {
         shim.abort("w");
         assertEquals(Vote.NO, shim.prepare("r"));
         assertNull(store.get("x"));
+    }
+
+    @Test
+    void cascadeAndCoordinatorAbortsAreCountedByCause() {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r");
+        shim.get("r", "x");
+        shim.end("r");
+        shim.abort("w");
+        shim.prepare("r");
+        assertEquals(1, shim.stats().aborts(AbortCause.COORDINATOR));
+        assertEquals(1, shim.stats().aborts(AbortCause.CASCADE));
+        assertEquals(2, shim.stats().aborts());
+        assertEquals(0, shim.stats().commits());
+    }
+
+    // ---- non-speculative baseline: same shim, lock() waits for the predecessors to commit ----
+
+    private final SpeculativeCoShim<String, String> s2pl =
+            new SpeculativeCoShim<>(store, LOCK_TIMEOUT, SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false);
+
+    @Test
+    void nonSpeculativeReaderWaitsForTheWriterToCommitAndReadsTheStore() throws Exception {
+        s2pl.start("w");
+        s2pl.put("w", "x", "1");
+        s2pl.end("w");
+        s2pl.start("r");
+        CompletableFuture<String> read = CompletableFuture.supplyAsync(() -> s2pl.get("r", "x"));
+        Thread.sleep(100);
+        assertFalse(read.isDone(), "an executed writer is not enough without speculation");
+        assertEquals(Vote.YES, s2pl.prepare("w"));
+        Thread.sleep(100);
+        assertFalse(read.isDone(), "nor is a prepared one");
+        s2pl.commit("w");
+        assertEquals("1", read.get(1, TimeUnit.SECONDS));
+        s2pl.end("r");
+        assertEquals(Vote.YES, s2pl.prepare("r"));
+        s2pl.commit("r");
+        assertEquals(2, s2pl.stats().commits());
+    }
+
+    @Test
+    void nonSpeculativeWriterAbortNeverCascades() throws Exception {
+        store.store("x", "0");
+        s2pl.start("w");
+        s2pl.put("w", "x", "1");
+        s2pl.end("w");
+        s2pl.start("r");
+        CompletableFuture<String> read = CompletableFuture.supplyAsync(() -> s2pl.get("r", "x"));
+        Thread.sleep(100);
+        assertFalse(read.isDone());
+        s2pl.abort("w");
+        assertEquals("0", read.get(1, TimeUnit.SECONDS), "reads the committed value, never w's buffer");
+        s2pl.end("r");
+        assertEquals(Vote.YES, s2pl.prepare("r"));
+        s2pl.commit("r");
+        assertEquals(0, s2pl.stats().aborts(AbortCause.CASCADE));
+        assertEquals(1, s2pl.stats().aborts(AbortCause.COORDINATOR));
+    }
+
+    @Test
+    void nonSpeculativeWaitTimesOutIfTheWriterNeverResolves() {
+        SpeculativeCoShim<String, String> shortTimeout = new SpeculativeCoShim<>(
+                store, Duration.ofMillis(100), SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false);
+        shortTimeout.start("w");
+        shortTimeout.put("w", "x", "1");
+        shortTimeout.end("w");
+        shortTimeout.start("r");
+        assertThrows(TxnAbortedException.class, () -> shortTimeout.put("r", "x", "2"));
+        assertEquals(1, shortTimeout.stats().aborts(AbortCause.LOCK_TIMEOUT));
+        assertEquals(Vote.YES, shortTimeout.prepare("w"), "the timeout only aborts the waiter");
     }
 
     @Test

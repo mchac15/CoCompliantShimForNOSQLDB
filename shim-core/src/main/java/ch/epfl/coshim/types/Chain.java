@@ -205,6 +205,11 @@ class Chain<K, V> {
    * of the later nodes up to the next blind writer must_abort (mark_must_abort), and only then
    * releases (cascade before splice).
    *
+   * <p>Without speculation there is nothing to cascade: every holder behind txn's uncommitted node
+   * is still waiting in lock() (or holds a node behind such a waiter), so none has read txn's
+   * buffer. They are only woken up by the release.
+   *
+   * @param cascade false for the non-speculative baseline: release only
    * @param marked receives every txn this call moved to must_abort (to wake them up)
    * @param doomedFinished receives those of them that were executed (the caller aborts them)
    * @return true iff the chain is now empty, as in {@link #release}
@@ -212,9 +217,10 @@ class Chain<K, V> {
   synchronized boolean abortAndRelease(
       Transaction<K, V> txn,
       LockType<K, V> held,
+      boolean cascade,
       List<Transaction<K, V>> marked,
       List<Transaction<K, V>> doomedFinished) {
-    if (held.mode() == LockMode.EXCLUSIVE) {
+    if (cascade && held.mode() == LockMode.EXCLUSIVE) {
       for (LockNode<K, V> s = held.node().getNext(); s != null; s = s.getNext()) {
         if (s.getMode() == LockMode.EXCLUSIVE && !s.isUpgraded()) {
           break;   // blind write: it does not depend on txn's value
