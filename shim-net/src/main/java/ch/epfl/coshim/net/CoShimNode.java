@@ -13,17 +13,28 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Runs one shim node hosting one or more databases, one shim each (String keys and values, one
  * in-memory store per database for now).
  *
  * <pre>
- *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [port] [shim] [databases] [allowed-client ...]
- *     port            default 7000
- *     shim            speculative (pseudo.txt, TODO) | nocc (no concurrency control, baseline); default nocc
- *     databases       comma-separated database names; default "default"
- *     allowed-client  optional client addresses (e.g. the RMs' hosts); default: any authenticated client
+ *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
+ *       [--lock-timeout-ms T] [--stats-interval-s I] [--allow HOST ...]
+ *     --port              default 7000
+ *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
+ *                         for the predecessors to commit, no cascades) | nocc (no concurrency
+ *                         control); default nocc
+ *     --databases         comma-separated database names; default "default"
+ *     --lock-timeout-ms   lock_timeout of speculative/nonspeculative; default 200
+ *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
+ *     --allow             a client address allowed to connect (e.g. an RM host), repeatable; default:
+ *                         any authenticated client
+ *
+ *   Positional form (still accepted): CoShimNode [port] [shim] [databases] [allowed-client ...]
  * </pre>
  *
  * RMs then use one data source per database:
@@ -33,35 +44,95 @@ public final class CoShimNode {
 
     private CoShimNode() {}
 
+    /** The parsed command line. */
+    record Options(int port, String shim, String[] databases, Duration lockTimeout, long statsIntervalSeconds,
+            Set<InetAddress> allowed) {
+
+        static Options parse(String[] args) throws Exception {
+            int port = 7000;
+            String shim = "nocc";
+            // A comma-separated list, e.g. "shop,billing": the node hosts one database (and one shim) per
+            // name. With no argument it hosts a single database called "default".
+            String databases = "default";
+            long lockTimeoutMs = 200;
+            long statsIntervalSeconds = 10;
+            Set<InetAddress> allowed = new HashSet<>();
+            if (args.length > 0 && args[0].startsWith("--")) {
+                for (int i = 0; i < args.length; i++) {
+                    String flag = args[i];
+                    if (i + 1 >= args.length) {
+                        throw new IllegalArgumentException(flag + " needs a value");
+                    }
+                    String value = args[++i];
+                    switch (flag) {
+                        case "--port" -> port = Integer.parseInt(value);
+                        case "--shim" -> shim = value;
+                        case "--databases" -> databases = value;
+                        case "--lock-timeout-ms" -> lockTimeoutMs = Long.parseLong(value);
+                        case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
+                        case "--allow" -> allowed.add(InetAddress.getByName(value));
+                        default -> throw new IllegalArgumentException("unknown option " + flag);
+                    }
+                }
+            } else {
+                port = args.length > 0 ? Integer.parseInt(args[0]) : port;
+                shim = args.length > 1 ? args[1] : shim;
+                databases = args.length > 2 ? args[2] : databases;
+                for (int i = 3; i < args.length; i++) {
+                    allowed.add(InetAddress.getByName(args[i]));
+                }
+            }
+            return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs),
+                    statsIntervalSeconds, allowed);
+        }
+
+        CoShim<TableKey<String>, String> newShim(KvStore<TableKey<String>, String> store) {
+            return switch (shim) {
+                case "speculative" -> new SpeculativeCoShim<>(store, lockTimeout,
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true);
+                case "nonspeculative" -> new SpeculativeCoShim<>(store, lockTimeout,
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false);
+                case "nocc" -> new NoCcShim<>(store);
+                default -> throw new IllegalArgumentException("unknown shim " + shim);
+            };
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         String token = System.getenv("COSHIM_TOKEN");
         if (token == null || token.isEmpty()) {
             System.err.println("set COSHIM_TOKEN: the shared secret the RMs must present");
             System.exit(2);
         }
-        int port = args.length > 0 ? Integer.parseInt(args[0]) : 7000;
-        String kind = args.length > 1 ? args[1] : "nocc";
-        // A comma-separated list, e.g. "shop,billing": the node hosts one database (and one shim) per
-        // name. With no argument it hosts a single database called "default".
-        String[] databaseNames = (args.length > 2 ? args[2] : "default").split(",");
-        Set<InetAddress> allowed = new HashSet<>();
-        for (int i = 3; i < args.length; i++) {
-            allowed.add(InetAddress.getByName(args[i]));
-        }
+        Options options = Options.parse(args);
 
         Map<String, CoShim<TableKey<String>, String>> databases = new LinkedHashMap<>();
-        for (String name : databaseNames) {
+        for (String name : options.databases()) {
             KvStore<TableKey<String>, String> store = new InMemoryKvStore<>();
-            databases.put(name, switch (kind) {
-                case "speculative" -> new SpeculativeCoShim<>(store, Duration.ofMillis(200));
-                case "nocc" -> new NoCcShim<>(store);
-                default -> throw new IllegalArgumentException("unknown shim " + kind);
-            });
+            databases.put(name, options.newShim(store));
         }
         CoShimServer<TableKey<String>, String> server = new CoShimServer<>(
-                databases, new TableKeyCodec<>(Codec.UTF8), Codec.UTF8, new InetSocketAddress(port), token, allowed);
-        System.out.println("coshim node (" + kind + ") on port " + server.getPort() + ", databases " + databases.keySet()
-                + (allowed.isEmpty() ? "" : ", allowed clients " + allowed));
+                databases, new TableKeyCodec<>(Codec.UTF8), Codec.UTF8, new InetSocketAddress(options.port()), token,
+                options.allowed());
+        System.out.println("coshim node (" + options.shim() + ", lock timeout " + options.lockTimeout().toMillis()
+                + " ms) on port " + server.getPort() + ", databases " + databases.keySet()
+                + (options.allowed().isEmpty() ? "" : ", allowed clients " + options.allowed()));
+
+        Runnable printStats = () -> databases.forEach((name, shim) -> {
+            if (shim instanceof SpeculativeCoShim<?, ?> speculative) {
+                System.out.println("stats " + name + ": " + speculative.stats());
+            }
+        });
+        Runtime.getRuntime().addShutdownHook(new Thread(printStats, "coshim-stats-final"));
+        if (options.statsIntervalSeconds() > 0) {
+            ScheduledExecutorService statsLogger = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "coshim-stats");
+                t.setDaemon(true);
+                return t;
+            });
+            statsLogger.scheduleAtFixedRate(printStats, options.statsIntervalSeconds(),
+                    options.statsIntervalSeconds(), TimeUnit.SECONDS);
+        }
         Thread.currentThread().join();
     }
 }

@@ -80,11 +80,29 @@ public class LocksMap<K, V> {
   }
 
   private final ConcurrentHashMap<K, Chain<K, V>> locksMap = new ConcurrentHashMap<>();
+  /** What lock()/upgrade() wait for: every predecessor holder in this set. */
+  private final Set<Status> lockReady;
+  private final boolean speculative;
+
+  /** The speculative lock table of pseudo.txt. */
+  public LocksMap() {
+    this(true);
+  }
+
+  /**
+   * @param speculative true: lock() waits until the predecessors are executed (pseudo.txt). false:
+   *     the non-speculative S2PL baseline, lock() waits until they committed, so no txn ever reads
+   *     an uncommitted value and an abort never cascades
+   */
+  public LocksMap(boolean speculative) {
+    this.speculative = speculative;
+    this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
+  }
 
   /**
    * lock(k, mode, txn) and upgrade(k, txn): takes the lock, then waits (at most {@code timeout})
-   * until every holder of its predecessor is at least executed. On MUST_ABORT / TIMED_OUT the
-   * caller runs abort_transaction(txn).
+   * until every holder of its predecessor is at least executed (committed if not speculative). On
+   * MUST_ABORT / TIMED_OUT the caller runs abort_transaction(txn).
    */
   public LockResult lock(K key, Transaction<K, V> txn, LockMode mode, Duration timeout) {
     long deadline = System.nanoTime() + timeout.toNanos();
@@ -163,7 +181,8 @@ public class LocksMap<K, V> {
     for (Map.Entry<K, LockType<K, V>> e : txn.frozenLocks().entrySet()) {
       LockType<K, V> held = e.getValue();
       locksMap.computeIfPresent(
-          e.getKey(), (k, c) -> c.abortAndRelease(txn, held, marked, doomedFinished) ? null : c);
+          e.getKey(),
+          (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished) ? null : c);
     }
     for (Transaction<K, V> t : marked) {
       statusChanged(t);
@@ -204,7 +223,7 @@ public class LocksMap<K, V> {
   }
 
   private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline) {
-    return switch (chain.awaitPredecessor(txn, SPECULATION_POINT, true, deadline)) {
+    return switch (chain.awaitPredecessor(txn, lockReady, true, deadline)) {
       case READY -> LockResult.ACQUIRED;
       case DOOMED -> LockResult.MUST_ABORT;
       case TIMED_OUT -> LockResult.TIMED_OUT;

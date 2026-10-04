@@ -11,7 +11,7 @@ global transactions that mix both kinds of shim.
 | Module | Depends on | Contents |
 | --- | --- | --- |
 | `store-api` | nothing | `KvStore<K, V>`: the whole database behind `get` / `store`, plus `InMemoryKvStore`; `TableKey` (table, key): a shim manages several tables of its database |
-| `shim-core` | `store-api` | `CoShim`: the requests a shim receives from client connections (start / get / put / end / prepare / commit / abort). It never runs client code; `SpeculativeCoShim` is a **TODO stub** to be implemented from pseudo.txt; `NoCcShim` is a pass-through shim (no concurrency control) used as the benchmark baseline and in tests |
+| `shim-core` | `store-api` | `CoShim`: the requests a shim receives from client connections (start / get / put / end / prepare / commit / abort). It never runs client code; `SpeculativeCoShim` implements pseudo.txt, and with `speculative = false` is the non-speculative strict-2PL baseline (lock() waits for predecessors to *commit*, no cascades); `ShimStats` counts its commits and aborts by cause; `NoCcShim` is a pass-through shim (no concurrency control) used in tests |
 | `shim-net` | `shim-core` | **Shim nodes**: `CoShimServer` hosts one or more databases, one `CoShim` each, and serves them over TCP to the participants only (shared-token handshake, optional client allowlist); `RemoteCoShim` is the client the RMs use, bound to one database; `CoShimNode` runs a node |
 | `coshim-jdbc` | `shim-core` | The shim as a JDBC "driver": `CoShimDataSource` (`DataSource` + `XADataSource`, URL `jdbc:coshim://host:port/database`), `CoShimXAResource`, `KvSession` (`get(table, key)` / `put(table, key, value)` instead of SQL). No Seata dependency |
 | `seata-xa` | `coshim-jdbc`, patched Seata | `DataSourceProxyCoShim`: the counterpart of `new DataSourceProxyXA(mysqlPool)` |
@@ -80,7 +80,9 @@ drivers with Sonata's hook in the RM.
 ```
 
 ```sh
-COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode 7000 nocc shop,billing [allowed RM hosts...]
+COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode --port 7000 --shim speculative \
+    --databases shop,billing --lock-timeout-ms 1000 [--stats-interval-s 10] [--allow RM-host ...]
+# --shim speculative | nonspeculative | nocc; commit/abort counters are logged every interval and at shutdown
 ```
 
 ```java
@@ -168,6 +170,7 @@ also be proposed upstream.
 
 ```sh
 scripts/install-seata.sh      # clones ../incubator-seata (Sonata fork), applies seata-patches/, installs 2.6.0-SNAPSHOT into ~/.m2
+                              # --with-acta: also the shaded seata-all + starter used by ../acta-server
 mvn verify                    # JDK 17+
 ```
 
@@ -178,7 +181,7 @@ and Druid on the classpath, like any Seata XA application.
 
 ## Next steps
 
-- Implement `SpeculativeCoShim` from pseudo.txt.
+- Benchmark speculative vs non-speculative (`CoShimNode --shim`) end to end on the Acta Micro workload.
 - Add a real key-value backend behind `KvStore`.
 - Run end to end against `seata-mock-server` or a real TC, with a mixed global transaction (a
   MySQL/Sonata branch and a coshim branch). Then build a benchmark comparing stock XA, Sonata,

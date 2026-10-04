@@ -1,5 +1,6 @@
 package ch.epfl.coshim.core;
 
+import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.KvStore;
 import ch.epfl.coshim.types.LockType;
 import ch.epfl.coshim.types.LocksMap;
@@ -18,6 +19,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * The speculative CO-compliant shim of pseudo.txt (S2PL + speculation at {@code executed}). The
  * lock table (chains, lock/upgrade, cascades) lives in {@link LocksMap}; this class keeps
  * transactions_map, the status CASes, the buffers and the tombstones.
+ *
+ * <p>With {@code speculative = false} it is the non-speculative baseline: plain strict 2PL, where
+ * lock() waits until the predecessors committed instead of executed. Same code otherwise, so a
+ * benchmark of the two isolates what speculation buys (shorter lock waits) and costs (cascades).
  */
 public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   /** Above Seata's default 60 s global transaction timeout (pseudo.txt tombstone_ttl). */
@@ -37,7 +42,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   private final KvStore<K, V> store;
   private final Duration lockTimeout;
   private final Duration tombstoneTtl;
-  private final LocksMap<K, V> locksMap = new LocksMap<>();
+  private final LocksMap<K, V> locksMap;
+  private final ShimStats stats = new ShimStats();
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
 
   public SpeculativeCoShim(KvStore<K, V> store, Duration lockTimeout) {
@@ -50,6 +56,15 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
    *     global transaction timeout
    */
   public SpeculativeCoShim(KvStore<K, V> store, Duration lockTimeout, Duration tombstoneTtl) {
+    this(store, lockTimeout, tombstoneTtl, true);
+  }
+
+  /**
+   * @param speculative false for the non-speculative baseline (see the class comment)
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store, Duration lockTimeout, Duration tombstoneTtl, boolean speculative) {
+    this.locksMap = new LocksMap<>(speculative);
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
     this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);
@@ -101,7 +116,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       }
       // aborted or must_abort: a cascade / foreign abort may have landed after the last get/put and
       // nobody released the locks yet. Idempotent
-      abortTransaction(txn);
+      abortTransaction(txn, AbortCause.CASCADE);
       return Outcome.FAILED;
     }
     // successors waiting in lock() for this txn to reach the speculation point
@@ -114,7 +129,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     Transaction<K, V> txn = running(txnId);
     LockResult res = locksMap.lock(key, txn, LockType.LockMode.SHARED, lockTimeout);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT) {
-      abortTransaction(txn);
+      abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("get: lock failed, must abort");
     }
     // own write first: read_buffer may hold the value read before this txn's own put
@@ -124,7 +139,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     }
     LocksMap.ReadResult<V> readRes = locksMap.read(key, txn);
     if (readRes.isDoomed()) {
-      abortTransaction(txn);
+      abortTransaction(txn, AbortCause.CASCADE);
       throw new TxnAbortedException("get: read failed, must abort");
     }
     if (readRes.value() != null) {
@@ -142,7 +157,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     Transaction<K, V> txn = running(txnId);
     LockResult res = locksMap.lock(key, txn, LockType.LockMode.EXCLUSIVE, lockTimeout);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT) {
-      abortTransaction(txn);
+      abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("put: lock failed, must abort");
     }
     txn.addToWriteSet(key, value);
@@ -158,18 +173,18 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       return Vote.YES; // duplicate prepare: re-send the vote
     }
     if (!PREPARABLE.contains(txn.getStatus())) {
-      abortTransaction(txn); // started, aborted (incl. tombstone) or must_abort
+      abortTransaction(txn, AbortCause.PREPARE_NO); // started, aborted (incl. tombstone) or must_abort
       return Vote.NO;
     }
     if (!locksMap.awaitPredecessorsResolved(txn)) {
-      abortTransaction(txn); // doomed while waiting; a no-op if already aborted
+      abortTransaction(txn, AbortCause.CASCADE); // doomed while waiting; a no-op if already aborted
       return Vote.NO;
     }
     if (!PREPARABLE.contains(txn.compareAndSwapStatus(PREPARABLE, Status.PREPARED))) {
       if (VOTED_YES.contains(txn.getStatus())) {
         return Vote.YES; // a concurrent duplicate prepare already voted YES
       }
-      abortTransaction(txn); // a late cascade landed after the wait
+      abortTransaction(txn, AbortCause.CASCADE); // a late cascade landed after the wait
       return Vote.NO;
     }
     return Vote.YES;
@@ -189,6 +204,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     locksMap.release(txn);
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
+    stats.committed();
   }
 
   @Override
@@ -202,7 +218,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (txn.getStatus() == Status.ABORTED) {
       return; // tombstone (new or old), or already aborted: abort_transaction would be a no-op
     }
-    abortTransaction(txn);
+    abortTransaction(txn, AbortCause.COORDINATOR);
   }
 
   /** The txn of a get/put: FAILED (thrown) if unknown, or if the request came after end(). */
@@ -218,14 +234,30 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     return txn; // aborted / must_abort: lock() returns MUST_ABORT
   }
 
-  private void abortTransaction(Transaction<K, V> txn) {
-    if (!ABORTABLE.contains(txn.compareAndSwapStatus(ABORTABLE, Status.ABORTED))) {
+  /** Commit and abort counters, by abort cause. */
+  public ShimStats stats() {
+    return stats;
+  }
+
+  private static AbortCause lockFailure(LockResult res) {
+    // MUST_ABORT of a txn that was not marked: it lost an upgrade race (a marked one counts as cascade)
+    return res == LockResult.TIMED_OUT ? AbortCause.LOCK_TIMEOUT : AbortCause.UPGRADE_CONFLICT;
+  }
+
+  /**
+   * @param cause why the caller aborts txn; a txn that was must_abort counts as a cascade whatever
+   *     the site that finally aborts it
+   */
+  private void abortTransaction(Transaction<K, V> txn, AbortCause cause) {
+    Status before = txn.compareAndSwapStatus(ABORTABLE, Status.ABORTED);
+    if (!ABORTABLE.contains(before)) {
       return; // already aborted or committing/committed
     }
+    stats.aborted(before == Status.MUST_ABORT ? AbortCause.CASCADE : cause);
     List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
     transactionsMap.remove(txn.getTransactionId(), txn);
     for (Transaction<K, V> t : doomed) {
-      abortTransaction(t);
+      abortTransaction(t, AbortCause.CASCADE);
     }
   }
 }
