@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -338,7 +340,9 @@ public final class MicroBench {
      * {@code java ... MicroBench [--shim speculative|nonspeculative] [--threads N] [--table-size N]
      * [--branches N] [--reads N] [--writes N] [--skew X] [--shim-b-percent P] [--rmw true|false]
      * [--warmup-s S] [--measure-s S] [--commit-delay-ms MS] [--lock-timeout-ms MS] [--txn-timeout-ms MS]
-     * [--csv FILE] [--label TEXT]}. Exit code 0 iff the run had no warning and the audit passed.
+     * [--csv FILE] [--label TEXT]}. The run is appended to {@code FILE} (default
+     * {@code bench-results/<timestamp>-<shim>.csv} in the working directory). Exit code 0 iff the run had
+     * no warning and the audit passed.
      */
     public static void main(String[] args) throws Exception {
         BenchConfig config;
@@ -350,13 +354,17 @@ public final class MicroBench {
             return;
         }
         String csv = option(args, "--csv");
+        if (csv == null) {
+            csv = "bench-results/" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
+                    + "-" + config.shim() + ".csv";
+        }
         String label = option(args, "--label");
 
         BenchResult result = new MicroBench(config).run();
         System.out.println(result.summary());
-        if (csv != null) {
-            appendCsv(Path.of(csv), result.csvRow(label == null ? "" : label));
-        }
+        Path file = Path.of(csv).toAbsolutePath();
+        appendCsv(file, result.csvRow(label == null ? "" : label));
+        System.out.println("  results appended to " + file);
         System.exit(result.ok() ? 0 : 1);
     }
 
