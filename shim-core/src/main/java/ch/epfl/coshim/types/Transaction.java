@@ -1,6 +1,5 @@
 package ch.epfl.coshim.types;
 
-import java.sql.Timestamp;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -19,16 +18,18 @@ public class Transaction<K, V> {
   private final Map<K, LockType<K, V>> locksAcquired;
   private final Map<K, V> writeSet;
   private final Map<K, V> readSet;
-  private final Timestamp expirationTime;
+  /** expires_at of pseudo.txt, in {@link System#currentTimeMillis()}: set only on a tombstone. */
+  private final Long expiresAtMillis;
   private Status status;
 
-  public Transaction(String transactionId, Status status, Timestamp expirationTime) {
+  /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
+  public Transaction(String transactionId, Status status, Long expiresAtMillis) {
     this.transactionId = transactionId;
     this.locksAcquired = new HashMap<>();
     this.status = status;
     this.writeSet = new HashMap<>();
     this.readSet = new HashMap<>();
-    this.expirationTime = expirationTime;
+    this.expiresAtMillis = expiresAtMillis;
   }
 
   public String getTransactionId() {
@@ -79,8 +80,9 @@ public class Transaction<K, V> {
     return readSet;
   }
 
-  public Timestamp getExpirationTime() {
-    return expirationTime;
+  /** A tombstone past its expires_at (pseudo.txt gc_tombstones()); always false for a live txn. */
+  public boolean isExpiredTombstone(long nowMillis) {
+    return expiresAtMillis != null && nowMillis >= expiresAtMillis;
   }
 
   public void addToWriteSet(K key, V value) {
@@ -89,6 +91,12 @@ public class Transaction<K, V> {
 
   public void addToReadSet(K key, V value) {
     readSet.put(key, value);
+  }
+
+  public void setStatus(Status newStatus) {
+    synchronized (this) {
+      this.status = newStatus;
+    }
   }
 
   /**

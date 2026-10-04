@@ -1,6 +1,7 @@
 package ch.epfl.coshim.net;
 
 import ch.epfl.coshim.core.CoShim;
+import ch.epfl.coshim.core.Outcome;
 import ch.epfl.coshim.core.TxnAbortedException;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -164,7 +165,7 @@ public class CoShimServer<K, V> implements AutoCloseable {
         try {
             switch (op) {
                 case Protocol.START -> {
-                    boolean started = shim.start(txnId);
+                    boolean started = shim.start(txnId) == Outcome.SUCCEEDED;
                     out.writeByte(Protocol.OK);
                     out.writeBoolean(started);
                 }
