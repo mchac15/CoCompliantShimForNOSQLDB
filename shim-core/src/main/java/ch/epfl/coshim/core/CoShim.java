@@ -42,7 +42,7 @@ public interface CoShim<K, V> {
   /**
    * Registers the transaction (status {@code started}).
    *
-   * @return false if the id is already registered, or was aborted before it started (tombstone)
+   * @return FAILED if the id is already registered, or was aborted before it started (tombstone)
    */
   Outcome start(String txnId);
 

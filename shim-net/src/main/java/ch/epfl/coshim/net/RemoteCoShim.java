@@ -59,8 +59,8 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
     }
 
     @Override
-    public boolean start(String txnId) {
-        return call(Protocol.START, txnId, null, null, in -> in.readBoolean());
+    public Outcome start(String txnId) {
+        return call(Protocol.START, txnId, null, null, in -> in.readBoolean()) ? Outcome.SUCCEEDED : Outcome.FAILED;
     }
 
     @Override

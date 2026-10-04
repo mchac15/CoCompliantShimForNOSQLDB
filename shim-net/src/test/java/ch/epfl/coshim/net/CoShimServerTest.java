@@ -64,8 +64,8 @@ class CoShimServerTest {
         startNode(new NoCcShim<>(store), Set.of());
         client = connect(TOKEN).verify();
 
-        assertTrue(client.start("t1"));
-        assertFalse(client.start("t1"));
+        assertEquals(Outcome.SUCCEEDED, client.start("t1"));
+        assertEquals(Outcome.FAILED, client.start("t1"));
         client.put("t1", "x", "1");
         assertEquals("1", client.get("t1", "x"));
         assertNull(client.get("t1", "absent"));
@@ -89,7 +89,7 @@ class CoShimServerTest {
         startNode(new NoCcShim<>(store), Set.of());
         client = connect(TOKEN);
         client.abort("t1");   // the TC's rollback, possibly relayed by another RM instance
-        assertFalse(client.start("t1"));
+        assertEquals(Outcome.FAILED, client.start("t1"));
         assertEquals(Vote.NO, client.prepare("t1"));
     }
 
@@ -101,8 +101,8 @@ class CoShimServerTest {
         client = connect("orders", TOKEN);
         try (RemoteCoShim<String, String> stock = connect("stock", TOKEN)) {
             // the same txn id and key on two databases are unrelated
-            assertTrue(client.start("t1"));
-            assertTrue(stock.start("t1"));
+            assertEquals(Outcome.SUCCEEDED, client.start("t1"));
+            assertEquals(Outcome.SUCCEEDED, stock.start("t1"));
             client.put("t1", "k", "order");
             stock.put("t1", "k", "level");
             for (RemoteCoShim<String, String> db : java.util.List.of(client, stock)) {

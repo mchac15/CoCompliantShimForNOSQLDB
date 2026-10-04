@@ -5,7 +5,9 @@ import ch.epfl.coshim.types.LockType;
 import ch.epfl.coshim.types.LocksMap;
 import ch.epfl.coshim.types.LocksMap.LockResult;
 import ch.epfl.coshim.types.Transaction;
+import ch.epfl.coshim.types.Transaction.Status;
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -13,52 +15,74 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * The speculative CO-compliant shim of pseudo.txt (S2PL + speculation at {@code executed}).
- *
- * <p>TODO: not implemented yet. This template only wires it into Seata; translate pseudo.txt here
- * (LockNode, chain, locks_map, transactions_map, lock/upgrade/abort_transaction/mark_must_abort),
- * including the tombstones for an abort that arrives before start (see {@link CoShim} and {@link
- * NoCcShim} for a reference of that part).
+ * The speculative CO-compliant shim of pseudo.txt (S2PL + speculation at {@code executed}). The
+ * lock table (chains, lock/upgrade, cascades) lives in {@link LocksMap}; this class keeps
+ * transactions_map, the status CASes, the buffers and the tombstones.
  */
 public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
-  private static final Duration TOMBSTONE_TTL = Duration.ofSeconds(10);
-  private static final Duration LOCK_TIMEOUT = Duration.ofSeconds(10);
+  /** Above Seata's default 60 s global transaction timeout (pseudo.txt tombstone_ttl). */
+  public static final Duration DEFAULT_TOMBSTONE_TTL = Duration.ofSeconds(180);
+
+  private static final Duration GC_PERIOD = Duration.ofSeconds(1);
+  /** The request came after end(): the write buffer is final. */
+  private static final Set<Status> FINISHED =
+      EnumSet.of(Status.EXECUTED, Status.PREPARED, Status.COMMITTING, Status.COMMITTED);
+  /** Voted YES already. */
+  private static final Set<Status> VOTED_YES =
+      EnumSet.of(Status.PREPARED, Status.COMMITTING, Status.COMMITTED);
+  private static final Set<Status> PREPARABLE = EnumSet.of(Status.EXECUTED, Status.PREPARED);
+  private static final Set<Status> ABORTABLE =
+      EnumSet.of(Status.STARTED, Status.EXECUTED, Status.MUST_ABORT, Status.PREPARED);
 
   private final KvStore<K, V> store;
+  private final Duration lockTimeout;
+  private final Duration tombstoneTtl;
   private final LocksMap<K, V> locksMap = new LocksMap<>();
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
 
-  public SpeculativeCoShim(KvStore<K, V> store) {
+  public SpeculativeCoShim(KvStore<K, V> store, Duration lockTimeout) {
+    this(store, lockTimeout, DEFAULT_TOMBSTONE_TTL);
+  }
+
+  /**
+   * @param lockTimeout bounds the waits of lock()/upgrade() (deadlock breaking)
+   * @param tombstoneTtl how long an abort-before-start is remembered; at least the coordinator's
+   *     global transaction timeout
+   */
+  public SpeculativeCoShim(KvStore<K, V> store, Duration lockTimeout, Duration tombstoneTtl) {
     this.store = Objects.requireNonNull(store);
-    // Launch background garbage collector
+    this.lockTimeout = Objects.requireNonNull(lockTimeout);
+    this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);
     startBackgroundGarbageCollector();
   }
 
+  /** pseudo.txt gc_tombstones(): removes the expired tombstones, never a live txn. */
   private void startBackgroundGarbageCollector() {
     Thread gcThread =
         new Thread(
             () -> {
               while (true) {
                 try {
-                  Thread.sleep(1000); // Sleep for 1 second
+                  Thread.sleep(GC_PERIOD.toMillis());
                   long now = System.currentTimeMillis();
+                  // CHM's entrySet().removeIf removes an entry only if it still maps to that value
                   transactionsMap
                       .entrySet()
-                      .removeIf(entry -> entry.getValue().getExpirationTime() < now);
+                      .removeIf(entry -> entry.getValue().isExpiredTombstone(now));
                 } catch (InterruptedException e) {
                   Thread.currentThread().interrupt();
                   break; // Exit the loop if interrupted
                 }
               }
-            });
+            },
+            "coshim-tombstone-gc");
     gcThread.setDaemon(true); // Set as daemon so it doesn't prevent JVM shutdown
     gcThread.start();
   }
 
   @Override
   public Outcome start(String txnId) {
-    Transaction<K, V> txn =
-        new Transaction<>(txnId, Transaction.Status.STARTED, LOCK_TIMEOUT.toMillis());
+    Transaction<K, V> txn = new Transaction<>(txnId, Status.STARTED, null);
     if (transactionsMap.putIfAbsent(txnId, txn) != null) {
       return Outcome.FAILED; // already registered or tombstone
     }
@@ -71,44 +95,32 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (txn == null) {
       return Outcome.FAILED;
     }
-    if (!txn.compareAndSwapStatus(Transaction.Status.STARTED, Transaction.Status.EXECUTED)) {
-      if (Set.of(
-              Transaction.Status.EXECUTED,
-              Transaction.Status.PREPARED,
-              Transaction.Status.COMMITTING,
-              Transaction.Status.COMMITTED)
-          .contains(txn.getStatus()))
+    if (!txn.compareAndSwapStatus(Status.STARTED, Status.EXECUTED)) {
+      if (FINISHED.contains(txn.getStatus())) {
         return Outcome.SUCCEEDED; // duplicate end: already executed or prepared, never abort it
-
-      // TODO: check if it is this one
-      // abort_transaction
+      }
+      // aborted or must_abort: a cascade / foreign abort may have landed after the last get/put and
+      // nobody released the locks yet. Idempotent
       abortTransaction(txn);
       return Outcome.FAILED;
     }
+    // successors waiting in lock() for this txn to reach the speculation point
+    locksMap.statusChanged(txn);
     return Outcome.SUCCEEDED;
   }
 
   @Override
   public V get(String txnId, K key) {
-    Transaction<K, V> txn = transactionsMap.get(txnId);
-    if (txn == null) return null;
-    if (Set.of(
-            Transaction.Status.EXECUTED,
-            Transaction.Status.PREPARED,
-            Transaction.Status.COMMITTING,
-            Transaction.Status.COMMITTED,
-            Transaction.Status.ABORTED)
-        .contains(txn.getStatus())) {
-      return null;
-    }
-    LockResult res = locksMap.lock(key, txn, LockType.LockMode.SHARED, LOCK_TIMEOUT);
+    Transaction<K, V> txn = running(txnId);
+    LockResult res = locksMap.lock(key, txn, LockType.LockMode.SHARED, lockTimeout);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT) {
       abortTransaction(txn);
       throw new TxnAbortedException("get: lock failed, must abort");
     }
-    Map<K, V> readSet = txn.getReadSet();
-    if (readSet.containsKey(key)) {
-      return readSet.get(key);
+    // own write first: read_buffer may hold the value read before this txn's own put
+    V own = txn.getWriteSet().get(key);
+    if (own != null) {
+      return own;
     }
     LocksMap.ReadResult<V> readRes = locksMap.read(key, txn);
     if (readRes.isDoomed()) {
@@ -126,18 +138,9 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
 
   @Override
   public void put(String txnId, K key, V value) {
-    Transaction<K, V> txn = transactionsMap.get(txnId);
-    if (txn == null) return;
-    if (Set.of(
-            Transaction.Status.EXECUTED,
-            Transaction.Status.PREPARED,
-            Transaction.Status.COMMITTING,
-            Transaction.Status.COMMITTED,
-            Transaction.Status.ABORTED)
-        .contains(txn.getStatus())) {
-      return;
-    }
-    LockResult res = locksMap.lock(key, txn, LockType.LockMode.EXCLUSIVE, LOCK_TIMEOUT);
+    Objects.requireNonNull(value, "values are non-null");
+    Transaction<K, V> txn = running(txnId);
+    LockResult res = locksMap.lock(key, txn, LockType.LockMode.EXCLUSIVE, lockTimeout);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT) {
       abortTransaction(txn);
       throw new TxnAbortedException("put: lock failed, must abort");
@@ -148,33 +151,25 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   @Override
   public Vote prepare(String txnId) {
     Transaction<K, V> txn = transactionsMap.get(txnId);
-    if (txn == null) return Vote.NO;
-    if (Set.of(
-            Transaction.Status.PREPARED,
-            Transaction.Status.COMMITTING,
-            Transaction.Status.COMMITTED)
-        .contains(txn.getStatus())) return Vote.YES; // already prepared or committed
-
-    if (!Set.of(Transaction.Status.PREPARED, Transaction.Status.EXECUTED)
-        .contains(txn.getStatus())) {
-      // TODO: check if abort_transaction
-      abortTransaction(txn);
-      return Vote.NO; // must abort
-    }
-
-    if (!locksMap.awaitPredecessorsResolved(txn)) {
-      // TODO: check if abort_transaction
-      abortTransaction(txn);
+    if (txn == null) {
       return Vote.NO;
     }
-    if (txn.compareAndSwapStatus(
-        Set.of(Transaction.Status.PREPARED, Transaction.Status.EXECUTED),
-        Transaction.Status.PREPARED)) {
-      if (Set.of(Transaction.Status.COMMITTING, Transaction.Status.COMMITTED)
-          .contains(txn.getStatus())) {
-        return Vote.YES; // already prepared or committed
+    if (VOTED_YES.contains(txn.getStatus())) {
+      return Vote.YES; // duplicate prepare: re-send the vote
+    }
+    if (!PREPARABLE.contains(txn.getStatus())) {
+      abortTransaction(txn); // started, aborted (incl. tombstone) or must_abort
+      return Vote.NO;
+    }
+    if (!locksMap.awaitPredecessorsResolved(txn)) {
+      abortTransaction(txn); // doomed while waiting; a no-op if already aborted
+      return Vote.NO;
+    }
+    if (!PREPARABLE.contains(txn.compareAndSwapStatus(PREPARABLE, Status.PREPARED))) {
+      if (VOTED_YES.contains(txn.getStatus())) {
+        return Vote.YES; // a concurrent duplicate prepare already voted YES
       }
-      abortTransaction(txn);
+      abortTransaction(txn); // a late cascade landed after the wait
       return Vote.NO;
     }
     return Vote.YES;
@@ -183,15 +178,16 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   @Override
   public void commit(String txnId) {
     Transaction<K, V> txn = transactionsMap.get(txnId);
-    if (txn == null) return;
-    if (!txn.compareAndSwapStatus(
-        Set.of(Transaction.Status.PREPARED, Transaction.Status.COMMITTING),
-        Transaction.Status.COMMITTING)) {
+    if (txn == null) {
+      return;
+    }
+    // only from prepared: a duplicate commit must not re-apply the buffer over a successor's writes
+    if (!txn.compareAndSwapStatus(Status.PREPARED, Status.COMMITTING)) {
       return;
     }
     store.storeAll(txn.getWriteSet());
     locksMap.release(txn);
-    txn.setStatus(Transaction.Status.COMMITTED);
+    txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
   }
 
@@ -200,25 +196,34 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     Transaction<K, V> txn =
         transactionsMap.computeIfAbsent(
             txnId,
-            id -> new Transaction<>(id, Transaction.Status.ABORTED, TOMBSTONE_TTL.toMillis()));
-    if (txn.getStatus() == Transaction.Status.ABORTED) {
-      return; // already aborted or tombstone
+            id ->
+                new Transaction<>(
+                    id, Status.ABORTED, System.currentTimeMillis() + tombstoneTtl.toMillis()));
+    if (txn.getStatus() == Status.ABORTED) {
+      return; // tombstone (new or old), or already aborted: abort_transaction would be a no-op
     }
     abortTransaction(txn);
   }
 
+  /** The txn of a get/put: FAILED (thrown) if unknown, or if the request came after end(). */
+  private Transaction<K, V> running(String txnId) {
+    Transaction<K, V> txn = transactionsMap.get(txnId);
+    if (txn == null) {
+      throw new TxnAbortedException("txn " + txnId + " is unknown");
+    }
+    if (FINISHED.contains(txn.getStatus())) {
+      // never abort here: a prepared txn voted YES
+      throw new TxnAbortedException("txn " + txnId + " already ended");
+    }
+    return txn; // aborted / must_abort: lock() returns MUST_ABORT
+  }
+
   private void abortTransaction(Transaction<K, V> txn) {
-    if (!txn.compareAndSwapStatus(
-        Set.of(
-            Transaction.Status.STARTED,
-            Transaction.Status.EXECUTED,
-            Transaction.Status.MUST_ABORT,
-            Transaction.Status.PREPARED),
-        Transaction.Status.ABORTED)) {
+    if (!ABORTABLE.contains(txn.compareAndSwapStatus(ABORTABLE, Status.ABORTED))) {
       return; // already aborted or committing/committed
     }
     List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
-    transactionsMap.remove(txn.getId(), txn);
+    transactionsMap.remove(txn.getTransactionId(), txn);
     for (Transaction<K, V> t : doomed) {
       abortTransaction(t);
     }

@@ -18,16 +18,18 @@ public class Transaction<K, V> {
   private final Map<K, LockType<K, V>> locksAcquired;
   private final Map<K, V> writeSet;
   private final Map<K, V> readSet;
-  private final long expirationTime;
+  /** expires_at of pseudo.txt, in {@link System#currentTimeMillis()}: set only on a tombstone. */
+  private final Long expiresAtMillis;
   private Status status;
 
-  public Transaction(String transactionId, Status status, long expirationTime) {
+  /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
+  public Transaction(String transactionId, Status status, Long expiresAtMillis) {
     this.transactionId = transactionId;
     this.locksAcquired = new HashMap<>();
     this.status = status;
     this.writeSet = new HashMap<>();
     this.readSet = new HashMap<>();
-    this.expirationTime = expirationTime + System.currentTimeMillis();
+    this.expiresAtMillis = expiresAtMillis;
   }
 
   public String getTransactionId() {
@@ -78,8 +80,9 @@ public class Transaction<K, V> {
     return readSet;
   }
 
-  public long getExpirationTime() {
-    return expirationTime;
+  /** A tombstone past its expires_at (pseudo.txt gc_tombstones()); always false for a live txn. */
+  public boolean isExpiredTombstone(long nowMillis) {
+    return expiresAtMillis != null && nowMillis >= expiresAtMillis;
   }
 
   public void addToWriteSet(K key, V value) {
@@ -96,25 +99,21 @@ public class Transaction<K, V> {
     }
   }
 
-  public String getId() {
-    return transactionId;
-  }
-
   /**
    * CAS_returning of pseudo.txt: moves to {@code to} only if the current status is in {@code from}.
    * Returns the status before the call; the CAS succeeded iff {@code from} contains it. After a
    * successful CAS, call {@link LocksMap#statusChanged} so that waiters re-check.
    */
-  public synchronized boolean compareAndSwapStatus(Set<Status> from, Status to) {
+  public synchronized Status compareAndSwapStatus(Set<Status> from, Status to) {
     Status before = status;
     if (from.contains(before)) {
       status = to;
     }
-    return from.contains(before);
+    return before;
   }
 
   public boolean compareAndSwapStatus(Status from, Status to) {
-    return compareAndSwapStatus(EnumSet.of(from), to);
+    return compareAndSwapStatus(EnumSet.of(from), to) == from;
   }
 
   public static enum Status {

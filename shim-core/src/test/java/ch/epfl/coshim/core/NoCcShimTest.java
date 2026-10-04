@@ -20,7 +20,7 @@ class NoCcShimTest {
 
     @Test
     void requestsThenPrepareCommitApplyBufferedWritesOnlyAtCommit() {
-        assertTrue(shim.start("t1"));
+        assertEquals(Outcome.SUCCEEDED, shim.start("t1"));
         shim.put("t1", "x", "1");
         assertEquals("1", shim.get("t1", "x"), "reads its own buffered write");
         assertEquals(Outcome.SUCCEEDED, shim.end("t1"));
@@ -84,7 +84,7 @@ class NoCcShimTest {
     @Test
     void abortBeforeStartLeavesATombstoneThatRefusesTheStart() {
         shim.abort("t1");   // the coordinator rolled the branch back before its start arrived
-        assertFalse(shim.start("t1"));
+        assertEquals(Outcome.FAILED, shim.start("t1"));
         assertThrows(TxnAbortedException.class, () -> shim.put("t1", "x", "1"));
         assertEquals(Outcome.FAILED, shim.end("t1"));
         assertEquals(Vote.NO, shim.prepare("t1"));
@@ -104,13 +104,13 @@ class NoCcShimTest {
         NoCcShim<String, String> expiring = new NoCcShim<>(store, Duration.ZERO);
         expiring.abort("t1");
         assertEquals(0, expiring.size(), "expired right away with a zero TTL");
-        assertTrue(expiring.start("t1"), "the documented caveat: a start after expiry is accepted");
+        assertEquals(Outcome.SUCCEEDED, expiring.start("t1"), "the documented caveat: a start after expiry is accepted");
     }
 
     @Test
     void startIsOncePerIdAndPrepareBeforeEndVotesNo() {
         shim.start("t1");
-        assertFalse(shim.start("t1"));
+        assertEquals(Outcome.FAILED, shim.start("t1"));
         assertEquals(Vote.NO, shim.prepare("t1"));
     }
 }
