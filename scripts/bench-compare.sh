@@ -33,8 +33,8 @@ done
 
 echo "results: $csv"
 awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i }
-         { printf "%-6s %-15s %10s %11s %9s %9s %9s %15s %20s %9s\n",
-                  $col["label"], $col["shim"], $col["tps"], $col["abort_rate"], $col["mean_us"], $col["p50_us"],
-                  $col["p99_us"],
+         { printf "%-6s %-15s %10s %11s %9s %9s %9s %9s %15s %20s %9s\n",
+                  $col["label"], $col["shim"], $col["tps"], $col["abort_rate"], $col["timed_out"], $col["mean_us"],
+                  $col["p50_us"], $col["p99_us"],
                   $col["aborts_cascade"], $col["aborts_lock_timeout"], $col["audit_ok"] }' "$csv"
 exit "$status"

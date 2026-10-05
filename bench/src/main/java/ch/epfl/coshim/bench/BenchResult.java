@@ -66,10 +66,12 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
     public String summary() {
         StringBuilder sb = new StringBuilder();
         sb.append(String.format(Locale.ROOT, "[%s] threads=%d tableSize=%d branches=%d reads=%d writes=%d skew=%.2f "
-                        + "shimB=%d%% rmw=%b commitDelay=%dms lockTimeout=%dms measure=%ds%n",
+                        + "shimB=%d%% rmw=%b commitDelay=%dms lockTimeout=%dms txnTimeout=%dms branches %s "
+                        + "measure=%ds%n",
                 config.shim(), config.threads(), config.tableSize(), config.branches(), config.reads(), config.writes(),
                 config.skewness(), config.shimBPercent(), config.rmw(), config.commitDelay().toMillis(),
-                config.lockTimeout().toMillis(), config.measure().toSeconds()));
+                config.lockTimeout().toMillis(), config.txnTimeout().toMillis(),
+                config.parallelBranches() ? "in parallel" : "in order", config.measure().toSeconds()));
         sb.append(String.format(Locale.ROOT, "  committed: %d (%.1f txn/s)   rolled back: %d (+%d by txn timeout), "
                         + "abort rate %.1f%%%n", committed, tps(), aborted, timedOut, 100 * abortRate()));
         sb.append(String.format(Locale.ROOT, "  commit latency: mean %d us, p50 %d us, p99 %d us, max %d us%n",
@@ -87,7 +89,8 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
 
     public static String csvHeader() {
         return Stream.concat(Stream.of("label", "shim", "threads", "table_size", "branches", "reads", "writes", "skew",
-                        "shim_b_percent", "rmw", "commit_delay_ms", "lock_timeout_ms", "measure_s", "committed", "tps",
+                        "shim_b_percent", "rmw", "commit_delay_ms", "lock_timeout_ms", "txn_timeout_ms",
+                        "parallel_branches", "measure_s", "committed", "tps",
                         "aborted", "timed_out", "abort_rate", "mean_us", "p50_us", "p99_us"),
                 Stream.concat(Stream.of(AbortCause.values()).map(c -> "aborts_" + c.name().toLowerCase(Locale.ROOT)),
                         Stream.of("audit_ok")))
@@ -98,6 +101,7 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
         return Stream.concat(Stream.of(label, config.shim(), config.threads(), config.tableSize(), config.branches(),
                                 config.reads(), config.writes(), config.skewness(), config.shimBPercent(), config.rmw(),
                                 config.commitDelay().toMillis(), config.lockTimeout().toMillis(),
+                                config.txnTimeout().toMillis(), config.parallelBranches(),
                                 config.measure().toSeconds(), committed, String.format(Locale.ROOT, "%.1f", tps()),
                                 aborted, timedOut, String.format(Locale.ROOT, "%.4f", abortRate()),
                                 meanLatencyUs(), latencyPercentileUs(50), latencyPercentileUs(99)),

@@ -19,9 +19,13 @@ import org.junit.jupiter.api.Test;
 class MicroBenchTest {
 
     /** 20 hot keys per table, 8 workers, every txn writes 8 of them. */
-    private static BenchConfig contended(String shim) {
+    private static BenchConfig contended(String shim, boolean parallelBranches) {
         return new BenchConfig(shim, 8, 200, 2, 1, 2, 0.9, 50, true, Duration.ZERO, Duration.ofMillis(1500),
-                Duration.ofMillis(1), Duration.ofMillis(200), Duration.ofSeconds(2));
+                Duration.ofMillis(1), Duration.ofMillis(200), Duration.ofMillis(500), parallelBranches);
+    }
+
+    private static BenchConfig contended(String shim) {
+        return contended(shim, false);
     }
 
     @ParameterizedTest
@@ -38,12 +42,23 @@ class MicroBenchTest {
         }
     }
 
+    /** Branches at the same time: cross-shim prepare cycles appear, the txn timeout must clear them. */
+    @ParameterizedTest
+    @ValueSource(strings = {"speculative", "nonspeculative"})
+    void parallelBranchesRunAndKeepTheAudit(String shim) throws Exception {
+        BenchResult result = new MicroBench(contended(shim, true)).run();
+
+        assertNull(result.warning(), result.summary());
+        assertTrue(result.committed() > 0, result.summary());
+        assertEquals(result.auditExpected(), result.auditActual(), result.summary());
+    }
+
     @Test
     void blindWritesHaveNoAuditButRun() throws Exception {
         BenchConfig c = contended("speculative");
         BenchConfig blind = new BenchConfig(c.shim(), c.threads(), c.tableSize(), c.branches(), c.reads(), c.writes(),
                 c.skewness(), c.shimBPercent(), false, c.warmup(), Duration.ofMillis(500), c.commitDelay(),
-                c.lockTimeout(), c.txnTimeout());
+                c.lockTimeout(), c.txnTimeout(), false);
         BenchResult result = new MicroBench(blind).run();
         assertNull(result.warning(), result.summary());
         assertTrue(result.committed() > 0);

@@ -19,6 +19,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadLocalRandom;
@@ -48,7 +52,13 @@ import java.util.concurrent.locks.LockSupport;
  *       same plan, as Acta does.
  * </ol>
  *
- * A global transaction timeout plays the TC's: it rolls a stuck attempt back (e.g. a prepare that
+ * With {@code parallelBranches}, step 1 runs every branch at the same time instead (each still
+ * start, ops, end, prepare), and the first failure rolls the whole transaction back. Branches then
+ * no longer take the shims in the same order in every transaction, so two transactions can wait on
+ * each other's commit in prepare on different shims (a cross-shim cycle); only the global timeout
+ * below breaks it, and those attempts are counted as timed out.
+ *
+ * <p>A global transaction timeout plays the TC's: it rolls a stuck attempt back (e.g. a prepare that
  * waits forever on a cross-shim cycle). Commit and timeout race on one state CAS, so a global
  * transaction is either committed on every branch or rolled back on every branch.
  *
@@ -72,6 +82,12 @@ public final class MicroBench {
     private final List<SpeculativeCoShim<TableKey<Integer>, Integer>> shims = new ArrayList<>();
     private final ScheduledThreadPoolExecutor timeouts = new ScheduledThreadPoolExecutor(1, r -> {
         Thread t = new Thread(r, "bench-txn-timeout");
+        t.setDaemon(true);
+        return t;
+    });
+    /** --parallel-branches only: runs the branches of each attempt; grows to threads × branches. */
+    private final ExecutorService branchPool = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "bench-branch");
         t.setDaemon(true);
         return t;
     });
@@ -122,6 +138,7 @@ public final class MicroBench {
             }
         }
         timeouts.shutdownNow();
+        branchPool.shutdownNow();
         for (Worker w : workers) {
             if (w.error != null) {
                 warning = "worker failed: " + w.error;
@@ -245,33 +262,16 @@ public final class MicroBench {
         ScheduledFuture<?> timer =
                 timeouts.schedule(g::timeout, config.txnTimeout().toMillis(), TimeUnit.MILLISECONDS);
         try {
-            for (int i = 0; i < plan.size(); i++) {
-                Branch b = plan.get(i);
-                CoShim<TableKey<Integer>, Integer> shim = shims.get(b.shim());
-                String branchId = g.id + "-" + i;
-                g.register(shim, branchId);
-                if (g.state.get() != ACTIVE) {
-                    return g.rollback();
+            if (config.parallelBranches()) {
+                Attempt failed = phaseOneInParallel(g, plan);
+                if (failed != null) {
+                    return failed;
                 }
-                if (shim.start(branchId) != Outcome.SUCCEEDED) {
-                    return g.rollback();
-                }
-                for (int k : b.readKeys()) {
-                    shim.get(branchId, new TableKey<>(b.table(), k));
-                }
-                for (int k : b.writeKeys()) {
-                    TableKey<Integer> key = new TableKey<>(b.table(), k);
-                    int value;
-                    if (config.rmw()) {
-                        Integer old = shim.get(branchId, key);
-                        value = (old == null ? 0 : old) + 1;
-                    } else {
-                        value = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
+            } else {
+                for (int i = 0; i < plan.size(); i++) {
+                    if (!runBranch(g, plan.get(i), i)) {
+                        return g.rollback();
                     }
-                    shim.put(branchId, key, value);
-                }
-                if (shim.end(branchId) != Outcome.SUCCEEDED || shim.prepare(branchId) != Vote.YES) {
-                    return g.rollback();
                 }
             }
             if (!g.state.compareAndSet(ACTIVE, COMMITTING)) {
@@ -289,6 +289,75 @@ public final class MicroBench {
         } finally {
             timer.cancel(false);
         }
+    }
+
+    /**
+     * Phase 1 of one branch: register (like Seata's branchRegister), start, the gets/puts, end, and
+     * prepare right away.
+     *
+     * @return true iff the branch voted YES
+     * @throws TxnAbortedException if the shim aborted the branch during a get/put
+     */
+    private boolean runBranch(GlobalTxn g, Branch b, int index) {
+        CoShim<TableKey<Integer>, Integer> shim = shims.get(b.shim());
+        String branchId = g.id + "-" + index;
+        g.register(shim, branchId);
+        if (g.state.get() != ACTIVE || shim.start(branchId) != Outcome.SUCCEEDED) {
+            return false;
+        }
+        for (int k : b.readKeys()) {
+            shim.get(branchId, new TableKey<>(b.table(), k));
+        }
+        for (int k : b.writeKeys()) {
+            TableKey<Integer> key = new TableKey<>(b.table(), k);
+            int value;
+            if (config.rmw()) {
+                Integer old = shim.get(branchId, key);
+                value = (old == null ? 0 : old) + 1;
+            } else {
+                value = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
+            }
+            shim.put(branchId, key, value);
+        }
+        return shim.end(branchId) == Outcome.SUCCEEDED && shim.prepare(branchId) == Vote.YES;
+    }
+
+    /**
+     * Phase 1 of every branch at the same time (--parallel-branches). On the first failure the
+     * coordinator rolls the whole transaction back at once, which also releases a sibling branch
+     * blocked in prepare. Returns only when every branch is done, so no branch outlives its attempt.
+     *
+     * @return null if every branch voted YES, else the attempt's outcome (rolled back)
+     */
+    private Attempt phaseOneInParallel(GlobalTxn g, List<Branch> plan) {
+        ExecutorCompletionService<Boolean> done = new ExecutorCompletionService<>(branchPool);
+        for (int i = 0; i < plan.size(); i++) {
+            int index = i;
+            done.submit(() -> runBranch(g, plan.get(index), index));
+        }
+        Attempt outcome = null;
+        RuntimeException error = null;
+        for (int i = 0; i < plan.size(); i++) {
+            boolean yes;
+            try {
+                yes = done.take().get();
+            } catch (ExecutionException e) {
+                yes = false;
+                if (!(e.getCause() instanceof TxnAbortedException) && error == null) {
+                    error = e.getCause() instanceof RuntimeException r ? r : new IllegalStateException(e.getCause());
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                yes = false;
+            }
+            if (!yes && outcome == null) {
+                outcome = g.rollback();
+            }
+        }
+        if (error != null) {
+            throw error;
+        }
+        return outcome;
     }
 
     private final class Worker implements Runnable {
@@ -340,6 +409,7 @@ public final class MicroBench {
      * {@code java ... MicroBench [--shim speculative|nonspeculative] [--threads N] [--table-size N]
      * [--branches N] [--reads N] [--writes N] [--skew X] [--shim-b-percent P] [--rmw true|false]
      * [--warmup-s S] [--measure-s S] [--commit-delay-ms MS] [--lock-timeout-ms MS] [--txn-timeout-ms MS]
+     * [--parallel-branches true|false]
      * [--csv FILE] [--label TEXT]}. The run is appended to {@code FILE} (default
      * {@code bench-results/<timestamp>-<shim>.csv} in the working directory). Exit code 0 iff the run had
      * no warning and the audit passed.

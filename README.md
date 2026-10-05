@@ -190,10 +190,17 @@ run ends with an audit (sum of all values = committed txns × branches × writes
 ```sh
 scripts/bench-compare.sh                                   # the simple test, both variants
 scripts/bench-compare.sh --reps 3 --skew 0.99 --threads 100 --lock-timeout-ms 100
+scripts/bench-compare.sh --parallel-branches true --txn-timeout-ms 200 --lock-timeout-ms 100
 ```
 
+`--parallel-branches true` runs the branches of each global transaction at the same time instead of
+in order. Transactions then take the shims in different orders, so two of them can wait on each
+other's commit in `prepare` on different shims; the shim has no timeout there, only the global
+`--txn-timeout-ms` breaks such a cycle (column `timed_out`). Lower it when using this mode.
+
 Options: `--threads --table-size --branches --reads --writes --skew --shim-b-percent --rmw
---warmup-s --measure-s --commit-delay-ms --lock-timeout-ms --txn-timeout-ms`. Every run is appended
+--warmup-s --measure-s --commit-delay-ms --lock-timeout-ms --txn-timeout-ms --parallel-branches`.
+Every run is appended
 to `bench-results/<timestamp>.csv` (or `CSV=...`); the script prints a comparison table and exits 1
 if a run warned or failed its audit. `MicroBenchTest` runs both variants briefly under heavy
 contention as part of `mvn verify`.

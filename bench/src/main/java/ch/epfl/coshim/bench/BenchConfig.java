@@ -21,14 +21,17 @@ import java.time.Duration;
  * @param commitDelay          emulated TM → TC → RM round trip between the last YES vote and phase 2
  * @param lockTimeout          the shims' lock_timeout
  * @param txnTimeout           global transaction timeout, as Seata's TC: rolls a stuck txn back
+ * @param parallelBranches     run the branches of a global transaction at the same time (each still
+ *                             start, ops, end, prepare) instead of one after the other; exposes
+ *                             cross-shim lock cycles, which only the txn timeout breaks
  */
 public record BenchConfig(String shim, int threads, int tableSize, int branches, int reads, int writes,
         double skewness, int shimBPercent, boolean rmw, Duration warmup, Duration measure, Duration commitDelay,
-        Duration lockTimeout, Duration txnTimeout) {
+        Duration lockTimeout, Duration txnTimeout, boolean parallelBranches) {
 
     public static BenchConfig defaults() {
         return new BenchConfig("speculative", 50, 10_000, 2, 2, 2, 0.9, 50, true, Duration.ofSeconds(10),
-                Duration.ofSeconds(30), Duration.ofMillis(1), Duration.ofSeconds(1), Duration.ofSeconds(10));
+                Duration.ofSeconds(30), Duration.ofMillis(1), Duration.ofSeconds(1), Duration.ofSeconds(10), false);
     }
 
     public boolean speculative() {
@@ -86,6 +89,7 @@ public record BenchConfig(String shim, int threads, int tableSize, int branches,
         Duration commitDelay = c.commitDelay;
         Duration lockTimeout = c.lockTimeout;
         Duration txnTimeout = c.txnTimeout;
+        boolean parallelBranches = c.parallelBranches;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -111,11 +115,12 @@ public record BenchConfig(String shim, int threads, int tableSize, int branches,
                 case "--commit-delay-ms" -> commitDelay = Duration.ofMillis(Long.parseLong(v));
                 case "--lock-timeout-ms" -> lockTimeout = Duration.ofMillis(Long.parseLong(v));
                 case "--txn-timeout-ms" -> txnTimeout = Duration.ofMillis(Long.parseLong(v));
+                case "--parallel-branches" -> parallelBranches = Boolean.parseBoolean(v);
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(shim, threads, tableSize, branches, reads, writes, skewness, shimBPercent, rmw, warmup,
-                measure, commitDelay, lockTimeout, txnTimeout).validate();
+                measure, commitDelay, lockTimeout, txnTimeout, parallelBranches).validate();
     }
 
     private static Duration seconds(String v) {
