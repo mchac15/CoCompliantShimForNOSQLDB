@@ -1,25 +1,21 @@
 package ch.epfl.coshim.bench;
 
-import ch.epfl.coshim.jdbc.CoShimDataSource;
-import ch.epfl.coshim.jdbc.KvSession;
-import ch.epfl.coshim.net.Codec;
-import ch.epfl.coshim.net.RemoteCoShim;
-import ch.epfl.coshim.net.TableKeyCodec;
-import ch.epfl.coshim.seata.DataSourceProxyCoShim;
-import ch.epfl.coshim.store.TableKey;
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.SQLTransactionRollbackException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
@@ -28,7 +24,8 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
-import javax.sql.DataSource;
+import javax.transaction.xa.XAException;
+import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.core.context.RootContext;
 import org.apache.seata.core.exception.TransactionException;
 import org.apache.seata.core.exception.TransactionExceptionCode;
@@ -42,12 +39,17 @@ import org.apache.seata.tm.api.GlobalTransactionContext;
  * Micro benchmark of the shim through the real path: a Seata TC decides every global transaction,
  * and the shims run in shim nodes ({@code CoShimNode}) reached over TCP. This JVM is the
  * application, like one of Acta's services: a Seata TM (begin / commit / rollback) and RM (one
- * {@link DataSourceProxyCoShim} per shim database).
+ * Seata XA data source per participant).
+ *
+ * <p>A participant is a shim database ({@link CoShimParticipant}) or, to compare with Sonata, a
+ * MySQL/PostgreSQL database behind Seata's stock XA proxy ({@link SqlParticipant}, Sonata on with
+ * {@code sonata}). Everything else, the TC included, is the same for both, so the runs differ only
+ * in what is behind the {@code XAResource}.
  *
  * <p>Workload: Acta's Micro (scripts in ../acta-server). Each worker runs global transactions in a
  * closed loop. A global transaction has {@code branches} branches; branch i reads {@code reads}
- * keys then writes {@code writes} other keys of table {@code micro-i}, on one of the shims chosen
- * at random. Hot and cold keys follow Acta's skew rule.
+ * keys then writes {@code writes} other keys of table {@code micro-i}, on one of the participants
+ * chosen at random. Hot and cold keys follow Acta's skew rule.
  *
  * <p>One attempt:
  *
@@ -63,12 +65,14 @@ import org.apache.seata.tm.api.GlobalTransactionContext;
  *       the branches back itself (the shims receive abort over their connections).
  * </ol>
  *
- * <p>With {@code rmw}, every write is {@code v := get(k) + 1} on keys that start empty, so after
- * the run the sum of all values, read back through the shims, must equal committed txns × branches
- * × writes (lost updates, partial commits). Attempts whose outcome is unknown (the TM got no clear
- * answer to its commit) widen the accepted range.
+ * <p>With {@code rmw}, every write is {@code v := get(k) + 1} on keys that start at 0, so after
+ * the run the sum of all values, read back from the participants, must equal committed txns ×
+ * branches × writes (lost updates, partial commits). Attempts whose outcome is unknown (the TM got
+ * no clear answer to its commit) widen the accepted range.
  *
- * <p>The shims' own counters (commits, aborts by cause) are logged by the nodes.
+ * <p>Failed branches in the measurement window are counted by cause (deadlock, lock timeout,
+ * serialization failure, XA rollback / NO vote, ...); the shims' own counters (commits, aborts by
+ * cause) are logged by the nodes.
  */
 public final class MicroBench implements AutoCloseable {
 
@@ -83,8 +87,7 @@ public final class MicroBench implements AutoCloseable {
     private static String seataTc;
 
     private final BenchConfig config;
-    private final List<RemoteCoShim<TableKey<String>, String>> remotes = new ArrayList<>();
-    private final List<DataSource> dataSources = new ArrayList<>();
+    private final List<Participant> participants = new ArrayList<>();
     /** --parallel-branches only: runs the branches of each attempt; grows to threads × branches. */
     private final ExecutorService branchPool = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "bench-branch");
@@ -94,24 +97,31 @@ public final class MicroBench implements AutoCloseable {
     private final LongAdder committedTotal = new LongAdder();
     private final LongAdder unknownTotal = new LongAdder();
     private final AtomicBoolean stop = new AtomicBoolean();
+    /** Failed branches in the measurement window, by cause. */
+    private final Map<String, LongAdder> branchFailures = new ConcurrentHashMap<>();
+    private volatile long measureStart = Long.MAX_VALUE;
+    private volatile long measureEnd = Long.MIN_VALUE;
 
     /**
-     * Connects to the TC (once per JVM) and to every shim database.
+     * Connects to the TC (once per JVM) and to every participant, and sets their tables up (SQL
+     * databases: micro tables reset to 0, plus Sonata's dummy table when Sonata is on).
      *
-     * @param token the shim nodes' shared secret (COSHIM_TOKEN)
+     * @param token the shim nodes' shared secret (COSHIM_TOKEN); only needed for shim databases
      */
     public MicroBench(BenchConfig config, String token) {
         this.config = config.validate();
+        // before Seata's XA proxy class is loaded: it reads the switch once, into a static final
+        System.setProperty(ConfigurationKeys.SONATA_ENABLE_GLOBAL_SERIALIZABILITY, String.valueOf(config.sonata()));
         initSeata(config.tc());
-        for (String shim : config.shims()) {
-            int colon = shim.indexOf(':');
-            int slash = shim.indexOf('/');
-            InetSocketAddress node = new InetSocketAddress(shim.substring(0, colon),
-                    Integer.parseInt(shim.substring(colon + 1, slash)));
-            RemoteCoShim<TableKey<String>, String> remote = new RemoteCoShim<>(node, shim.substring(slash + 1), token,
-                    new TableKeyCodec<>(Codec.UTF8), Codec.UTF8).verify();
-            remotes.add(remote);
-            dataSources.add(new DataSourceProxyCoShim(new CoShimDataSource<>(shim, remote)));
+        try {
+            for (String spec : config.shims()) {
+                Participant p = Participant.connect(spec, token, config);
+                participants.add(p);
+                p.setUp(config.branches(), config.tableSize());
+            }
+        } catch (SQLException | RuntimeException e) {
+            close();
+            throw e instanceof RuntimeException r ? r : new IllegalStateException("setting the databases up failed", e);
         }
     }
 
@@ -133,6 +143,8 @@ public final class MicroBench implements AutoCloseable {
         long start = System.nanoTime();
         long measureStart = start + config.warmup().toNanos();
         long measureEnd = measureStart + config.measure().toNanos();
+        this.measureStart = measureStart;
+        this.measureEnd = measureEnd;
 
         List<Worker> workers = new ArrayList<>();
         List<Thread> threads = new ArrayList<>();
@@ -189,30 +201,26 @@ public final class MicroBench implements AutoCloseable {
             expectedMax = (committedTotal.sum() + unknownTotal.sum()) * perTxn;
             actual = storedSum(expectedMin);
         }
+        Map<String, Long> failures = new TreeMap<>();
+        branchFailures.forEach((cause, n) -> failures.put(cause, n.sum()));
         return new BenchResult(config, committed, aborted, timedOut, unknown, latencies, expectedMin, expectedMax,
-                actual, warning);
+                actual, failures, warning);
     }
 
     /**
-     * The sum of every value of every micro table on every shim, read through the shims (local
-     * transactions, outside any global one). Read again a few times while it is below
-     * {@code expectedMin}, in case the TC still delivers phase-2 commits.
+     * The sum of every value of every micro table on every participant (local transactions, outside
+     * any global one). Read again a few times while it is below {@code expectedMin}, in case the TC
+     * still delivers phase-2 commits.
      */
     private long storedSum(long expectedMin) throws InterruptedException {
         long sum = 0;
         for (int round = 0; round < 10; round++) {
             sum = 0;
-            for (DataSource ds : dataSources) {
-                try (Connection c = ds.getConnection()) {
-                    KvSession<String, String> kv = KvSession.from(c);
-                    for (int b = 0; b < config.branches(); b++) {
-                        for (int k = 0; k < config.tableSize(); k++) {
-                            String v = kv.get(table(b), String.valueOf(k));
-                            sum += v == null ? 0 : Long.parseLong(v);
-                        }
-                    }
+            for (Participant p : participants) {
+                try {
+                    sum += p.sum(config.branches(), config.tableSize());
                 } catch (SQLException e) {
-                    throw new IllegalStateException("audit read failed", e);
+                    throw new IllegalStateException("audit read failed on " + p.spec(), e);
                 }
             }
             if (sum >= expectedMin) {
@@ -223,12 +231,12 @@ public final class MicroBench implements AutoCloseable {
         return sum;
     }
 
-    private static String table(int branch) {
+    static String table(int branch) {
         return "micro-" + branch;
     }
 
     private List<Branch> nextPlan() {
-        return randomPlan(config, dataSources.size());
+        return randomPlan(config, participants.size());
     }
 
     /**
@@ -355,38 +363,33 @@ public final class MicroBench implements AutoCloseable {
     }
 
     /**
-     * Phase 1 of one branch over an XA connection to its shim: register + start, the gets/puts,
-     * end + prepare.
+     * Phase 1 of one branch over an XA connection to its participant: register + start, the
+     * reads/writes, end + prepare (with Sonata, its dummy write comes right before prepare).
      *
      * @param bindXid true when running on a pool thread, which must join the global transaction
-     * @return true iff the branch voted YES; false if the shim aborted it, voted NO, or the TC
-     *     refused the branch (e.g. the txn already timed out)
+     * @return true iff the branch voted YES; false if the participant aborted it, voted NO, or the
+     *     TC refused the branch (e.g. the txn already timed out)
      */
     private boolean runBranch(String xid, Branch b, boolean bindXid) {
         if (bindXid) {
             RootContext.bind(xid);
         }
-        try (Connection c = dataSources.get(b.shim()).getConnection()) {
-            c.setAutoCommit(false);   // branchRegister with the TC + xa start on the shim
+        Participant p = participants.get(b.shim());
+        try (Connection c = p.dataSource().getConnection()) {
+            c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
             try {
-                KvSession<String, String> kv = KvSession.from(c);
                 for (int k : b.readKeys()) {
-                    kv.get(b.table(), String.valueOf(k));
+                    p.get(c, b.table(), k);
                 }
                 for (int k : b.writeKeys()) {
-                    String key = String.valueOf(k);
-                    long value;
-                    if (config.rmw()) {
-                        String old = kv.get(b.table(), key);
-                        value = (old == null ? 0 : Long.parseLong(old)) + 1;
-                    } else {
-                        value = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
-                    }
-                    kv.put(b.table(), key, String.valueOf(value));
+                    long value = config.rmw() ? p.get(c, b.table(), k) + 1
+                            : ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+                    p.put(c, b.table(), k, value);
                 }
-                c.commit();   // xa end + xa prepare: the shim votes
+                c.commit();   // xa end + xa prepare: the participant votes
                 return true;
             } catch (SQLException e) {
+                countFailure(e);
                 try {
                     c.rollback();
                 } catch (SQLException ignored) {
@@ -395,12 +398,67 @@ public final class MicroBench implements AutoCloseable {
                 return false;
             }
         } catch (SQLException e) {
-            return false;   // the branch could not be registered or started
+            countFailure(e);
+            return false;   // the branch could not be registered, started or prepared
         } finally {
             if (bindXid) {
                 RootContext.unbind();
             }
         }
+    }
+
+    private void countFailure(SQLException e) {
+        long now = System.nanoTime();
+        if (now >= measureStart && now < measureEnd) {
+            branchFailures.computeIfAbsent(failureCause(e), c -> new LongAdder()).increment();
+        }
+    }
+
+    /**
+     * Why a branch failed, from the first recognisable exception in the cause chain: MySQL
+     * (deadlock 1213, lock wait timeout 1205), PostgreSQL (40P01, 55P03, serialization failure 40001,
+     * also raised by Sonata's SSI dummy write), XA rollback codes (the shim's NO vote), the shim's
+     * aborts during execution, and the TC refusing the branch.
+     */
+    static String failureCause(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof SQLException s) {
+                if (s.getErrorCode() == 1213 || "40P01".equals(s.getSQLState())) {
+                    return "deadlock";
+                }
+                if (s.getErrorCode() == 1205 || "55P03".equals(s.getSQLState())) {
+                    return "lock_timeout";
+                }
+                if ("40001".equals(s.getSQLState())) {
+                    return "serialization";
+                }
+                if (s instanceof SQLTransactionRollbackException && s.getSQLState() == null) {
+                    return "shim_abort";   // the shim aborted the branch while it executed
+                }
+            }
+            if (t instanceof TransactionException) {
+                return "tc_refused";   // branch register / report refused, e.g. the txn already timed out
+            }
+            if (t instanceof XAException x) {
+                if (x.errorCode == XAException.XA_RBDEADLOCK) {
+                    return "deadlock";
+                }
+                if (x.errorCode == XAException.XA_RBTIMEOUT) {
+                    return "lock_timeout";
+                }
+                if (x.errorCode >= XAException.XA_RBBASE && x.errorCode <= XAException.XA_RBEND) {
+                    return "xa_rollback";
+                }
+                if (x.getMessage() != null && x.getMessage().contains("serialization failure")) {
+                    return "serialization";
+                }
+            }
+        }
+        Throwable root = e;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        return "other:" + root.getClass().getSimpleName();
     }
 
     private final class Worker implements Runnable {
@@ -458,15 +516,17 @@ public final class MicroBench implements AutoCloseable {
     @Override
     public void close() {
         branchPool.shutdownNow();
-        remotes.forEach(RemoteCoShim::close);
+        participants.forEach(Participant::close);
     }
 
     /**
-     * {@code COSHIM_TOKEN=... java ... MicroBench [--variant LABEL] [--shims host:port/db,...]
+     * {@code COSHIM_TOKEN=... java ... MicroBench [--variant LABEL] [--shims PARTICIPANT,...]
      * [--tc host:port] [--threads N] [--table-size N] [--branches N] [--reads N] [--writes N] [--skew X]
      * [--rmw true|false] [--warmup-s S] [--measure-s S] [--txn-timeout-ms MS]
-     * [--parallel-branches true|false] [--csv FILE] [--label TEXT]}. Needs a running Seata TC and the
-     * shim nodes ({@code CoShimNode}). The run is appended to {@code FILE} (default
+     * [--parallel-branches true|false] [--sonata true|false] [--csv FILE] [--label TEXT]}, where a
+     * participant is a shim database {@code host:port/db} or {@code jdbc:mysql://...} /
+     * {@code jdbc:postgresql://...}. Needs a running Seata TC and the shim nodes ({@code CoShimNode})
+     * or databases; COSHIM_TOKEN only with shim databases. The run is appended to {@code FILE} (default
      * {@code bench-results/<timestamp>-<variant>.csv}). Exit code 0 iff the run had no warning and the
      * audit passed.
      */
@@ -480,7 +540,7 @@ public final class MicroBench implements AutoCloseable {
             return;
         }
         String token = System.getenv("COSHIM_TOKEN");
-        if (token == null || token.isEmpty()) {
+        if ((token == null || token.isEmpty()) && config.shims().stream().anyMatch(Participant::isCoShim)) {
             System.err.println("error: set COSHIM_TOKEN to the shim nodes' token");
             System.exit(2);
             return;

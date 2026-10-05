@@ -2,6 +2,7 @@ package ch.epfl.coshim.bench;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -18,11 +19,14 @@ import java.util.stream.Stream;
  *                          commit), sorted ascending
  * @param auditExpectedMin  rmw only: committed txns (whole run) × branches × writes, else -1
  * @param auditExpectedMax  rmw only: the same counting the unknown outcomes as committed, else -1
- * @param auditActual       rmw only: sum of every value on every shim, else -1
+ * @param auditActual       rmw only: sum of every value on every participant, else -1
+ * @param branchFailures    failed branches in the window by cause (deadlock, lock_timeout,
+ *                          serialization, xa_rollback, other:...); a TC timeout fails none
  * @param warning           null, or why the run is not trustworthy (worker error, stuck worker)
  */
 public record BenchResult(BenchConfig config, long committed, long aborted, long timedOut, long unknown,
-        List<Long> commitLatencyUs, long auditExpectedMin, long auditExpectedMax, long auditActual, String warning) {
+        List<Long> commitLatencyUs, long auditExpectedMin, long auditExpectedMax, long auditActual,
+        Map<String, Long> branchFailures, String warning) {
 
     public double tps() {
         return committed * 1000.0 / config.measure().toMillis();
@@ -77,7 +81,9 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                 : (auditOk() ? "OK" : "FAILED") + " (expected " + auditExpectedMin
                         + (auditExpectedMax > auditExpectedMin ? ".." + auditExpectedMax : "")
                         + ", actual " + auditActual + ")");
-        sb.append(System.lineSeparator()).append("  shim abort causes: see the shim nodes' logs");
+        sb.append(System.lineSeparator()).append("  failed branches: ")
+                .append(branchFailures.isEmpty() ? "none" : failuresText(", "))
+                .append(" (shim abort causes: see the shim nodes' logs)");
         if (warning != null) {
             sb.append(System.lineSeparator()).append("  WARNING: ").append(warning);
         }
@@ -87,7 +93,8 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
     public static String csvHeader() {
         return Stream.of("label", "variant", "shims", "threads", "table_size", "branches", "reads", "writes", "skew",
                         "rmw", "txn_timeout_ms", "parallel_branches", "measure_s", "committed", "tps", "aborted",
-                        "timed_out", "unknown", "abort_rate", "mean_us", "p50_us", "p99_us", "audit_ok")
+                        "timed_out", "unknown", "abort_rate", "mean_us", "p50_us", "p99_us", "audit_ok",
+                        "branch_failures")
                 .collect(Collectors.joining(","));
     }
 
@@ -97,8 +104,13 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         config.txnTimeout().toMillis(), config.parallelBranches(), config.measure().toSeconds(),
                         committed, String.format(Locale.ROOT, "%.1f", tps()), aborted, timedOut, unknown,
                         String.format(Locale.ROOT, "%.4f", abortRate()), meanLatencyUs(), latencyPercentileUs(50),
-                        latencyPercentileUs(99), audited() ? auditOk() : "n/a")
+                        latencyPercentileUs(99), audited() ? auditOk() : "n/a", failuresText(";"))
                 .map(String::valueOf)
                 .collect(Collectors.joining(","));
+    }
+
+    private String failuresText(String separator) {
+        return branchFailures.entrySet().stream().map(e -> e.getKey() + "=" + e.getValue())
+                .collect(Collectors.joining(separator));
     }
 }
