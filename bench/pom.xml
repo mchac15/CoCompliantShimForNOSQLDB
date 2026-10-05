@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>ch.epfl.coshim</groupId>
+        <artifactId>coshim-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>bench</artifactId>
+    <name>bench</name>
+    <description>Micro benchmark of the shim through a real Seata TC and shim nodes reached over TCP</description>
+
+    <dependencies>
+        <!-- Seata XA data source for the shim (brings coshim-jdbc, seata-rm-datasource, seata-tm, Druid) -->
+        <dependency>
+            <groupId>ch.epfl.coshim</groupId>
+            <artifactId>seata-xa</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- RemoteCoShim (client of the shim nodes), CoShimNode / CoShimServer -->
+        <dependency>
+            <groupId>ch.epfl.coshim</groupId>
+            <artifactId>shim-net</artifactId>
+        </dependency>
+        <!-- the TM/RM <-> TC wire format; the split Seata modules do not bring one (seata-all does) -->
+        <dependency>
+            <groupId>org.apache.seata</groupId>
+            <artifactId>seata-serializer-seata</artifactId>
+            <version>${seata.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+</project>
