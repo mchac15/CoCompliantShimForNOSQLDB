@@ -1,109 +1,132 @@
 package ch.epfl.coshim.bench;
 
-import ch.epfl.coshim.core.CoShim;
-import ch.epfl.coshim.core.Outcome;
-import ch.epfl.coshim.core.ShimStats;
-import ch.epfl.coshim.core.SpeculativeCoShim;
-import ch.epfl.coshim.core.TxnAbortedException;
-import ch.epfl.coshim.core.Vote;
-import ch.epfl.coshim.store.InMemoryKvStore;
+import ch.epfl.coshim.jdbc.CoShimDataSource;
+import ch.epfl.coshim.jdbc.KvSession;
+import ch.epfl.coshim.net.Codec;
+import ch.epfl.coshim.net.RemoteCoShim;
+import ch.epfl.coshim.net.TableKeyCodec;
+import ch.epfl.coshim.seata.DataSourceProxyCoShim;
 import ch.epfl.coshim.store.TableKey;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.LockSupport;
+import javax.sql.DataSource;
+import org.apache.seata.core.context.RootContext;
+import org.apache.seata.core.exception.TransactionException;
+import org.apache.seata.core.exception.TransactionExceptionCode;
+import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.rm.RMClient;
+import org.apache.seata.tm.TMClient;
+import org.apache.seata.tm.api.GlobalTransaction;
+import org.apache.seata.tm.api.GlobalTransactionContext;
 
 /**
- * Standalone Micro benchmark of the shim: Acta's Micro workload (scripts in ../acta-server), run in
- * one JVM against two {@link SpeculativeCoShim}s ("a" and "b", one in-memory store each), with this
- * class playing the application and the 2PC coordinator. Nothing else is in the loop (no Seata, no
- * network), so a speculative run and a non-speculative run differ only in the speculation point.
+ * Micro benchmark of the shim through the real path: a Seata TC decides every global transaction,
+ * and the shims run in shim nodes ({@code CoShimNode}) reached over TCP. This JVM is the
+ * application, like one of Acta's services: a Seata TM (begin / commit / rollback) and RM (one
+ * {@link DataSourceProxyCoShim} per shim database).
  *
- * <p>Each worker runs global transactions in a closed loop. A global transaction has
- * {@code branches} branches; branch i reads {@code reads} keys then writes {@code writes} other keys
- * of table {@code micro-i}, on shim "a" or "b" at random. The coordinator follows Seata's XA mode:
+ * <p>Workload: Acta's Micro (scripts in ../acta-server). Each worker runs global transactions in a
+ * closed loop. A global transaction has {@code branches} branches; branch i reads {@code reads}
+ * keys then writes {@code writes} other keys of table {@code micro-i}, on one of the shims chosen
+ * at random. Hot and cold keys follow Acta's skew rule.
+ *
+ * <p>One attempt:
  *
  * <ol>
- *   <li>per branch, in order: start, the gets/puts, end, then prepare right away (Seata's phase 1
- *       runs xa end + xa prepare when the branch's connection commits);
- *   <li>after the last YES vote, {@code commitDelay} (the TM → TC → RM round trip), then commit on
- *       every branch;
- *   <li>any abort or NO vote rolls every registered branch back; the attempt is retried with the
- *       same plan, as Acta does.
+ *   <li>TM begin with {@code txnTimeout}: the TC creates the XID and starts its timeout;
+ *   <li>per branch: an XA connection to its shim; {@code setAutoCommit(false)} registers the branch
+ *       with the TC and starts it on the shim, the gets/puts go to the shim, {@code commit()} ends
+ *       and prepares it (the shim votes). Branches run in order, or at the same time with
+ *       {@code parallelBranches} (each thread binds the XID);
+ *   <li>all YES: TM commit, the TC sends phase 2 to the RM, which commits each branch on its shim;
+ *       any failure: TM rollback, the TC rolls every branch back on its shim, and the attempt is
+ *       retried with the same plan, as Acta does. If the TC's timeout expires first, the TC rolls
+ *       the branches back itself (the shims receive abort over their connections).
  * </ol>
  *
- * With {@code parallelBranches}, step 1 runs every branch at the same time instead (each still
- * start, ops, end, prepare), and the first failure rolls the whole transaction back. Branches then
- * no longer take the shims in the same order in every transaction, so two transactions can wait on
- * each other's commit in prepare on different shims (a cross-shim cycle); only the global timeout
- * below breaks it, and those attempts are counted as timed out.
+ * <p>With {@code rmw}, every write is {@code v := get(k) + 1} on keys that start empty, so after
+ * the run the sum of all values, read back through the shims, must equal committed txns × branches
+ * × writes (lost updates, partial commits). Attempts whose outcome is unknown (the TM got no clear
+ * answer to its commit) widen the accepted range.
  *
- * <p>A global transaction timeout plays the TC's: it rolls a stuck attempt back (e.g. a prepare that
- * waits forever on a cross-shim cycle). Commit and timeout race on one state CAS, so a global
- * transaction is either committed on every branch or rolled back on every branch.
- *
- * <p>With {@code rmw}, every write is {@code v := get(k) + 1} on keys that start at 0, so after the
- * run the sum of all values must equal committed txns × branches × writes. Any lost update, partial
- * commit or commit of an aborted txn shows up there.
+ * <p>The shims' own counters (commits, aborts by cause) are logged by the nodes.
  */
-public final class MicroBench {
+public final class MicroBench implements AutoCloseable {
 
-    private static final int ACTIVE = 0;
-    private static final int COMMITTING = 1;
-    private static final int ROLLED_BACK = 2;
+    static final String APPLICATION_ID = "coshim-bench";
+    static final String TX_SERVICE_GROUP = "default_tx_group";
 
     /** One branch of a plan: which shim, which table, which keys. */
     record Branch(int shim, String table, List<Integer> readKeys, List<Integer> writeKeys) {}
 
-    private enum Attempt { COMMITTED, ABORTED, TIMED_OUT }
+    enum Attempt { COMMITTED, ABORTED, TIMED_OUT, UNKNOWN }
+
+    private static String seataTc;
 
     private final BenchConfig config;
-    private final List<InMemoryKvStore<TableKey<Integer>, Integer>> stores = new ArrayList<>();
-    private final List<SpeculativeCoShim<TableKey<Integer>, Integer>> shims = new ArrayList<>();
-    private final ScheduledThreadPoolExecutor timeouts = new ScheduledThreadPoolExecutor(1, r -> {
-        Thread t = new Thread(r, "bench-txn-timeout");
-        t.setDaemon(true);
-        return t;
-    });
+    private final List<RemoteCoShim<TableKey<String>, String>> remotes = new ArrayList<>();
+    private final List<DataSource> dataSources = new ArrayList<>();
     /** --parallel-branches only: runs the branches of each attempt; grows to threads × branches. */
     private final ExecutorService branchPool = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "bench-branch");
         t.setDaemon(true);
         return t;
     });
-    private final AtomicLong globalIds = new AtomicLong();
     private final LongAdder committedTotal = new LongAdder();
+    private final LongAdder unknownTotal = new LongAdder();
     private final AtomicBoolean stop = new AtomicBoolean();
 
-    public MicroBench(BenchConfig config) {
+    /**
+     * Connects to the TC (once per JVM) and to every shim database.
+     *
+     * @param token the shim nodes' shared secret (COSHIM_TOKEN)
+     */
+    public MicroBench(BenchConfig config, String token) {
         this.config = config.validate();
-        for (int s = 0; s < 2; s++) {
-            InMemoryKvStore<TableKey<Integer>, Integer> store = new InMemoryKvStore<>();
-            stores.add(store);
-            shims.add(new SpeculativeCoShim<>(store, config.lockTimeout(), SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL,
-                    config.speculative()));
+        initSeata(config.tc());
+        for (String shim : config.shims()) {
+            int colon = shim.indexOf(':');
+            int slash = shim.indexOf('/');
+            InetSocketAddress node = new InetSocketAddress(shim.substring(0, colon),
+                    Integer.parseInt(shim.substring(colon + 1, slash)));
+            RemoteCoShim<TableKey<String>, String> remote = new RemoteCoShim<>(node, shim.substring(slash + 1), token,
+                    new TableKeyCodec<>(Codec.UTF8), Codec.UTF8).verify();
+            remotes.add(remote);
+            dataSources.add(new DataSourceProxyCoShim(new CoShimDataSource<>(shim, remote)));
         }
-        timeouts.setRemoveOnCancelPolicy(true);
+    }
+
+    /** Seata's TM and RM clients are per JVM: connect them once, to one TC. */
+    static synchronized void initSeata(String tc) {
+        if (seataTc != null) {
+            if (!seataTc.equals(tc)) {
+                throw new IllegalStateException("this JVM is already connected to the TC at " + seataTc);
+            }
+            return;
+        }
+        System.setProperty("service.default.grouplist", tc);
+        TMClient.init(APPLICATION_ID, TX_SERVICE_GROUP);
+        RMClient.init(APPLICATION_ID, TX_SERVICE_GROUP);
+        seataTc = tc;
     }
 
     public BenchResult run() throws InterruptedException {
@@ -121,9 +144,8 @@ public final class MicroBench {
             t.start();
         }
 
-        // drain: in-flight attempts finish (bounded by the txn timeout), then the workers exit
-        long drainDeadline = measureEnd + config.txnTimeout().toNanos() + config.commitDelay().toNanos()
-                + TimeUnit.SECONDS.toNanos(5);
+        // drain: in-flight attempts finish (bounded by the TC's timeout), then the workers exit
+        long drainDeadline = measureEnd + config.txnTimeout().toNanos() + TimeUnit.SECONDS.toNanos(10);
         for (Thread t : threads) {
             t.join(Math.max(1, TimeUnit.NANOSECONDS.toMillis(drainDeadline - System.nanoTime())));
         }
@@ -137,8 +159,6 @@ public final class MicroBench {
                 t.join(1000);
             }
         }
-        timeouts.shutdownNow();
-        branchPool.shutdownNow();
         for (Worker w : workers) {
             if (w.error != null) {
                 warning = "worker failed: " + w.error;
@@ -149,35 +169,56 @@ public final class MicroBench {
         long committed = 0;
         long aborted = 0;
         long timedOut = 0;
+        long unknown = 0;
         List<Long> latencies = new ArrayList<>();
         for (Worker w : workers) {
             committed += w.committed;
             aborted += w.aborted;
             timedOut += w.timedOut;
+            unknown += w.unknown;
             latencies.addAll(w.latenciesUs);
         }
         latencies.sort(null);
 
-        long expected = -1;
+        long expectedMin = -1;
+        long expectedMax = -1;
         long actual = -1;
-        if (config.rmw() && stuck == 0) {
-            expected = committedTotal.sum() * config.branches() * config.writes();
-            actual = storedSum();
+        if (config.rmw() && stuck == 0 && warning == null) {
+            long perTxn = (long) config.branches() * config.writes();
+            expectedMin = committedTotal.sum() * perTxn;
+            expectedMax = (committedTotal.sum() + unknownTotal.sum()) * perTxn;
+            actual = storedSum(expectedMin);
         }
-        List<ShimStats> stats = shims.stream().map(SpeculativeCoShim::stats).toList();
-        return new BenchResult(config, committed, aborted, timedOut, latencies, stats, expected, actual, warning);
+        return new BenchResult(config, committed, aborted, timedOut, unknown, latencies, expectedMin, expectedMax,
+                actual, warning);
     }
 
-    /** The sum of every value of every micro table, in both stores. */
-    private long storedSum() {
+    /**
+     * The sum of every value of every micro table on every shim, read through the shims (local
+     * transactions, outside any global one). Read again a few times while it is below
+     * {@code expectedMin}, in case the TC still delivers phase-2 commits.
+     */
+    private long storedSum(long expectedMin) throws InterruptedException {
         long sum = 0;
-        for (InMemoryKvStore<TableKey<Integer>, Integer> store : stores) {
-            for (int b = 0; b < config.branches(); b++) {
-                for (int k = 0; k < config.tableSize(); k++) {
-                    Integer v = store.get(new TableKey<>(table(b), k));
-                    sum += v == null ? 0 : v;
+        for (int round = 0; round < 10; round++) {
+            sum = 0;
+            for (DataSource ds : dataSources) {
+                try (Connection c = ds.getConnection()) {
+                    KvSession<String, String> kv = KvSession.from(c);
+                    for (int b = 0; b < config.branches(); b++) {
+                        for (int k = 0; k < config.tableSize(); k++) {
+                            String v = kv.get(table(b), String.valueOf(k));
+                            sum += v == null ? 0 : Long.parseLong(v);
+                        }
+                    }
+                } catch (SQLException e) {
+                    throw new IllegalStateException("audit read failed", e);
                 }
             }
+            if (sum >= expectedMin) {
+                break;
+            }
+            Thread.sleep(500);
         }
         return sum;
     }
@@ -186,22 +227,28 @@ public final class MicroBench {
         return "micro-" + branch;
     }
 
-    /** A new plan, as Acta's MicroWorkloadService: distinct keys across the whole global txn. */
-    List<Branch> nextPlan() {
+    private List<Branch> nextPlan() {
+        return randomPlan(config, dataSources.size());
+    }
+
+    /**
+     * A new plan, as Acta's MicroWorkloadService: branch i on table micro-i, on a shim chosen at
+     * random, with distinct keys across the whole global txn.
+     */
+    static List<Branch> randomPlan(BenchConfig config, int shims) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Set<Integer> used = new HashSet<>();
         List<Branch> plan = new ArrayList<>();
         for (int b = 0; b < config.branches(); b++) {
-            List<Integer> reads = workingSet(config.reads(), used);
-            List<Integer> writes = workingSet(config.writes(), used);
-            int shim = random.nextInt(100) < config.shimBPercent() ? 1 : 0;
-            plan.add(new Branch(shim, table(b), reads, writes));
+            List<Integer> reads = workingSet(config, config.reads(), used);
+            List<Integer> writes = workingSet(config, config.writes(), used);
+            plan.add(new Branch(random.nextInt(shims), table(b), reads, writes));
         }
         return plan;
     }
 
     /** Acta's makeWorkingSet: ops × skewness keys from the hot range, the rest from the cold range. */
-    private List<Integer> workingSet(int ops, Set<Integer> used) {
+    private static List<Integer> workingSet(BenchConfig config, int ops, Set<Integer> used) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
         int hot = config.hotRangeSize();
         List<Integer> keys = new ArrayList<>();
@@ -220,144 +267,140 @@ public final class MicroBench {
         return keys;
     }
 
-    /** One global transaction attempt, as the coordinator sees it. */
-    private final class GlobalTxn {
-        final String id = "g" + globalIds.incrementAndGet();
-        final AtomicInteger state = new AtomicInteger(ACTIVE);
-        /** Registered branches, in order; read by the timeout thread. */
-        final List<String> branchIds = new CopyOnWriteArrayList<>();
-        final List<CoShim<TableKey<Integer>, Integer>> branchShims = new CopyOnWriteArrayList<>();
-
-        /** Like Seata's branchRegister: before start, so a timeout can roll the branch back. */
-        synchronized void register(CoShim<TableKey<Integer>, Integer> shim, String branchId) {
-            branchShims.add(shim);
-            branchIds.add(branchId);
-        }
-
-        /** The TC's global timeout: rolls back unless the coordinator already decided commit. */
-        void timeout() {
-            if (state.compareAndSet(ACTIVE, ROLLED_BACK)) {
-                abortAll();
-            }
-        }
-
-        /** The coordinator's rollback after a failed branch; TIMED_OUT if the timeout did it first. */
-        Attempt rollback() {
-            if (state.compareAndSet(ACTIVE, ROLLED_BACK)) {
-                abortAll();
-                return Attempt.ABORTED;
-            }
-            return Attempt.TIMED_OUT;
-        }
-
-        private synchronized void abortAll() {
-            for (int i = 0; i < branchIds.size(); i++) {
-                branchShims.get(i).abort(branchIds.get(i));
-            }
-        }
-    }
-
-    private Attempt attempt(List<Branch> plan) {
-        GlobalTxn g = new GlobalTxn();
-        ScheduledFuture<?> timer =
-                timeouts.schedule(g::timeout, config.txnTimeout().toMillis(), TimeUnit.MILLISECONDS);
+    /** One global transaction attempt: TM begin, phase 1 of every branch, TM commit or rollback. */
+    Attempt attempt(List<Branch> plan) {
+        GlobalTransaction tx = GlobalTransactionContext.createNew();
         try {
-            if (config.parallelBranches()) {
-                Attempt failed = phaseOneInParallel(g, plan);
-                if (failed != null) {
-                    return failed;
-                }
-            } else {
-                for (int i = 0; i < plan.size(); i++) {
-                    if (!runBranch(g, plan.get(i), i)) {
-                        return g.rollback();
-                    }
-                }
+            tx.begin((int) config.txnTimeout().toMillis(), "micro");
+        } catch (TransactionException e) {
+            throw new IllegalStateException("TC at " + config.tc() + ": begin failed", e);
+        }
+        try {
+            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan) : phaseOneInOrder(tx, plan);
+            if (!allYes) {
+                return rollback(tx);
             }
-            if (!g.state.compareAndSet(ACTIVE, COMMITTING)) {
-                return Attempt.TIMED_OUT;   // the timeout rolled every branch back already
+            try {
+                tx.commit();
+            } catch (TransactionException e) {
+                return e.getCode() == TransactionExceptionCode.TransactionTimeout ? Attempt.TIMED_OUT : Attempt.UNKNOWN;
             }
-            if (!config.commitDelay().isZero()) {
-                LockSupport.parkNanos(config.commitDelay().toNanos());
+            GlobalStatus status = tx.getLocalStatus();
+            if (status == GlobalStatus.Committed || status == GlobalStatus.AsyncCommitting) {
+                return Attempt.COMMITTED;
             }
-            for (int i = 0; i < g.branchIds.size(); i++) {
-                g.branchShims.get(i).commit(g.branchIds.get(i));
+            if (isTimeout(status)) {
+                return Attempt.TIMED_OUT;
             }
-            return Attempt.COMMITTED;
-        } catch (TxnAbortedException e) {
-            return g.rollback();
+            return status == GlobalStatus.Rollbacked ? Attempt.ABORTED : Attempt.UNKNOWN;
         } finally {
-            timer.cancel(false);
+            RootContext.unbind();
         }
     }
 
-    /**
-     * Phase 1 of one branch: register (like Seata's branchRegister), start, the gets/puts, end, and
-     * prepare right away.
-     *
-     * @return true iff the branch voted YES
-     * @throws TxnAbortedException if the shim aborted the branch during a get/put
-     */
-    private boolean runBranch(GlobalTxn g, Branch b, int index) {
-        CoShim<TableKey<Integer>, Integer> shim = shims.get(b.shim());
-        String branchId = g.id + "-" + index;
-        g.register(shim, branchId);
-        if (g.state.get() != ACTIVE || shim.start(branchId) != Outcome.SUCCEEDED) {
-            return false;
+    private static boolean isTimeout(GlobalStatus status) {
+        return status == GlobalStatus.TimeoutRollbacking || status == GlobalStatus.TimeoutRollbacked
+                || status == GlobalStatus.TimeoutRollbackRetrying || status == GlobalStatus.TimeoutRollbackFailed;
+    }
+
+    /** TM rollback: the TC rolls every registered branch back on its shim. Nothing was committed. */
+    private Attempt rollback(GlobalTransaction tx) {
+        try {
+            tx.rollback();
+        } catch (TransactionException e) {
+            // the TC refused (e.g. it already timed the txn out); it never commits it either way
+            return e.getCode() == TransactionExceptionCode.TransactionTimeout ? Attempt.TIMED_OUT : Attempt.ABORTED;
         }
-        for (int k : b.readKeys()) {
-            shim.get(branchId, new TableKey<>(b.table(), k));
-        }
-        for (int k : b.writeKeys()) {
-            TableKey<Integer> key = new TableKey<>(b.table(), k);
-            int value;
-            if (config.rmw()) {
-                Integer old = shim.get(branchId, key);
-                value = (old == null ? 0 : old) + 1;
-            } else {
-                value = ThreadLocalRandom.current().nextInt(1, Integer.MAX_VALUE);
+        return isTimeout(tx.getLocalStatus()) ? Attempt.TIMED_OUT : Attempt.ABORTED;
+    }
+
+    private boolean phaseOneInOrder(GlobalTransaction tx, List<Branch> plan) {
+        for (Branch b : plan) {
+            if (!runBranch(tx.getXid(), b, false)) {
+                return false;
             }
-            shim.put(branchId, key, value);
         }
-        return shim.end(branchId) == Outcome.SUCCEEDED && shim.prepare(branchId) == Vote.YES;
+        return true;
     }
 
     /**
-     * Phase 1 of every branch at the same time (--parallel-branches). On the first failure the
-     * coordinator rolls the whole transaction back at once, which also releases a sibling branch
-     * blocked in prepare. Returns only when every branch is done, so no branch outlives its attempt.
-     *
-     * @return null if every branch voted YES, else the attempt's outcome (rolled back)
+     * Phase 1 of every branch at the same time. Returns only when every branch is done, so no branch
+     * outlives its attempt; the caller then rolls back if any branch failed, which the TC turns into
+     * an abort on every shim (including one where a sibling still waits in prepare: it votes NO).
      */
-    private Attempt phaseOneInParallel(GlobalTxn g, List<Branch> plan) {
+    private boolean phaseOneInParallel(GlobalTransaction tx, List<Branch> plan) {
         ExecutorCompletionService<Boolean> done = new ExecutorCompletionService<>(branchPool);
-        for (int i = 0; i < plan.size(); i++) {
-            int index = i;
-            done.submit(() -> runBranch(g, plan.get(index), index));
+        for (Branch b : plan) {
+            done.submit(() -> runBranch(tx.getXid(), b, true));
         }
-        Attempt outcome = null;
+        boolean allYes = true;
         RuntimeException error = null;
         for (int i = 0; i < plan.size(); i++) {
-            boolean yes;
             try {
-                yes = done.take().get();
+                allYes &= done.take().get();
             } catch (ExecutionException e) {
-                yes = false;
-                if (!(e.getCause() instanceof TxnAbortedException) && error == null) {
+                allYes = false;
+                if (error == null) {
                     error = e.getCause() instanceof RuntimeException r ? r : new IllegalStateException(e.getCause());
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                yes = false;
-            }
-            if (!yes && outcome == null) {
-                outcome = g.rollback();
+                allYes = false;
             }
         }
         if (error != null) {
             throw error;
         }
-        return outcome;
+        return allYes;
+    }
+
+    /**
+     * Phase 1 of one branch over an XA connection to its shim: register + start, the gets/puts,
+     * end + prepare.
+     *
+     * @param bindXid true when running on a pool thread, which must join the global transaction
+     * @return true iff the branch voted YES; false if the shim aborted it, voted NO, or the TC
+     *     refused the branch (e.g. the txn already timed out)
+     */
+    private boolean runBranch(String xid, Branch b, boolean bindXid) {
+        if (bindXid) {
+            RootContext.bind(xid);
+        }
+        try (Connection c = dataSources.get(b.shim()).getConnection()) {
+            c.setAutoCommit(false);   // branchRegister with the TC + xa start on the shim
+            try {
+                KvSession<String, String> kv = KvSession.from(c);
+                for (int k : b.readKeys()) {
+                    kv.get(b.table(), String.valueOf(k));
+                }
+                for (int k : b.writeKeys()) {
+                    String key = String.valueOf(k);
+                    long value;
+                    if (config.rmw()) {
+                        String old = kv.get(b.table(), key);
+                        value = (old == null ? 0 : Long.parseLong(old)) + 1;
+                    } else {
+                        value = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+                    }
+                    kv.put(b.table(), key, String.valueOf(value));
+                }
+                c.commit();   // xa end + xa prepare: the shim votes
+                return true;
+            } catch (SQLException e) {
+                try {
+                    c.rollback();
+                } catch (SQLException ignored) {
+                    // the global rollback that follows aborts the branch anyway
+                }
+                return false;
+            }
+        } catch (SQLException e) {
+            return false;   // the branch could not be registered or started
+        } finally {
+            if (bindXid) {
+                RootContext.unbind();
+            }
+        }
     }
 
     private final class Worker implements Runnable {
@@ -366,6 +409,7 @@ public final class MicroBench {
         long committed;
         long aborted;
         long timedOut;
+        long unknown;
         final List<Long> latenciesUs = new ArrayList<>();
         volatile Throwable error;
 
@@ -400,19 +444,31 @@ public final class MicroBench {
                     }
                     case ABORTED -> aborted += measured ? 1 : 0;
                     case TIMED_OUT -> timedOut += measured ? 1 : 0;
+                    case UNKNOWN -> {
+                        // may or may not have committed: never retry it, and widen the audit's range
+                        unknownTotal.increment();
+                        unknown += measured ? 1 : 0;
+                        plan = nextPlan();
+                    }
                 }
             }
         }
     }
 
+    @Override
+    public void close() {
+        branchPool.shutdownNow();
+        remotes.forEach(RemoteCoShim::close);
+    }
+
     /**
-     * {@code java ... MicroBench [--shim speculative|nonspeculative] [--threads N] [--table-size N]
-     * [--branches N] [--reads N] [--writes N] [--skew X] [--shim-b-percent P] [--rmw true|false]
-     * [--warmup-s S] [--measure-s S] [--commit-delay-ms MS] [--lock-timeout-ms MS] [--txn-timeout-ms MS]
-     * [--parallel-branches true|false]
-     * [--csv FILE] [--label TEXT]}. The run is appended to {@code FILE} (default
-     * {@code bench-results/<timestamp>-<shim>.csv} in the working directory). Exit code 0 iff the run had
-     * no warning and the audit passed.
+     * {@code COSHIM_TOKEN=... java ... MicroBench [--variant LABEL] [--shims host:port/db,...]
+     * [--tc host:port] [--threads N] [--table-size N] [--branches N] [--reads N] [--writes N] [--skew X]
+     * [--rmw true|false] [--warmup-s S] [--measure-s S] [--txn-timeout-ms MS]
+     * [--parallel-branches true|false] [--csv FILE] [--label TEXT]}. Needs a running Seata TC and the
+     * shim nodes ({@code CoShimNode}). The run is appended to {@code FILE} (default
+     * {@code bench-results/<timestamp>-<variant>.csv}). Exit code 0 iff the run had no warning and the
+     * audit passed.
      */
     public static void main(String[] args) throws Exception {
         BenchConfig config;
@@ -423,14 +479,23 @@ public final class MicroBench {
             System.exit(2);
             return;
         }
+        String token = System.getenv("COSHIM_TOKEN");
+        if (token == null || token.isEmpty()) {
+            System.err.println("error: set COSHIM_TOKEN to the shim nodes' token");
+            System.exit(2);
+            return;
+        }
         String csv = option(args, "--csv");
         if (csv == null) {
             csv = "bench-results/" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
-                    + "-" + config.shim() + ".csv";
+                    + "-" + config.variant() + ".csv";
         }
         String label = option(args, "--label");
 
-        BenchResult result = new MicroBench(config).run();
+        BenchResult result;
+        try (MicroBench bench = new MicroBench(config, token)) {
+            result = bench.run();
+        }
         System.out.println(result.summary());
         Path file = Path.of(csv).toAbsolutePath();
         appendCsv(file, result.csvRow(label == null ? "" : label));

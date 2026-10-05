@@ -1,45 +1,43 @@
 package ch.epfl.coshim.bench;
 
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * Parameters of one {@link MicroBench} run. The defaults are the "simple test": Acta's Micro workload
  * with read-modify-write writes, skew 0.9, 50 workers, 2 branches per global transaction.
  *
- * @param shim                 speculative | nonspeculative
- * @param threads              closed-loop workers (Acta's concurrency)
- * @param tableSize            keys per table; branch i of every txn uses table micro-i
- * @param branches             branches (subtransactions) per global transaction
- * @param reads                pure reads per branch, done first
- * @param writes               writes per branch, done after the reads
- * @param skewness             share of each branch's keys drawn from the hot range, the first
- *                             (1 - skewness) * tableSize keys (Acta's definition, in [0.5, 1))
- * @param shimBPercent         chance that a branch goes to shim "b" instead of "a" (Acta's pgPercentage)
- * @param rmw                  writes are v := get(k) + 1 instead of blind random values; enables the audit
- * @param warmup               run time before measuring
- * @param measure              measured run time
- * @param commitDelay          emulated TM → TC → RM round trip between the last YES vote and phase 2
- * @param lockTimeout          the shims' lock_timeout
- * @param txnTimeout           global transaction timeout, as Seata's TC: rolls a stuck txn back
- * @param parallelBranches     run the branches of a global transaction at the same time (each still
- *                             start, ops, end, prepare) instead of one after the other; exposes
- *                             cross-shim lock cycles, which only the txn timeout breaks
+ * <p>The shim variant (speculative or not) and its lock timeout are set on the shim nodes
+ * ({@code CoShimNode --shim ... --lock-timeout-ms ...}), not here: the benchmark only reaches them
+ * over TCP.
+ *
+ * @param variant          label of the run in the results (the variant the nodes were started with)
+ * @param shims            the shim databases, {@code host:port/database}; each branch goes to one of
+ *                         them at random
+ * @param tc               the Seata TC, {@code host:port}
+ * @param threads          closed-loop workers (Acta's concurrency)
+ * @param tableSize        keys per table; branch i of every txn uses table micro-i
+ * @param branches         branches (subtransactions) per global transaction
+ * @param reads            pure reads per branch, done first
+ * @param writes           writes per branch, done after the reads
+ * @param skewness         share of each branch's keys drawn from the hot range, the first
+ *                         (1 - skewness) * tableSize keys (Acta's definition, in [0.5, 1))
+ * @param rmw              writes are v := get(k) + 1 instead of blind random values; enables the audit
+ * @param warmup           run time before measuring
+ * @param measure          measured run time
+ * @param txnTimeout       global transaction timeout, enforced by the TC (rolls the branches back)
+ * @param parallelBranches run the branches of a global transaction at the same time (each still
+ *                         start, ops, end, prepare) instead of one after the other
  */
-public record BenchConfig(String shim, int threads, int tableSize, int branches, int reads, int writes,
-        double skewness, int shimBPercent, boolean rmw, Duration warmup, Duration measure, Duration commitDelay,
-        Duration lockTimeout, Duration txnTimeout, boolean parallelBranches) {
+public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
+        int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
+        boolean parallelBranches) {
 
     public static BenchConfig defaults() {
-        return new BenchConfig("speculative", 50, 10_000, 2, 2, 2, 0.9, 50, true, Duration.ofSeconds(10),
-                Duration.ofSeconds(30), Duration.ofMillis(1), Duration.ofSeconds(1), Duration.ofSeconds(10), false);
-    }
-
-    public boolean speculative() {
-        return switch (shim) {
-            case "speculative" -> true;
-            case "nonspeculative" -> false;
-            default -> throw new IllegalArgumentException("--shim must be speculative or nonspeculative: " + shim);
-        };
+        return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
+                10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
+                false);
     }
 
     /** Keys per table in the hot range. */
@@ -49,16 +47,21 @@ public record BenchConfig(String shim, int threads, int tableSize, int branches,
 
     /** Same checks as Acta's Micro run endpoint: every txn must find distinct hot and cold keys. */
     public BenchConfig validate() {
-        speculative();
+        require(!shims.isEmpty(), "--shims needs at least one host:port/database");
+        for (String shim : shims) {
+            require(shim.matches("[^:/]+:\\d+/.+"), "--shims entries are host:port/database: " + shim);
+        }
+        require(tc.matches("[^:]+:\\d+"), "--tc is host:port: " + tc);
         require(threads > 0, "--threads must be > 0");
         require(tableSize > 0, "--table-size must be > 0");
         require(branches > 0, "--branches must be > 0");
         require(reads >= 0 && writes >= 0, "--reads and --writes must be >= 0");
         require(reads + writes > 0, "a branch needs at least one read or write");
         require(skewness >= 0.5 && skewness < 1.0, "--skew must be in [0.5, 1)");
-        require(shimBPercent >= 0 && shimBPercent <= 100, "--shim-b-percent must be in [0, 100]");
         require(!measure.isZero() && !measure.isNegative(), "--measure-s must be > 0");
-        require(!warmup.isNegative() && !commitDelay.isNegative(), "durations must be >= 0");
+        require(!warmup.isNegative(), "--warmup-s must be >= 0");
+        require(txnTimeout.toMillis() >= 1 && txnTimeout.toMillis() <= Integer.MAX_VALUE,
+                "--txn-timeout-ms must be in [1, 2^31)");
         long hotPerBranch = (long) Math.ceil(reads * skewness) + (long) Math.ceil(writes * skewness);
         long coldPerBranch = (long) reads + writes - hotPerBranch;
         require(hotPerBranch * branches <= hotRangeSize(), "requested hot keys exceed the hot range");
@@ -75,19 +78,18 @@ public record BenchConfig(String shim, int threads, int tableSize, int branches,
     /** Parses {@code --flag value} pairs over the defaults; unknown flags are an error. */
     public static BenchConfig parse(String[] args) {
         BenchConfig c = defaults();
-        String shim = c.shim;
+        String variant = c.variant;
+        List<String> shims = c.shims;
+        String tc = c.tc;
         int threads = c.threads;
         int tableSize = c.tableSize;
         int branches = c.branches;
         int reads = c.reads;
         int writes = c.writes;
         double skewness = c.skewness;
-        int shimBPercent = c.shimBPercent;
         boolean rmw = c.rmw;
         Duration warmup = c.warmup;
         Duration measure = c.measure;
-        Duration commitDelay = c.commitDelay;
-        Duration lockTimeout = c.lockTimeout;
         Duration txnTimeout = c.txnTimeout;
         boolean parallelBranches = c.parallelBranches;
         for (int i = 0; i < args.length; i++) {
@@ -101,26 +103,26 @@ public record BenchConfig(String shim, int threads, int tableSize, int branches,
             }
             String v = args[++i];
             switch (flag) {
-                case "--shim" -> shim = v;
+                case "--variant" -> variant = v;
+                case "--shims" -> shims = Arrays.stream(v.split(",")).map(String::trim).filter(s -> !s.isEmpty())
+                        .toList();
+                case "--tc" -> tc = v;
                 case "--threads" -> threads = Integer.parseInt(v);
                 case "--table-size" -> tableSize = Integer.parseInt(v);
                 case "--branches" -> branches = Integer.parseInt(v);
                 case "--reads" -> reads = Integer.parseInt(v);
                 case "--writes" -> writes = Integer.parseInt(v);
                 case "--skew" -> skewness = Double.parseDouble(v);
-                case "--shim-b-percent" -> shimBPercent = Integer.parseInt(v);
                 case "--rmw" -> rmw = Boolean.parseBoolean(v);
                 case "--warmup-s" -> warmup = seconds(v);
                 case "--measure-s" -> measure = seconds(v);
-                case "--commit-delay-ms" -> commitDelay = Duration.ofMillis(Long.parseLong(v));
-                case "--lock-timeout-ms" -> lockTimeout = Duration.ofMillis(Long.parseLong(v));
                 case "--txn-timeout-ms" -> txnTimeout = Duration.ofMillis(Long.parseLong(v));
                 case "--parallel-branches" -> parallelBranches = Boolean.parseBoolean(v);
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
-        return new BenchConfig(shim, threads, tableSize, branches, reads, writes, skewness, shimBPercent, rmw, warmup,
-                measure, commitDelay, lockTimeout, txnTimeout, parallelBranches).validate();
+        return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
+                measure, txnTimeout, parallelBranches).validate();
     }
 
     private static Duration seconds(String v) {
