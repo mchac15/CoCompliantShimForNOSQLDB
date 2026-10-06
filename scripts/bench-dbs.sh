@@ -5,6 +5,8 @@
 #   scripts/bench-dbs.sh start mysql|postgres N    # servers on PORT, PORT+1, ..., database "acta"
 #   scripts/bench-dbs.sh stop  mysql|postgres      # removes them (and their data)
 #   scripts/bench-dbs.sh urls  mysql|postgres N    # prints the JDBC URLs, comma separated
+#   scripts/bench-dbs.sh createdb mysql|postgres I DB   # creates database DB on server I if missing
+#                                                     # (the shim's SqlKvStore: one per shim database)
 #
 # Configuration: the defaults of Acta's deployment (../acta-server/scripts/deploy, ansible
 # group_vars/all.example.yml), which is how Sonata is evaluated, with one change: no fsync, so that
@@ -25,7 +27,7 @@ mysql_port="${MYSQL_PORT:-3306}"
 pg_port="${PG_PORT:-5432}"
 
 usage() {
-    echo "usage: $0 start|stop|urls mysql|postgres [N]" >&2
+    echo "usage: $0 start|stop|urls mysql|postgres [N] | createdb mysql|postgres I DB" >&2
     exit 2
 }
 
@@ -117,10 +119,21 @@ case "$cmd" in
         urls
         ;;
     stop)
-        docker ps -a --format '{{.Names}}' | grep "^coshim-bench-$kind-" | xargs -r docker rm -f > /dev/null
+        docker ps -a --format '{{.Names}}' | grep "^coshim-bench-$kind-" | xargs -r docker rm -fv > /dev/null   # -v: also their data volumes, or every run leaks GBs
         ;;
     urls)
         urls
+        ;;
+    createdb)
+        db="${4:?database name}"
+        port=$((base_port + count))
+        if [[ $kind == mysql ]]; then
+            docker exec "$(name "$count")" mysql -h127.0.0.1 -P"$port" -uroot -e "create database if not exists \`$db\`"
+        else
+            docker exec "$(name "$count")" psql -h 127.0.0.1 -p "$port" -U acta -d acta -tAc \
+                "select 1 from pg_database where datname = '$db'" | grep -q 1 \
+                || docker exec "$(name "$count")" psql -h 127.0.0.1 -p "$port" -U acta -d acta -qc "create database \"$db\""
+        fi
         ;;
     *)
         usage
