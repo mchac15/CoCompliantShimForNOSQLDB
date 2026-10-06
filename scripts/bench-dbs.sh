@@ -49,8 +49,15 @@ urls() {
     echo "$list"
 }
 
+# A container removed uncleanly can leave its endpoint in the host network, and Docker then refuses
+# a new container of the same name ("endpoint with name ... already exists in network host").
+clear_stale_endpoint() {
+    docker network disconnect -f host "$(name "$1")" > /dev/null 2>&1 || true
+}
+
 start_mysql() {
     local i="$1" port=$((base_port + $1))
+    clear_stale_endpoint "$i"
     docker run -d --rm --name "$(name "$i")" --network host \
         -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=acta \
         "${MYSQL_IMAGE:-mysql:8.4}" \
@@ -65,6 +72,7 @@ start_mysql() {
 
 start_postgres() {
     local i="$1" port=$((base_port + $1))
+    clear_stale_endpoint "$i"
     docker run -d --rm --name "$(name "$i")" --network host --shm-size="${PG_SHM_SIZE:-4g}" \
         -e POSTGRES_USER=acta -e POSTGRES_DB=acta -e POSTGRES_HOST_AUTH_METHOD=trust \
         "${POSTGRES_IMAGE:-postgres:16}" \

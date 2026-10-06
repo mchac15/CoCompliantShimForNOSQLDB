@@ -143,6 +143,14 @@ if [[ "${1:-}" == "--summarize" ]]; then
     exit
 fi
 
+for arg in "$@"; do
+    if [[ $arg =~ ^--?([A-Z_]+)= ]]; then
+        echo "$arg: ${BASH_REMATCH[1]} is an environment variable, put it before the command:" \
+            "${BASH_REMATCH[1]}=... $0 [MicroBench options]" >&2
+        exit 2
+    fi
+done
+
 skews="${SKEWS:-0.5 0.9 0.99}"
 reps="${REPS:-3}"
 variants="${VARIANTS:-speculative-mysql sonata-mysql speculative-pg sonata-pg}"
