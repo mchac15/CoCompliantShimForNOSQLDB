@@ -281,6 +281,17 @@ VARIANTS="speculative-mysql sonata-mysql speculative-pg sonata-pg" scripts/bench
 scripts/bench-dbs.sh stop mysql; scripts/bench-dbs.sh stop postgres   # if you started them yourself
 ```
 
+`scripts/bench-sql-compare.sh` runs that comparison as a sweep (skews 0.5, 0.9, 0.99 × 3 reps by
+default, about 30 min) on servers it starts once, and writes `bench-results/sql-compare-<ts>/summary.md`:
+throughput, abort rate and latencies per skew and variant (mean and range over the reps), the
+shim / Sonata ratios per server kind, and the shim nodes' abort causes. `--summarize DIR` rebuilds
+the summary from an existing sweep.
+
+```sh
+scripts/bench-sql-compare.sh                                   # the default sweep
+SKEWS="0.9 0.99" REPS=5 LOCK_TIMEOUT_MS=100 scripts/bench-sql-compare.sh --threads 50
+```
+
 `bench-compare.sh` starts the databases it needs (and stops them at the end) unless they already
 run. The CSV gains `branch_failures`: failed branches in the measurement window by cause
 (`deadlock`, `lock_timeout`, `serialization`, `xa_rollback` = NO vote, `shim_abort`, `tc_refused`,
