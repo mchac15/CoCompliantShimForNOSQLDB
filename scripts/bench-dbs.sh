@@ -119,7 +119,7 @@ case "$cmd" in
         urls
         ;;
     stop)
-        docker ps -a --format '{{.Names}}' | grep "^coshim-bench-$kind-" | xargs -r docker rm -f > /dev/null
+        docker ps -a --format '{{.Names}}' | grep "^coshim-bench-$kind-" | xargs -r docker rm -fv > /dev/null   # -v: also their data volumes, or every run leaks GBs
         ;;
     urls)
         urls
