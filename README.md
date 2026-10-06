@@ -242,8 +242,44 @@ to it; the script prints a comparison table and exits 1 if a run warned or faile
 node; those runs are skipped when no TC is reachable (`-Dbench.tc=host:port`, default
 127.0.0.1:8091).
 
+## Benchmark: speculative shim vs Sonata
+
+The same `MicroBench` runs Sonata. A participant in `--shims` is a shim database
+(`host:port/db`) or a MySQL/PG database (`jdbc:mysql://...`, `jdbc:postgresql://...`). The latter is
+a Hikari pool at SERIALIZABLE wrapped in Seata's stock `DataSourceProxyXA`, as in Acta. With
+`--sonata true` (`sonata.enableGlobalSerializability`; Sonata's other settings at their defaults:
+`sonata_dummy`, 1,000,000 rows, SSI helper batch 10), Seata adds Sonata's dummy write before
+`xa prepare`. Everything else (TM, TC, attempts, retries, audit) is the same code as for the shim.
+
+```
+ MicroBench (TM + RM) ──▶ Seata TC :8091
+   ├ speculative / nonspeculative: DataSourceProxyCoShim ─TCP─▶ CoShimNode :7000, :7001
+   └ sonata-mysql / sonata-pg:     DataSourceProxyXA(Hikari) ─JDBC─▶ MySQL :3306, :3307 / PG :5432, :5433
+```
+
+`scripts/bench-dbs.sh start mysql|postgres N` runs one server per participant in Docker (host
+network), with the settings of Acta's deployment (`../acta-server/scripts/deploy`, e.g. MySQL 8.4,
+`innodb_lock_wait_timeout=60`; PG 16, `lock_timeout=60s`, `max_prepared_transactions=1500`) and
+**fsync off**, so that they, like the shim's in-memory store, do not pay for durability (MySQL:
+`innodb_flush_log_at_trx_commit=0`, `sync_binlog=0`, `innodb_flush_method=nosync`; PG: `fsync`,
+`synchronous_commit`, `full_page_writes` off). Memory sizes are scaled down to one machine (2G
+buffer pool / 2GB `shared_buffers`; overridable). Before each run, `MicroBench` resets the micro
+tables to 0, fills `sonata_dummy`, and rolls back XA transactions left prepared by a killed run.
+
+```sh
+VARIANTS="speculative sonata-mysql sonata-pg" scripts/bench-compare.sh --skew 0.99 --threads 100
+scripts/bench-dbs.sh stop mysql; scripts/bench-dbs.sh stop postgres   # if you started them yourself
+```
+
+`bench-compare.sh` starts the databases it needs (and stops them at the end) unless they already
+run. The CSV gains `branch_failures`: failed branches in the measurement window by cause
+(`deadlock`, `lock_timeout`, `serialization`, `xa_rollback` = NO vote, `shim_abort`, `tc_refused`,
+`other:...`).
+
+Sonata's switch is read once per JVM, so a run is all-Sonata or not. A mixed global transaction
+(a shim branch and a MySQL branch in the same `--shims`) works with `--sonata true`, since the hook
+only applies to MySQL/PG data sources.
+
 ## Next steps
 
 - Add a real key-value backend behind `KvStore`.
-- Compare with Sonata on MySQL/PG through Acta (a `COSHIM` mode whose branches reach the shim nodes
-  over TCP), with a mixed global transaction (a MySQL/Sonata branch and a coshim branch).

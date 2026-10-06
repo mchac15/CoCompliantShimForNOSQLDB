@@ -12,7 +12,15 @@
 
     <artifactId>bench</artifactId>
     <name>bench</name>
-    <description>Micro benchmark of the shim through a real Seata TC and shim nodes reached over TCP</description>
+    <description>Micro benchmark of the shim through a real Seata TC and shim nodes reached over TCP, and of
+        Sonata on MySQL/PostgreSQL through the same TC</description>
+
+    <properties>
+        <!-- the versions Acta (../acta-server) runs Sonata with -->
+        <hikari.version>7.0.2</hikari.version>
+        <mysql-connector.version>8.4.0</mysql-connector.version>
+        <postgresql.version>42.7.8</postgresql.version>
+    </properties>
 
     <dependencies>
         <!-- Seata XA data source for the shim (brings coshim-jdbc, seata-rm-datasource, seata-tm, Druid) -->
@@ -25,6 +33,30 @@
         <dependency>
             <groupId>ch.epfl.coshim</groupId>
             <artifactId>shim-net</artifactId>
+        </dependency>
+        <!-- Sonata participants: MySQL/PG pools wrapped in Seata's stock DataSourceProxyXA, as in Acta -->
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+            <version>${hikari.version}</version>
+            <exclusions>
+                <!-- keep the 1.7 API that slf4j-simple binds to; otherwise Seata's warnings go nowhere -->
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>${mysql-connector.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
         </dependency>
         <!-- the TM/RM <-> TC wire format; the split Seata modules do not bring one (seata-all does) -->
         <dependency>
