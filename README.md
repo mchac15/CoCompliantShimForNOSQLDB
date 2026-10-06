@@ -11,7 +11,7 @@ global transactions that mix both kinds of shim.
 | Module | Depends on | Contents |
 | --- | --- | --- |
 | `store-api` | nothing | `KvStore<K, V>`: the whole database behind `get` / `store`, plus `InMemoryKvStore`; `TableKey` (table, key): a shim manages several tables of its database |
-| `store-sql` | `store-api` | `SqlKvStore`: a MySQL or PostgreSQL database as a `KvStore` (URL `jdbc:coshim:mysql://...` / `jdbc:coshim:pg://...`): `get` is a `select`, `store` an upsert, on one table `kv` filled with N keys at creation; `KvStores.fromUrl` picks in-memory or SQL from the URL |
+| `store-sql` | `store-api` | `SqlKvStore`: a MySQL or PostgreSQL database as a `KvStore` (URL `jdbc:coshim:mysql://...` / `jdbc:coshim:pg://...`), with the tables, keys and statements of the benchmark's Sonata participants (`micro-i (key int, value bigint)`, `select` / `update`) but autocommit at READ COMMITTED; `KvStores.fromUrl` picks in-memory or SQL from the URL |
 | `shim-core` | `store-api` | `CoShim`: the requests a shim receives from client connections (start / get / put / end / prepare / commit / abort). It never runs client code; `SpeculativeCoShim` implements pseudo.txt, and with `speculative = false` is the non-speculative strict-2PL baseline (lock() waits for predecessors to *commit*, no cascades); `ShimStats` counts its commits and aborts by cause; `NoCcShim` is a pass-through shim (no concurrency control) used in tests |
 | `shim-net` | `shim-core` | **Shim nodes**: `CoShimServer` hosts one or more databases, one `CoShim` each, and serves them over TCP to the participants only (shared-token handshake, optional client allowlist); `RemoteCoShim` is the client the RMs use, bound to one database; `CoShimNode` runs a node |
 | `coshim-jdbc` | `shim-core` | The shim as a JDBC "driver": `CoShimDataSource` (`DataSource` + `XADataSource`, URL `jdbc:coshim://host:port/database`), `CoShimXAResource`, `KvSession` (`get(table, key)` / `put(table, key, value)` instead of SQL). No Seata dependency |
@@ -84,8 +84,8 @@ drivers with Sonata's hook in the RM.
 COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode --port 7000 --shim speculative \
     --databases shop,billing --lock-timeout-ms 1000 [--stats-interval-s 10] [--allow RM-host ...]
 # --shim speculative | nonspeculative | nocc; commit/abort counters are logged every interval and at shutdown
-# --store memory (default) | jdbc:coshim:mysql://host:3306 | jdbc:coshim:pg://host:5432 [--store-entries N]
-#   database D of the node lives in SQL database D on that server, table kv filled with keys 0..N-1
+# --store memory (default) | jdbc:coshim:mysql://host:3306 | jdbc:coshim:pg://host:5432 [?tables=a,b&entries=N&pool=N]
+#   database D of the node lives in SQL database D on that server; the tables are refilled with keys 0..N-1 at start
 ```
 
 ```java
@@ -253,9 +253,19 @@ a Hikari pool at SERIALIZABLE wrapped in Seata's stock `DataSourceProxyXA`, as i
 
 ```
  MicroBench (TM + RM) ──▶ Seata TC :8091
-   ├ speculative / nonspeculative: DataSourceProxyCoShim ─TCP─▶ CoShimNode :7000, :7001
+   ├ speculative / nonspeculative: DataSourceProxyCoShim ─TCP─▶ CoShimNode :7000, :7001 (in memory)
+   ├ speculative-mysql / -pg, ...:  DataSourceProxyCoShim ─TCP─▶ CoShimNode ─SqlKvStore─▶ the same servers
    └ sonata-mysql / sonata-pg:     DataSourceProxyXA(Hikari) ─JDBC─▶ MySQL :3306, :3307 / PG :5432, :5433
 ```
+
+With `<shim>-mysql` / `<shim>-pg`, node I stores its database `sI` in database `sI` of server I
+(`SqlKvStore`, created by `bench-dbs.sh createdb`), on the same servers as Sonata. Layout and
+statements are Sonata's: tables `micro-0 .. micro-(branches-1)`, `(key int primary key, value bigint)`,
+refilled with `--table-size` keys at 0 when the node starts, `select value ... where key = ?` and
+`update ... set value = ? where key = ?`; the pool has Sonata's size (`threads * branches * 2 + 4`,
+all opened up front). What differs is only who does the concurrency control: the shim's statements
+run in autocommit at READ COMMITTED (reads during execution unless a predecessor's write is
+buffered, writes applied at commit), Sonata's in SERIALIZABLE XA transactions plus its dummy write.
 
 `scripts/bench-dbs.sh start mysql|postgres N` runs one server per participant in Docker (host
 network), with the settings of Acta's deployment (`../acta-server/scripts/deploy`, e.g. MySQL 8.4,
@@ -267,7 +277,7 @@ buffer pool / 2GB `shared_buffers`; overridable). Before each run, `MicroBench` 
 tables to 0, fills `sonata_dummy`, and rolls back XA transactions left prepared by a killed run.
 
 ```sh
-VARIANTS="speculative sonata-mysql sonata-pg" scripts/bench-compare.sh --skew 0.99 --threads 100
+VARIANTS="speculative-mysql sonata-mysql speculative-pg sonata-pg" scripts/bench-compare.sh --skew 0.99 --threads 100
 scripts/bench-dbs.sh stop mysql; scripts/bench-dbs.sh stop postgres   # if you started them yourself
 ```
 

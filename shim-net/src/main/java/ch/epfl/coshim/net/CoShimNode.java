@@ -24,7 +24,7 @@ import java.util.concurrent.TimeUnit;
  * <pre>
  *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
  *       [--lock-timeout-ms T] [--stats-interval-s I] [--allow HOST ...]
- *       [--store memory|URL] [--store-entries N]
+ *       [--store memory|URL]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | nocc (no concurrency
@@ -35,9 +35,9 @@ import java.util.concurrent.TimeUnit;
  *     --allow             a client address allowed to connect (e.g. an RM host), repeatable; default:
  *                         any authenticated client
  *     --store             memory (default), or a server URL jdbc:coshim:mysql://host:port or
- *                         jdbc:coshim:pg://host:port[?user=...]: each database D of the node is
- *                         stored in the SQL database D on that server (which must exist)
- *     --store-entries     keys "0" .. N-1 each SQL store is filled with at start; default 0
+ *                         jdbc:coshim:pg://host:port, with SqlKvStore's parameters (?tables=...&
+ *                         entries=N&pool=N): each database D of the node is stored in the SQL
+ *                         database D on that server (which must exist)
  *
  *   Positional form (still accepted): CoShimNode [port] [shim] [databases] [allowed-client ...]
  * </pre>
@@ -51,7 +51,7 @@ public final class CoShimNode {
 
     /** The parsed command line. */
     record Options(int port, String shim, String[] databases, Duration lockTimeout, long statsIntervalSeconds,
-            Set<InetAddress> allowed, String store, int storeEntries) {
+            Set<InetAddress> allowed, String store) {
 
         static Options parse(String[] args) throws Exception {
             int port = 7000;
@@ -63,7 +63,6 @@ public final class CoShimNode {
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
             String store = "memory";
-            int storeEntries = 0;
             if (args.length > 0 && args[0].startsWith("--")) {
                 for (int i = 0; i < args.length; i++) {
                     String flag = args[i];
@@ -79,7 +78,6 @@ public final class CoShimNode {
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
                         case "--store" -> store = value;
-                        case "--store-entries" -> storeEntries = Integer.parseInt(value);
                         default -> throw new IllegalArgumentException("unknown option " + flag);
                     }
                 }
@@ -92,18 +90,18 @@ public final class CoShimNode {
                 }
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs),
-                    statsIntervalSeconds, allowed, store, storeEntries);
+                    statsIntervalSeconds, allowed, store);
         }
 
         /** {@code database}'s store: the {@code --store} URL with {@code /database} appended (before any {@code ?}). */
         KvStore<TableKey<String>, String> newStore(String database) {
             if (store.equals("memory")) {
-                return KvStores.fromUrl(store, storeEntries);
+                return KvStores.fromUrl(store);
             }
             int query = store.indexOf('?');
             String server = query < 0 ? store : store.substring(0, query);
             String params = query < 0 ? "" : store.substring(query);
-            return KvStores.fromUrl(server + "/" + database + params, storeEntries);
+            return KvStores.fromUrl(server + "/" + database + params);
         }
 
         CoShim<TableKey<String>, String> newShim(KvStore<TableKey<String>, String> store) {

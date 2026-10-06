@@ -11,14 +11,14 @@ public final class KvStores {
 
     /**
      * {@code memory}: an {@link InMemoryKvStore}; {@code jdbc:coshim:mysql://...} or
-     * {@code jdbc:coshim:pg://...}: a {@link SqlKvStore} filled with {@code entries} keys.
+     * {@code jdbc:coshim:pg://...}: a {@link SqlKvStore} (see there for the URL's parameters).
      */
-    public static KvStore<TableKey<String>, String> fromUrl(String url, int entries) {
+    public static KvStore<TableKey<String>, String> fromUrl(String url) {
         if (url.equals("memory")) {
             return new InMemoryKvStore<>();
         }
         if (url.startsWith(SqlKvStore.PREFIX)) {
-            return new SqlKvStore(url, entries);
+            return new SqlKvStore(url);
         }
         throw new IllegalArgumentException("unknown store (memory, jdbc:coshim:mysql://..., jdbc:coshim:pg://...): " + url);
     }
