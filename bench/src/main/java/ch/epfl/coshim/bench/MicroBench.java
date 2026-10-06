@@ -214,19 +214,29 @@ public final class MicroBench implements AutoCloseable {
      */
     private long storedSum(long expectedMin) throws InterruptedException {
         long sum = 0;
+        SQLTransactionRollbackException unsettled = null;
         for (int round = 0; round < 10; round++) {
             sum = 0;
+            unsettled = null;
             for (Participant p : participants) {
                 try {
                     sum += p.sum(config.branches(), config.tableSize());
+                } catch (SQLTransactionRollbackException e) {
+                    // the audit's reads take locks too: behind a branch the TC has not resolved yet,
+                    // one can time out or be aborted with it. Not settled yet: read again
+                    unsettled = e;
+                    break;
                 } catch (SQLException e) {
                     throw new IllegalStateException("audit read failed on " + p.spec(), e);
                 }
             }
-            if (sum >= expectedMin) {
+            if (unsettled == null && sum >= expectedMin) {
                 break;
             }
             Thread.sleep(500);
+        }
+        if (unsettled != null) {
+            throw new IllegalStateException("audit reads kept aborting for 10 rounds", unsettled);
         }
         return sum;
     }

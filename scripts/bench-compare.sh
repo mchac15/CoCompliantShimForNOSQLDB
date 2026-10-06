@@ -130,6 +130,10 @@ for rep in $(seq 1 "$reps"); do
 done
 
 echo "results: $csv (node logs: $logs)"
+if [[ ! -f "$csv" ]]; then
+    echo "no run completed: nothing was written to $csv" >&2
+    exit 1
+fi
 awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i }
          { printf "%-6s %-15s %10s %11s %9s %8s %9s %9s %9s %9s  %s\n",
                   $col["label"], $col["variant"], $col["tps"], $col["abort_rate"], $col["timed_out"], $col["unknown"],
