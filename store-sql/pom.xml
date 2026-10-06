@@ -12,7 +12,7 @@
 
     <artifactId>store-sql</artifactId>
     <name>store-sql</name>
-    <description>KvStore on MySQL or PostgreSQL: get / store translated to SQL, one table per TableKey table</description>
+    <description>KvStore on MySQL or PostgreSQL: get / store translated to SQL</description>
 
     <dependencies>
         <dependency>
@@ -44,12 +44,6 @@
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
-        </dependency>
-        <!-- end-to-end test: a SpeculativeCoShim committing to a real database -->
-        <dependency>
-            <groupId>ch.epfl.coshim</groupId>
-            <artifactId>shim-core</artifactId>
-            <scope>test</scope>
         </dependency>
     </dependencies>
 </project>

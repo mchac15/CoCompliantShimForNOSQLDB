@@ -11,7 +11,7 @@ global transactions that mix both kinds of shim.
 | Module | Depends on | Contents |
 | --- | --- | --- |
 | `store-api` | nothing | `KvStore<K, V>`: the whole database behind `get` / `store`, plus `InMemoryKvStore`; `TableKey` (table, key): a shim manages several tables of its database |
-| `store-sql` | `store-api` | `SqlKvStore`: a MySQL or PostgreSQL database as a `KvStore`. `get` is a `select`, `store` / `storeAll` an upsert (batched, one statement per table); each `TableKey` table is a SQL table `(k, v)`, created on first use, plain keys go to `kv`. Autocommit at READ COMMITTED: the shim does the concurrency control. Transient errors (deadlock, lost connection, ...) are retried. Tests against real databases run when `COSHIM_TEST_MYSQL_URL` / `COSHIM_TEST_PG_URL` are set |
+| `store-sql` | `store-api` | `SqlKvStore`: a MySQL or PostgreSQL database as a `KvStore` (URL `jdbc:coshim:mysql://...` / `jdbc:coshim:pg://...`): `get` is a `select`, `store` an upsert, on one table `kv` filled with N keys at creation; `KvStores.fromUrl` picks in-memory or SQL from the URL |
 | `shim-core` | `store-api` | `CoShim`: the requests a shim receives from client connections (start / get / put / end / prepare / commit / abort). It never runs client code; `SpeculativeCoShim` implements pseudo.txt, and with `speculative = false` is the non-speculative strict-2PL baseline (lock() waits for predecessors to *commit*, no cascades); `ShimStats` counts its commits and aborts by cause; `NoCcShim` is a pass-through shim (no concurrency control) used in tests |
 | `shim-net` | `shim-core` | **Shim nodes**: `CoShimServer` hosts one or more databases, one `CoShim` each, and serves them over TCP to the participants only (shared-token handshake, optional client allowlist); `RemoteCoShim` is the client the RMs use, bound to one database; `CoShimNode` runs a node |
 | `coshim-jdbc` | `shim-core` | The shim as a JDBC "driver": `CoShimDataSource` (`DataSource` + `XADataSource`, URL `jdbc:coshim://host:port/database`), `CoShimXAResource`, `KvSession` (`get(table, key)` / `put(table, key, value)` instead of SQL). No Seata dependency |
@@ -84,8 +84,8 @@ drivers with Sonata's hook in the RM.
 COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode --port 7000 --shim speculative \
     --databases shop,billing --lock-timeout-ms 1000 [--stats-interval-s 10] [--allow RM-host ...]
 # --shim speculative | nonspeculative | nocc; commit/abort counters are logged every interval and at shutdown
-# --store memory (default) | jdbc:mysql://host:3306/{database} | jdbc:postgresql://host:5432/{database}?user=u
-#   each database of the node on its own SQL database ({database} = its name; optional with one database)
+# --store memory (default) | jdbc:coshim:mysql://host:3306 | jdbc:coshim:pg://host:5432 [--store-entries N]
+#   database D of the node lives in SQL database D on that server, table kv filled with keys 0..N-1
 ```
 
 ```java
