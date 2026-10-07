@@ -1,21 +1,35 @@
 #!/usr/bin/env bash
-# Runs the Micro benchmark (bench/, ch.epfl.coshim.bench.MicroBench) through a real Seata TC against
-# shim nodes reached over TCP, once per shim variant with the same options, appends every run to one
-# CSV and prints a comparison.
+# Runs the Micro benchmark (bench/, ch.epfl.coshim.bench.MicroBench) through a real Seata TC, once
+# per variant with the same options, appends every run to one CSV and prints a comparison.
 #
 #   scripts/bench-compare.sh [--reps N] [MicroBench options...]
 #
-# Needs a running Seata TC (default 127.0.0.1:8091; pass --tc host:port otherwise), see README.md.
-# For each variant the script starts SHIMS shim nodes (CoShimNode, one database each, on ports
-# NODE_PORT, NODE_PORT+1, ...), runs MicroBench against them, then stops them; each node's log, with
-# its final commit/abort counters, is kept next to the CSV.
+# Variants:
+#   speculative, nonspeculative, nocc  the shim: SHIMS shim nodes (CoShimNode, one database each, on
+#                                      ports NODE_PORT, NODE_PORT+1, ...), started and stopped for
+#                                      each run; each node's log, with its final commit/abort
+#                                      counters, is kept next to the CSV
+#   speculative-mysql, speculative-pg, the shim on MySQL / PostgreSQL: as above, but each node stores
+#   nonspeculative-mysql, ...          its database sI in SQL database sI on server I of the Sonata
+#                                      variants (same servers, same settings, same tables and keys,
+#                                      same statements; see SqlKvStore), refilled at node start
+#   sonata-mysql, sonata-pg            Sonata: SHIMS MySQL / PostgreSQL servers (scripts/bench-dbs.sh:
+#                                      Acta's settings, fsync off) behind Seata's stock XA proxy, with
+#                                      sonata.enableGlobalSerializability (Sonata's other settings at
+#                                      their defaults). Started once if not running, stopped at the end
+#                                      if this script started them; tables are reset before each run
+#
+# Needs a running Seata TC (default 127.0.0.1:8091; pass --tc host:port otherwise), see README.md,
+# and Docker for the Sonata variants.
 #
 # With no option it runs the "simple test" (50 threads, table size 10000, 2 branches, 2 reads +
-# 2 rmw writes per branch, skew 0.9, 10 s warm-up + 30 s measured) on 2 shims.
+# 2 rmw writes per branch, skew 0.9, 10 s warm-up + 30 s measured) on 2 participants.
 # Examples: scripts/bench-compare.sh --reps 3 --skew 0.99 --threads 100
 #           SHIMS=4 scripts/bench-compare.sh --parallel-branches true --txn-timeout-ms 500
+#           VARIANTS="speculative sonata-mysql sonata-pg" scripts/bench-compare.sh
 # Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), VARIANTS ("speculative nonspeculative"),
-#      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o).
+#      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o), and
+#      scripts/bench-dbs.sh's MYSQL_PORT, PG_PORT, ...
 # Exit code 1 if any run printed a warning or failed its audit.
 set -euo pipefail
 
@@ -33,12 +47,22 @@ export COSHIM_TOKEN="${COSHIM_TOKEN:-bench-$RANDOM$RANDOM}"
 cd "$root"
 
 tc="127.0.0.1:8091"
+threads=50
+branches=2
+table_size=10000
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
-    if [[ "${args[$i]}" == "--tc" ]]; then
-        tc="${args[$((i + 1))]}"
-    fi
+    case "${args[$i]}" in
+        --tc) tc="${args[$((i + 1))]}" ;;
+        --threads) threads="${args[$((i + 1))]}" ;;
+        --branches) branches="${args[$((i + 1))]}" ;;
+        --table-size) table_size="${args[$((i + 1))]}" ;;
+    esac
 done
+# the tables MicroBench uses (branch i -> micro-i), and the connection pool size SqlParticipant gives
+# each Sonata server: the shim nodes' SQL stores get the same
+tables="$(seq -s, -f 'micro-%g' 0 $((branches - 1)))"
+sql_pool=$((threads * branches * 2 + 4))
 if ! (exec 3<>"/dev/tcp/${tc%:*}/${tc#*:}") 2>/dev/null; then
     echo "no Seata TC at $tc: start one first (see README.md, Benchmark)" >&2
     exit 2
@@ -67,17 +91,67 @@ stop_nodes() {
     done
     nodes=()
 }
-trap 'stop_nodes; rm -f "$cp_file"' EXIT
+started_dbs=()
+stop_dbs() {
+    for kind in "${started_dbs[@]}"; do
+        "$root/scripts/bench-dbs.sh" stop "$kind" || true
+    done
+}
+trap 'stop_nodes; stop_dbs; rm -f "$cp_file"' EXIT
+
+# kind of SQL server a variant runs on (mysql, postgres), or nothing for the in-memory shim
+db_kind() {
+    case "$1" in
+        *-mysql) echo mysql ;;
+        *-pg) echo postgres ;;
+    esac
+}
+
+# the SQL variants' databases: started once, before the first run
+for variant in $variants; do
+    kind="$(db_kind "$variant")"
+    [[ -n $kind ]] || continue
+    if ! docker container inspect "coshim-bench-$kind-0" > /dev/null 2>&1; then
+        echo "starting $shims $kind server(s)"
+        started_dbs+=("$kind")
+        "$root/scripts/bench-dbs.sh" start "$kind" "$shims" > /dev/null
+    fi
+done
 
 status=0
 for rep in $(seq 1 "$reps"); do
     for variant in $variants; do
+        case "$variant" in
+            sonata-mysql | sonata-pg)
+                kind=$([[ $variant == sonata-mysql ]] && echo mysql || echo postgres)
+                java -cp "$cp" ch.epfl.coshim.bench.MicroBench --variant "$variant" \
+                    --shims "$("$root/scripts/bench-dbs.sh" urls "$kind" "$shims")" --sonata true "$@" \
+                    --csv "$csv" --label "rep$rep" || status=1
+                echo
+                continue
+                ;;
+        esac
+        kind="$(db_kind "$variant")"
         for ((s = 0; s < shims; s++)); do
             port=$((base_port + s))
-            java -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "$variant" --databases "s$s" \
-                --lock-timeout-ms "$lock_timeout" --stats-interval-s 0 > "$logs/rep$rep-$variant-s$s.log" 2>&1 &
+            store=memory
+            if [[ -n $kind ]]; then
+                "$root/scripts/bench-dbs.sh" createdb "$kind" "$s" "s$s"
+                server="$("$root/scripts/bench-dbs.sh" urls "$kind" "$shims" | cut -d, -f$((s + 1)))"
+                server="${server%/*}"                            # jdbc:mysql://127.0.0.1:3306
+                [[ $kind == mysql ]] || server="${server/postgresql/pg}"
+                store="${server/jdbc:/jdbc:coshim:}?tables=$tables&entries=$table_size&pool=$sql_pool"
+            fi
+            java -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "${variant%-*}" --databases "s$s" \
+                --lock-timeout-ms "$lock_timeout" --stats-interval-s 0 --store "$store" \
+                > "$logs/rep$rep-$variant-s$s.log" 2>&1 &
             nodes+=($!)
             until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
+                if ! kill -0 "$!" 2>/dev/null; then
+                    echo "node s$s exited, see $logs/rep$rep-$variant-s$s.log" >&2
+                    cat "$logs/rep$rep-$variant-s$s.log" >&2
+                    exit 1
+                fi
                 sleep 0.2
             done
         done
@@ -90,8 +164,12 @@ for rep in $(seq 1 "$reps"); do
 done
 
 echo "results: $csv (node logs: $logs)"
+if [[ ! -f "$csv" ]]; then
+    echo "no run completed: nothing was written to $csv" >&2
+    exit 1
+fi
 awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i }
-         { printf "%-6s %-15s %10s %11s %9s %8s %9s %9s %9s %9s\n",
+         { printf "%-6s %-15s %10s %11s %9s %8s %9s %9s %9s %9s  %s\n",
                   $col["label"], $col["variant"], $col["tps"], $col["abort_rate"], $col["timed_out"], $col["unknown"],
-                  $col["mean_us"], $col["p50_us"], $col["p99_us"], $col["audit_ok"] }' "$csv"
+                  $col["mean_us"], $col["p50_us"], $col["p99_us"], $col["audit_ok"], $col["branch_failures"] }' "$csv"
 exit "$status"

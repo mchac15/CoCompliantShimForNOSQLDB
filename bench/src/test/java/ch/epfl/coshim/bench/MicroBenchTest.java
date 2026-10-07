@@ -16,12 +16,15 @@ import ch.epfl.coshim.store.TableKey;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.sql.SQLException;
+import java.sql.SQLTransactionRollbackException;
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import javax.transaction.xa.XAException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -71,6 +74,32 @@ class MicroBenchTest {
         BenchConfig c = config("--threads", "64", "--shims", "h1:7000/a, h2:7001/b,h3:7002/c", "--csv", "x.csv");
         assertEquals(64, c.threads());
         assertEquals(List.of("h1:7000/a", "h2:7001/b", "h3:7002/c"), c.shims());
+    }
+
+    @Test
+    void parseAcceptsSonataDatabases() {
+        BenchConfig c = config("--shims", "jdbc:mysql://h1:3306/acta,jdbc:postgresql://h2:5432/acta?user=x",
+                "--sonata", "true");
+        assertTrue(c.sonata());
+        assertEquals(List.of("jdbc:mysql://h1:3306/acta", "jdbc:postgresql://h2:5432/acta?user=x"), c.shims());
+        assertTrue(Participant.isCoShim("h1:7000/a"));
+        assertTrue(!Participant.isCoShim("jdbc:mysql://h1:3306/acta"));
+        assertThrows(IllegalArgumentException.class, () -> config("--shims", "jdbc:oracle:thin:@h:1521/x"));
+    }
+
+    @Test
+    void branchFailuresAreClassified() {
+        SQLException mysqlDeadlock = new SQLTransactionRollbackException("Deadlock found", "40001", 1213);
+        assertEquals("deadlock", MicroBench.failureCause(new SQLException("wrapped", mysqlDeadlock)));
+        assertEquals("lock_timeout", MicroBench.failureCause(new SQLException("Lock wait timeout", "HY000", 1205)));
+        assertEquals("serialization", MicroBench.failureCause(new SQLException("could not serialize", "40001")));
+        assertEquals("deadlock", MicroBench.failureCause(new SQLException("deadlock detected", "40P01")));
+        assertEquals("serialization", MicroBench.failureCause(new SQLException("prepare failed",
+                new XAException("PostgreSQL dummy write of global txn branch (x) failed due to serialization failure"))));
+        assertEquals("xa_rollback", MicroBench.failureCause(new SQLException("prepare failed",
+                new XAException(XAException.XA_RBROLLBACK))));
+        assertEquals("shim_abort", MicroBench.failureCause(new SQLTransactionRollbackException("aborted")));
+        assertEquals("other:IllegalStateException", MicroBench.failureCause(new SQLException(new IllegalStateException())));
     }
 
     /** 20 hot keys per table, 8 workers, every txn writes 4 of them; both variants, both branch modes. */
