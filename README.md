@@ -292,6 +292,20 @@ scripts/bench-sql-compare.sh                                   # the default swe
 SKEWS="0.9 0.99" REPS=5 LOCK_TIMEOUT_MS=100 scripts/bench-sql-compare.sh --threads 50
 ```
 
+`scripts/bench-lock-timeout-sweep.py` repeats that sweep over the shim's lock timeout (1, 5, 10, 20,
+50, 100 ms; 50 threads, table size 10000, 3 reps; about 1h45) and plots, per skew, throughput and
+abort rate against the lock timeout (`bench-results/lock-timeout-<ts>/skew-<s>.png`, all skews in
+`overview.png`). The lock timeout only reaches the shim nodes, so Sonata runs once per skew and is
+drawn flat (`--sonata-each-timeout` reruns it at every timeout). It needs matplotlib; `--out DIR`
+resumes a sweep that stopped, `plot DIR` re-plots one.
+
+```sh
+python -m venv .venv && .venv/bin/pip install matplotlib
+.venv/bin/python scripts/bench-lock-timeout-sweep.py                     # the default sweep
+.venv/bin/python scripts/bench-lock-timeout-sweep.py --reps 1 --lock-timeouts 1 10 100 -- --warmup-s 5
+.venv/bin/python scripts/bench-lock-timeout-sweep.py plot bench-results/lock-timeout-<ts>
+```
+
 `bench-compare.sh` starts the databases it needs (and stops them at the end) unless they already
 run. The CSV gains `branch_failures`: failed branches in the measurement window by cause
 (`deadlock`, `lock_timeout`, `serialization`, `xa_rollback` = NO vote, `shim_abort`, `tc_refused`,
