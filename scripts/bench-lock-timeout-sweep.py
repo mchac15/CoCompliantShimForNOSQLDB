@@ -19,8 +19,8 @@ Output, in DIR = bench-results/lock-timeout-<timestamp>/:
   overview.png     all skews in one figure (columns: skews; rows: tps, abort rate)
   sweep.csv        every run, with a lock_timeout_ms column (empty for Sonata run once)
 
-A sweep that stops halfway can be resumed with --out DIR: the timeouts (and Sonata) whose
-summary.md exists are skipped.
+A sweep that stops halfway can be resumed with --out DIR: the timeouts (and Sonata) with a
+summary.md and every skew's CSV are skipped.
 
 Needs a running Seata TC, Docker, and matplotlib (python -m venv .venv && .venv/bin/pip install
 matplotlib). Example: scripts/bench-lock-timeout-sweep.py --reps 3 -- --warmup-s 5
@@ -102,7 +102,7 @@ def run(args, microbench_args):
         if sonata_variants and not args.sonata_each_timeout:
             jobs.append((out / "sonata", sonata_variants, None))
         for i, (d, vs, t) in enumerate(jobs, 1):
-            if (d / "summary.md").exists():
+            if (d / "summary.md").exists() and all((d / f"skew-{s}.csv").exists() for s in args.skews):
                 print(f"skipping {d.name}: already done")
                 continue
             print(f"\n[{i}/{len(jobs)}]", end="")
