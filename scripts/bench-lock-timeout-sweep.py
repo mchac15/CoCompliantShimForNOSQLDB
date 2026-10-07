@@ -107,6 +107,10 @@ def run(args, microbench_args):
                 continue
             print(f"\n[{i}/{len(jobs)}]", end="")
             status |= run_compare(d, vs, args.skews, t, args, microbench_args)
+            if not any(d.glob("skew-*.csv")):   # not one run: the setup is broken (servers, TC), stop here
+                print(f"\n{d.name} produced no run, stopping the sweep (see the errors above); "
+                      f"fix it and resume with --out {out}", file=sys.stderr)
+                return 1
     finally:
         if not args.keep_dbs:
             for kind in to_stop:
