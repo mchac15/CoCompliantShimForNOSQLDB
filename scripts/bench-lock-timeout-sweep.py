@@ -5,7 +5,7 @@
     scripts/bench-lock-timeout-sweep.py plot DIR            # re-plots an existing sweep
 
 For each lock timeout (default 1 5 10 20 50 100 ms) it runs scripts/bench-sql-compare.sh with
-LOCK_TIMEOUT_MS set, the shim variants only, over the skews (default 0.5 0.9 0.99) at a fixed
+LOCK_TIMEOUT_MS set, the shim variants only, over the skews (default 0.5 0.99), once each, at a fixed
 thread count (50) and table size (10000). The lock timeout is an option of the shim nodes only:
 Sonata's lock waits are the servers' (innodb_lock_wait_timeout / lock_timeout, scripts/bench-dbs.sh),
 so Sonata runs once per skew and is drawn as a flat reference line (--sonata-each-timeout reruns it
@@ -15,7 +15,7 @@ started them.
 Output, in DIR = bench-results/lock-timeout-<timestamp>/:
   lt-<T>ms/        bench-sql-compare.sh's output for the shim variants at lock timeout T
   sonata/          bench-sql-compare.sh's output for the Sonata variants (once, or lt-<T>ms/ holds them)
-  skew-<s>.png     tps and abort rate against the lock timeout at skew s (mean over reps, min-max band)
+  skew-<s>.png     tps and abort rate against the lock timeout at skew s (with --reps > 1: mean, min-max band)
   overview.png     all skews in one figure (columns: skews; rows: tps, abort rate)
   sweep.csv        every run, with a lock_timeout_ms column (empty for Sonata run once)
 
@@ -230,7 +230,8 @@ def plot(out):
     reps = max(len([r for r in rows if r["skew"] == s and r["variant"] == v and r["lock_timeout_ms"] == t])
                for s in skews for v in variants for t in timeouts + [None]) or 1
     options = setup_line(out)
-    note = f"mean over {reps} rep(s), band: min-max" + (f"   |   {options}" if options else "")
+    note = ("one run per point" if reps == 1 else f"mean over {reps} reps, band: min-max") \
+        + (f"   |   {options}" if options else "")
     plt.rcParams.update({"font.size": 10, "axes.titlesize": 11, "figure.facecolor": "white"})
 
     def legend(fig, axes):
@@ -293,14 +294,15 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                 epilog="Arguments after -- go to MicroBench (through bench-sql-compare.sh).")
     p.add_argument("--lock-timeouts", type=int, nargs="+", default=[1, 5, 10, 20, 50, 100], metavar="MS")
-    p.add_argument("--skews", nargs="+", default=["0.5", "0.9", "0.99"])
+    p.add_argument("--skews", nargs="+", default=["0.5", "0.99"])
     p.add_argument("--threads", type=int, default=50)
     p.add_argument("--table-size", type=int, default=10000)
-    p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--reps", type=int, default=1)
     p.add_argument("--warmup-s", type=int, default=10)
     p.add_argument("--measure-s", type=int, default=30)
-    p.add_argument("--variants", default="speculative-mysql sonata-mysql speculative-pg sonata-pg",
-                   help="bench-compare.sh variants (default: %(default)s); add e.g. nonspeculative-mysql")
+    p.add_argument("--variants", default="speculative-mysql nonspeculative-mysql sonata-mysql "
+                                     "speculative-pg nonspeculative-pg sonata-pg",
+                   help="bench-compare.sh variants (default: %(default)s)")
     p.add_argument("--sonata-each-timeout", action="store_true",
                    help="rerun Sonata at every lock timeout instead of once per skew")
     p.add_argument("--keep-dbs", action="store_true", help="leave the servers running at the end")

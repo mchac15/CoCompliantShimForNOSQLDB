@@ -293,8 +293,9 @@ SKEWS="0.9 0.99" REPS=5 LOCK_TIMEOUT_MS=100 scripts/bench-sql-compare.sh --threa
 ```
 
 `scripts/bench-lock-timeout-sweep.py` repeats that sweep over the shim's lock timeout (1, 5, 10, 20,
-50, 100 ms; 50 threads, table size 10000, 3 reps; about 1h45) and plots, per skew, throughput and
-abort rate against the lock timeout (`bench-results/lock-timeout-<ts>/skew-<s>.png`, all skews in
+50, 100 ms; skews 0.5 and 0.99; the speculative and non-speculative shim and Sonata on MySQL and
+PostgreSQL; 50 threads, table size 10000; one run per configuration, `--reps N` for more; about 45 min)
+and plots, per skew, throughput and abort rate against the lock timeout (`bench-results/lock-timeout-<ts>/skew-<s>.png`, all skews in
 `overview.png`). The lock timeout only reaches the shim nodes, so Sonata runs once per skew and is
 drawn flat (`--sonata-each-timeout` reruns it at every timeout). It needs matplotlib; `--out DIR`
 resumes a sweep that stopped, `plot DIR` re-plots one.
