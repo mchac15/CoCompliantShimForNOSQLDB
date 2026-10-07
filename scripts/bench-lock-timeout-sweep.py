@@ -28,6 +28,7 @@ matplotlib). Example: scripts/bench-lock-timeout-sweep.py --reps 3 -- --warmup-s
 
 import argparse
 import csv
+import fcntl
 import os
 import subprocess
 import sys
@@ -84,6 +85,15 @@ def running(kind):
 
 
 def run(args, microbench_args):
+    # one sweep at a time: two share the servers and node ports, and each stops the servers it started
+    (ROOT / "bench-results").mkdir(exist_ok=True)
+    lock = open(ROOT / "bench-results/.lock-timeout-sweep.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another bench-lock-timeout-sweep.py is running (it would share the servers and node ports);"
+              " wait for it or stop it first", file=sys.stderr)
+        return 2
     out = Path(args.out) if args.out else ROOT / f"bench-results/lock-timeout-{datetime.now():%Y%m%d-%H%M%S}"
     out.mkdir(parents=True, exist_ok=True)
     variants = args.variants.split()
