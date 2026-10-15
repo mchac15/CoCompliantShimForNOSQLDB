@@ -1,0 +1,8 @@
+speculation_ds: speculated: boolean, commited:boolean,finished:boolean
+
+concurrenthashmap:key->moving_array[speculation_ds] of size n decide based on majority outcome
+moving_array: array of speculation_ds of size n,FIFO of size n
+at each lock acquire add the key with the speculation decision to the concurrenthashmap
+on commit/abort: update each entry inside of the lock key map per transaction, with its specific outcome(speculated, committed, finished)
+
+all of this would help with the main reason for abortions which is cascading aborts
