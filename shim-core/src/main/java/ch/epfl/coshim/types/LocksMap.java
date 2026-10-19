@@ -62,7 +62,9 @@ public class LocksMap<K, V> {
     /** txn is doomed or no longer running, or lost an RMW-vs-RMW upgrade: abort it. */
     MUST_ABORT,
     /** lock_timeout expired while waiting (assumed deadlock): abort it. */
-    TIMED_OUT
+    TIMED_OUT,
+    /** Deadlock prevention: it would have waited for a younger txn: abort it. */
+    DIE
   }
 
   /**
@@ -227,6 +229,7 @@ public class LocksMap<K, V> {
       case READY -> LockResult.ACQUIRED;
       case DOOMED -> LockResult.MUST_ABORT;
       case TIMED_OUT -> LockResult.TIMED_OUT;
+      case DIE -> LockResult.DIE;
     };
   }
 }
