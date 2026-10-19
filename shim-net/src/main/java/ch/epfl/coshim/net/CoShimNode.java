@@ -28,7 +28,9 @@ import java.util.concurrent.TimeUnit;
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | nocc (no concurrency
- *                         control); default nocc
+ *                         control); default nocc. speculative-waitdie / nonspeculative-waitdie: the
+ *                         same with wait-die deadlock prevention (a txn dies instead of waiting
+ *                         for a younger one; lock timeout as a backstop)
  *     --databases         comma-separated database names; default "default"
  *     --lock-timeout-ms   lock_timeout of speculative/nonspeculative; default 200
  *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
@@ -107,9 +109,13 @@ public final class CoShimNode {
         CoShim<TableKey<String>, String> newShim(KvStore<TableKey<String>, String> store) {
             return switch (shim) {
                 case "speculative" -> new SpeculativeCoShim<>(store, lockTimeout,
-                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true);
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, false);
                 case "nonspeculative" -> new SpeculativeCoShim<>(store, lockTimeout,
-                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false);
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, false);
+                case "speculative-waitdie" -> new SpeculativeCoShim<>(store, lockTimeout,
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, true);
+                case "nonspeculative-waitdie" -> new SpeculativeCoShim<>(store, lockTimeout,
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, true);
                 case "nocc" -> new NoCcShim<>(store);
                 default -> throw new IllegalArgumentException("unknown shim " + shim);
             };

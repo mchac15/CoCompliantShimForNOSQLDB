@@ -48,6 +48,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
   /** Hands out txn ages at start(): a later start() is younger. */
   private final AtomicLong timestampGenerator = new AtomicLong();
+  private final boolean waitDie;
 
   public SpeculativeCoShim(KvStore<K, V> store, Duration lockTimeout) {
     this(store, lockTimeout, DEFAULT_TOMBSTONE_TTL);
@@ -67,6 +68,20 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
    */
   public SpeculativeCoShim(
       KvStore<K, V> store, Duration lockTimeout, Duration tombstoneTtl, boolean speculative) {
+    this(store, lockTimeout, tombstoneTtl, speculative, true);
+  }
+
+  /**
+   * @param waitDie wait-die deadlock prevention; false: every txn gets the same age, so none dies
+   *     and only lockTimeout breaks deadlocks
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      boolean waitDie) {
+    this.waitDie = waitDie;
     this.locksMap = new LocksMap<>(speculative);
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
@@ -101,7 +116,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   @Override
   public Outcome start(String txnId) {
     Transaction<K, V> txn =
-        new Transaction<>(txnId, Status.STARTED, null, timestampGenerator.incrementAndGet());
+        new Transaction<>(
+            txnId, Status.STARTED, null, waitDie ? timestampGenerator.incrementAndGet() : 0);
     if (transactionsMap.putIfAbsent(txnId, txn) != null) {
       return Outcome.FAILED; // already registered or tombstone
     }

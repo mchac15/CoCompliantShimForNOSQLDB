@@ -43,7 +43,9 @@ DB_COLORS = {"mysql": "#2a78d6", "pg": "#eb6834"}
 DB_NAMES = {"mysql": "MySQL", "pg": "PostgreSQL"}
 SYSTEM_STYLES = {
     "speculative": dict(linestyle="-", marker="o", name="shim"),
+    "speculative-waitdie": dict(linestyle="-", marker="D", name="shim + wait-die"),
     "nonspeculative": dict(linestyle=":", marker="s", name="non-speculative shim"),
+    "nonspeculative-waitdie": dict(linestyle=":", marker="v", name="non-speculative shim + wait-die"),
     "nocc": dict(linestyle="-.", marker="^", name="no-CC shim"),
     "sonata": dict(linestyle="--", marker=None, name="Sonata"),
 }
