@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.InMemoryKvStore;
@@ -89,6 +90,38 @@ class SpeculativeCoShimTest {
         assertEquals(1, shim.stats().aborts(AbortCause.CASCADE));
         assertEquals(2, shim.stats().aborts());
         assertEquals(0, shim.stats().commits());
+    }
+
+    @Test
+    void speculativeGrantIsCountedWithTheWaitItSaved() throws Exception {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r");
+        shim.get("r", "x");   // granted on w, executed but not committed: depth 1
+        shim.end("r");
+        Thread.sleep(50);
+        assertEquals(Vote.YES, shim.prepare("w"));
+        shim.commit("w");
+        assertEquals(Vote.YES, shim.prepare("r"));
+        shim.commit("r");
+        assertEquals(1, shim.stats().commitsAtDepth(0), "w speculated on nothing");
+        assertEquals(1, shim.stats().commitsAtDepth(1));
+        assertTrue(shim.stats().savedUsAtDepth(1) >= 50_000, shim.stats().speculationSummary());
+        assertEquals(0, shim.stats().savedUsAtDepth(0));
+    }
+
+    @Test
+    void cascadeFanoutIsCounted() {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r1");
+        shim.get("r1", "x");
+        shim.start("r2");
+        shim.get("r2", "x");
+        shim.abort("w");
+        assertEquals(1, shim.stats().abortsWithFanout(2), shim.stats().speculationSummary());
     }
 
     // ---- non-speculative baseline: same shim, lock() waits for the predecessors to commit ----

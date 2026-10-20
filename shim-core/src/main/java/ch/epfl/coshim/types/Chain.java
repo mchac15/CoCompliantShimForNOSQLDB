@@ -2,6 +2,7 @@ package ch.epfl.coshim.types;
 
 import ch.epfl.coshim.types.LockType.LockMode;
 import ch.epfl.coshim.types.Transaction.Status;
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
@@ -36,7 +37,9 @@ class Chain<K, V> {
     /** txn is aborted or must_abort. */
     DOOMED,
     /** The deadline passed (or the thread was interrupted). */
-    TIMED_OUT
+    TIMED_OUT,
+    /** Deadlock prevention: txn would wait for a younger txn, so it aborts instead. */
+    DIE
   }
 
   private final K key;
@@ -139,6 +142,11 @@ class Chain<K, V> {
    * replaced while waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn
    * waits until it is spliced out (the cascade marks the dependents before that).
    *
+   * <p>Deadlock prevention, in the bounded (execution phase) wait only: a txn waits only for older
+   * txns and dies instead of waiting for a younger one, so no wait-for cycle can form. Chains are
+   * FIFO, so the common case (younger behind older) still waits. prepare() is unbounded and never
+   * dies: its waits are left to the coordinator.
+   *
    * @param deadlineNanos a {@link System#nanoTime()} deadline, used only if {@code bounded}
    */
   synchronized WaitResult awaitPredecessor(
@@ -149,7 +157,13 @@ class Chain<K, V> {
       }
       LockNode<K, V> pred = txn.getLock(key).node().getPrev();
       if (pred == null || pred.allHoldersIn(ready)) {
+        if (bounded) {
+          recordGrant(txn, pred);
+        }
         return WaitResult.READY;
+      }
+      if (bounded && pred.hasYoungerHolderNotIn(txn, ready)) {
+        return WaitResult.DIE;
       }
       try {
         if (bounded) {
@@ -166,6 +180,23 @@ class Chain<K, V> {
         return WaitResult.TIMED_OUT;
       }
     }
+  }
+
+  /** Statistics only: the uncommitted txns ahead of txn's node, and on how many nodes. */
+  private void recordGrant(Transaction<K, V> txn, LockNode<K, V> pred) {
+    int depth = 0;
+    List<Transaction<K, V>> pending = new ArrayList<>();
+    for (LockNode<K, V> n = pred; n != null; n = n.getPrev()) {
+      boolean any = false;
+      for (Transaction<K, V> t : n.getHolders()) {
+        if (t.getStatus() != Status.COMMITTED) {
+          pending.add(t);
+          any = true;
+        }
+      }
+      depth += any ? 1 : 0;
+    }
+    txn.recordGrant(depth, pending);
   }
 
   /**

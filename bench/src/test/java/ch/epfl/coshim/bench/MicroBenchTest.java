@@ -66,6 +66,32 @@ class MicroBenchTest {
     }
 
     @Test
+    void opCountsFollowTheTruncatedNormal() {
+        BenchConfig c = config("--ops-mean", "3", "--ops-sd", "1.5", "--ops-max", "10", "--branches", "2");
+        long ops = 0;
+        long branches = 0;
+        for (int i = 0; i < 20_000; i++) {
+            for (MicroBench.Branch b : MicroBench.randomPlan(c, 2)) {
+                int r = b.readKeys().size();
+                int w = b.writeKeys().size();
+                assertTrue(r >= 0 && r <= 10 && w >= 0 && w <= 10);
+                assertTrue(r + w > 0, "a branch has at least one op");
+                ops += r + w;
+                branches++;
+            }
+        }
+        double mean = (double) ops / branches / 2;
+        assertTrue(Math.abs(mean - 3) < 0.15, "mean ops per kind " + mean);
+        assertEquals(0, config().drawThinkNanos(), "no think time by default");
+        BenchConfig think = config("--think-mean-us", "2000", "--think-sd-us", "1000");
+        for (int i = 0; i < 1000; i++) {
+            assertTrue(think.drawThinkNanos() >= 0);
+        }
+        // the hot/cold capacity check uses the largest draw: 2 branches x 20 ops do not fit 30 keys
+        assertThrows(IllegalArgumentException.class, () -> config("--ops-mean", "3", "--table-size", "30"));
+    }
+
+    @Test
     void parseRejectsImpossibleWorkloads() {
         assertThrows(IllegalArgumentException.class, () -> config("--table-size", "10", "--skew", "0.9"));
         assertThrows(IllegalArgumentException.class, () -> config("--shims", "localhost:7000"));

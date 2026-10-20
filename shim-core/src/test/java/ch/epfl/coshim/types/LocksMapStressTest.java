@@ -114,7 +114,7 @@ class LocksMapStressTest {
       String key = KEYS.get(rnd.nextInt(KEYS.size()));
       LockMode mode = rnd.nextBoolean() ? LockMode.SHARED : LockMode.EXCLUSIVE;
       LockResult r = locks.lock(key, t, mode, LOCK_TIMEOUT);
-      if (r == LockResult.MUST_ABORT || r == LockResult.TIMED_OUT) {
+      if (r == LockResult.MUST_ABORT || r == LockResult.TIMED_OUT || r == LockResult.DIE) {
         return false;
       }
       if (mode == LockMode.EXCLUSIVE) {
