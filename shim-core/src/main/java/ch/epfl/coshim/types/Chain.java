@@ -37,7 +37,9 @@ class Chain<K, V> {
     /** txn is aborted or must_abort. */
     DOOMED,
     /** The deadline passed (or the thread was interrupted). */
-    TIMED_OUT
+    TIMED_OUT,
+    /** Deadlock prevention: txn would wait for a younger txn, so it aborts instead. */
+    DIE
   }
 
   private final K key;
@@ -140,6 +142,11 @@ class Chain<K, V> {
    * replaced while waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn
    * waits until it is spliced out (the cascade marks the dependents before that).
    *
+   * <p>Deadlock prevention, in the bounded (execution phase) wait only: a txn waits only for older
+   * txns and dies instead of waiting for a younger one, so no wait-for cycle can form. Chains are
+   * FIFO, so the common case (younger behind older) still waits. prepare() is unbounded and never
+   * dies: its waits are left to the coordinator.
+   *
    * @param deadlineNanos a {@link System#nanoTime()} deadline, used only if {@code bounded}
    */
   synchronized WaitResult awaitPredecessor(
@@ -154,6 +161,9 @@ class Chain<K, V> {
           recordGrant(txn, pred);
         }
         return WaitResult.READY;
+      }
+      if (bounded && pred.hasYoungerHolderNotIn(txn, ready)) {
+        return WaitResult.DIE;
       }
       try {
         if (bounded) {

@@ -73,6 +73,19 @@ public class LockNode<K, V> {
     return true;
   }
 
+  /**
+   * ∃ t in holders, t.status ∉ statuses ∧ t is younger than txn: txn would wait for a younger txn.
+   * Holders already in {@code statuses} are not waited for, so they do not count.
+   */
+  boolean hasYoungerHolderNotIn(Transaction<K, V> txn, Set<Transaction.Status> statuses) {
+    for (Transaction<K, V> t : holders) {
+      if (t.getTs() > txn.getTs() && !statuses.contains(t.getStatus())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   boolean isUpgraded() {
     return upgraded;
   }

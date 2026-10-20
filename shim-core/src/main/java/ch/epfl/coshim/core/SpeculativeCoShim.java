@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The speculative CO-compliant shim of pseudo.txt (S2PL + speculation at {@code executed}). The
@@ -45,6 +46,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   private final LocksMap<K, V> locksMap;
   private final ShimStats stats = new ShimStats();
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
+  /** Hands out txn ages at start(): a later start() is younger. */
+  private final AtomicLong timestampGenerator = new AtomicLong();
 
   public SpeculativeCoShim(KvStore<K, V> store, Duration lockTimeout) {
     this(store, lockTimeout, DEFAULT_TOMBSTONE_TTL);
@@ -97,7 +100,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
 
   @Override
   public Outcome start(String txnId) {
-    Transaction<K, V> txn = new Transaction<>(txnId, Status.STARTED, null);
+    Transaction<K, V> txn =
+        new Transaction<>(txnId, Status.STARTED, null, timestampGenerator.incrementAndGet());
     if (transactionsMap.putIfAbsent(txnId, txn) != null) {
       return Outcome.FAILED; // already registered or tombstone
     }
@@ -128,7 +132,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   public V get(String txnId, K key) {
     Transaction<K, V> txn = running(txnId);
     LockResult res = locksMap.lock(key, txn, LockType.LockMode.SHARED, lockTimeout);
-    if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT) {
+    if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("get: lock failed, must abort");
     }
@@ -156,7 +160,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     Objects.requireNonNull(value, "values are non-null");
     Transaction<K, V> txn = running(txnId);
     LockResult res = locksMap.lock(key, txn, LockType.LockMode.EXCLUSIVE, lockTimeout);
-    if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT) {
+    if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("put: lock failed, must abort");
     }
@@ -248,7 +252,11 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
 
   private static AbortCause lockFailure(LockResult res) {
     // MUST_ABORT of a txn that was not marked: it lost an upgrade race (a marked one counts as cascade)
-    return res == LockResult.TIMED_OUT ? AbortCause.LOCK_TIMEOUT : AbortCause.UPGRADE_CONFLICT;
+    return switch (res) {
+      case TIMED_OUT -> AbortCause.LOCK_TIMEOUT;
+      case DIE -> AbortCause.DEADLOCK_PREVENTION;
+      default -> AbortCause.UPGRADE_CONFLICT;
+    };
   }
 
   /**

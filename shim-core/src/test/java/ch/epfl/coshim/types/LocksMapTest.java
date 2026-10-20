@@ -31,6 +31,11 @@ class LocksMapTest {
     return new Transaction<>(id, Status.STARTED, null);
   }
 
+  /** A txn of age ts (smaller = older). */
+  private static Transaction<String, String> txn(String id, long ts) {
+    return new Transaction<>(id, Status.STARTED, null, ts);
+  }
+
   private void enqueue(Transaction<String, String> t, LockMode mode) {
     assertNotNull(locks.enqueue("x", t, mode));
   }
@@ -244,6 +249,74 @@ class LocksMapTest {
     assertEquals(LockResult.MUST_ABORT, f.get(2, TimeUnit.SECONDS));
     assertEquals(Status.MUST_ABORT, b.getStatus());
     assertTrue(finished.isEmpty(), "b was still running: its own thread aborts it");
+  }
+
+  // ---- deadlock prevention: wait only for older txns ----
+
+  @Test
+  void anOlderTxnDiesInsteadOfWaitingForAYoungerOne() {
+    Transaction<String, String> young = txn("young", 2);
+    Transaction<String, String> old = txn("old", 1);
+    locks.lock("x", young, LockMode.EXCLUSIVE, LONG);
+
+    assertEquals(LockResult.DIE, locks.lock("x", old, LockMode.SHARED, LONG));
+  }
+
+  @Test
+  void aYoungerTxnWaitsForAnOlderOne() throws Exception {
+    Transaction<String, String> old = txn("old", 1);
+    Transaction<String, String> young = txn("young", 2);
+    locks.lock("x", old, LockMode.EXCLUSIVE, LONG);
+    CompletableFuture<LockResult> f =
+        CompletableFuture.supplyAsync(() -> locks.lock("x", young, LockMode.SHARED, LONG));
+    assertBlocked(f);
+
+    set(old, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  @Test
+  void oneYoungerRunningReaderAmongOlderOnesIsEnoughToDie() {
+    Transaction<String, String> oldest = txn("oldest", 1);
+    Transaction<String, String> mid = txn("mid", 2);
+    Transaction<String, String> youngest = txn("youngest", 3);
+    locks.lock("x", oldest, LockMode.SHARED, LONG);
+    locks.lock("x", youngest, LockMode.SHARED, LONG);
+
+    assertEquals(LockResult.DIE, locks.lock("x", mid, LockMode.EXCLUSIVE, LONG));
+  }
+
+  @Test
+  void anExecutedYoungerHolderIsNotWaitedForSoDoesNotCount() throws Exception {
+    Transaction<String, String> oldest = txn("oldest", 1);
+    Transaction<String, String> mid = txn("mid", 2);
+    Transaction<String, String> youngest = txn("youngest", 3);
+    locks.lock("x", oldest, LockMode.SHARED, LONG);
+    locks.lock("x", youngest, LockMode.SHARED, LONG);
+    set(youngest, Status.EXECUTED);
+    CompletableFuture<LockResult> f =
+        CompletableFuture.supplyAsync(() -> locks.lock("x", mid, LockMode.EXCLUSIVE, LONG));
+    assertBlocked(f);
+
+    set(oldest, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  @Test
+  void prepareWaitsForAYoungerPredecessorInsteadOfDying() throws Exception {
+    Transaction<String, String> young = txn("young", 2);
+    Transaction<String, String> old = txn("old", 1);
+    enqueue(young, LockMode.EXCLUSIVE);
+    enqueue(old, LockMode.EXCLUSIVE);
+    set(young, Status.PREPARED);
+    set(old, Status.EXECUTED);
+
+    CompletableFuture<Boolean> f = CompletableFuture.supplyAsync(() -> locks.awaitPredecessorsResolved(old));
+    assertBlocked(f);
+
+    set(young, Status.COMMITTING);
+    locks.release(young);
+    assertTrue(f.get(2, TimeUnit.SECONDS));
   }
 
   // ---- non-speculative baseline ----

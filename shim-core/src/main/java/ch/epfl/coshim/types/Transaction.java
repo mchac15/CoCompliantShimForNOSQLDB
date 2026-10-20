@@ -22,6 +22,8 @@ public class Transaction<K, V> {
   private final Map<K, V> readSet;
   /** expires_at of pseudo.txt, in {@link System#currentTimeMillis()}: set only on a tombstone. */
   private final Long expiresAtMillis;
+  /** Age for deadlock prevention (smaller = older); see {@link LockNode#hasYoungerHolderNotIn}. */
+  private final long ts;
   private Status status;
 
   /** A lock granted while the txns ahead on its chain were not all committed yet (speculation). */
@@ -36,12 +38,22 @@ public class Transaction<K, V> {
 
   /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
   public Transaction(String transactionId, Status status, Long expiresAtMillis) {
+    this(transactionId, status, expiresAtMillis, 0);
+  }
+
+  /** @param ts the txn's age; txns of equal ts never abort each other for deadlock prevention */
+  public Transaction(String transactionId, Status status, Long expiresAtMillis, long ts) {
     this.transactionId = transactionId;
     this.locksAcquired = new HashMap<>();
     this.status = status;
     this.writeSet = new HashMap<>();
     this.readSet = new HashMap<>();
     this.expiresAtMillis = expiresAtMillis;
+    this.ts = ts;
+  }
+
+  public long getTs() {
+    return ts;
   }
 
   public String getTransactionId() {
