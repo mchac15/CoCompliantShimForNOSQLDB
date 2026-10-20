@@ -1,8 +1,10 @@
 package ch.epfl.coshim.types;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -21,6 +23,16 @@ public class Transaction<K, V> {
   /** expires_at of pseudo.txt, in {@link System#currentTimeMillis()}: set only on a tombstone. */
   private final Long expiresAtMillis;
   private Status status;
+
+  /** A lock granted while the txns ahead on its chain were not all committed yet (speculation). */
+  private record Grant(long atNanos, List<? extends Transaction<?, ?>> pending) {}
+
+  // statistics only (ShimStats), never read by the protocol
+  /** When the txn committed or aborted, in {@link System#nanoTime()}; 0 while unresolved. */
+  private volatile long resolvedAtNanos;
+  private final List<Grant> grants = new ArrayList<>();
+  private int maxDepth;
+  private int cascadeFanout;
 
   /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
   public Transaction(String transactionId, Status status, Long expiresAtMillis) {
@@ -114,6 +126,64 @@ public class Transaction<K, V> {
 
   public boolean compareAndSwapStatus(Status from, Status to) {
     return compareAndSwapStatus(EnumSet.of(from), to) == from;
+  }
+
+  /**
+   * A lock() wait ended (READY) with {@code depth} nodes ahead holding the txns {@code pending}, none
+   * of them committed yet: without speculation the wait would have lasted until they resolved.
+   */
+  synchronized void recordGrant(int depth, List<? extends Transaction<?, ?>> pending) {
+    maxDepth = Math.max(maxDepth, depth);
+    if (!pending.isEmpty()) {
+      grants.add(new Grant(System.nanoTime(), pending));
+    }
+  }
+
+  /** The deepest dependency chain ahead of the txn at any of its lock grants (0: never speculated). */
+  public synchronized int maxDepth() {
+    return maxDepth;
+  }
+
+  public synchronized int speculativeGrants() {
+    return grants.size();
+  }
+
+  /**
+   * Estimate of the time speculation saved this txn: replays its speculative grants in order, as if
+   * each had waited until the last txn it depended on resolved (plain S2PL), shifting the later ones
+   * by the waits before them. Call once every predecessor resolved (prepare voted YES); one still
+   * unresolved counts as resolving now.
+   */
+  public synchronized long savedNanos() {
+    long now = System.nanoTime();
+    long shift = 0;
+    for (Grant g : grants) {
+      long latest = 0;
+      for (Transaction<?, ?> t : g.pending()) {
+        long r = t.resolvedAtNanos;
+        latest = Math.max(latest, r == 0 ? now : r);
+      }
+      shift += Math.max(0, latest - (g.atNanos() + shift));
+    }
+    return shift;
+  }
+
+  /**
+   * Committed or aborted: stamps the time and drops the grants, so a resolved txn no longer keeps
+   * its predecessors (and theirs, transitively) reachable.
+   */
+  public synchronized void markResolved() {
+    resolvedAtNanos = System.nanoTime();
+    grants.clear();
+  }
+
+  /** How many txns the abort of this one marked must_abort directly (cascade fan-out). */
+  public synchronized int cascadeFanout() {
+    return cascadeFanout;
+  }
+
+  synchronized void setCascadeFanout(int n) {
+    cascadeFanout = n;
   }
 
   public static enum Status {

@@ -2,6 +2,7 @@ package ch.epfl.coshim.types;
 
 import ch.epfl.coshim.types.LockType.LockMode;
 import ch.epfl.coshim.types.Transaction.Status;
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
@@ -149,6 +150,9 @@ class Chain<K, V> {
       }
       LockNode<K, V> pred = txn.getLock(key).node().getPrev();
       if (pred == null || pred.allHoldersIn(ready)) {
+        if (bounded) {
+          recordGrant(txn, pred);
+        }
         return WaitResult.READY;
       }
       try {
@@ -166,6 +170,23 @@ class Chain<K, V> {
         return WaitResult.TIMED_OUT;
       }
     }
+  }
+
+  /** Statistics only: the uncommitted txns ahead of txn's node, and on how many nodes. */
+  private void recordGrant(Transaction<K, V> txn, LockNode<K, V> pred) {
+    int depth = 0;
+    List<Transaction<K, V>> pending = new ArrayList<>();
+    for (LockNode<K, V> n = pred; n != null; n = n.getPrev()) {
+      boolean any = false;
+      for (Transaction<K, V> t : n.getHolders()) {
+        if (t.getStatus() != Status.COMMITTED) {
+          pending.add(t);
+          any = true;
+        }
+      }
+      depth += any ? 1 : 0;
+    }
+    txn.recordGrant(depth, pending);
   }
 
   /**

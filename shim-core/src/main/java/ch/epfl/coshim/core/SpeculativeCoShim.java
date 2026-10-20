@@ -176,6 +176,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       abortTransaction(txn, AbortCause.PREPARE_NO); // started, aborted (incl. tombstone) or must_abort
       return Vote.NO;
     }
+    long waitStart = System.nanoTime();
     if (!locksMap.awaitPredecessorsResolved(txn)) {
       abortTransaction(txn, AbortCause.CASCADE); // doomed while waiting; a no-op if already aborted
       return Vote.NO;
@@ -187,6 +188,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       abortTransaction(txn, AbortCause.CASCADE); // a late cascade landed after the wait
       return Vote.NO;
     }
+    stats.prepared(System.nanoTime() - waitStart);
     return Vote.YES;
   }
 
@@ -200,11 +202,16 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (!txn.compareAndSwapStatus(Status.PREPARED, Status.COMMITTING)) {
       return;
     }
+    // statistics only: every predecessor resolved (prepare passed); stamp this txn before any
+    // successor can see it committed
+    int grants = txn.speculativeGrants();
+    long saved = txn.savedNanos();
     store.storeAll(txn.getWriteSet());
+    txn.markResolved();
     locksMap.release(txn);
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
-    stats.committed();
+    stats.committed(txn.maxDepth(), grants, saved);
   }
 
   @Override
@@ -253,8 +260,10 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (!ABORTABLE.contains(before)) {
       return; // already aborted or committing/committed
     }
-    stats.aborted(before == Status.MUST_ABORT ? AbortCause.CASCADE : cause);
+    txn.markResolved();
     List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
+    stats.aborted(before == Status.MUST_ABORT ? AbortCause.CASCADE : cause, txn.maxDepth(),
+        txn.cascadeFanout());
     transactionsMap.remove(txn.getTransactionId(), txn);
     for (Transaction<K, V> t : doomed) {
       abortTransaction(t, AbortCause.CASCADE);

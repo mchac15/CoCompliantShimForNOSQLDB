@@ -184,6 +184,7 @@ public class LocksMap<K, V> {
           e.getKey(),
           (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished) ? null : c);
     }
+    txn.setCascadeFanout(marked.size());
     for (Transaction<K, V> t : marked) {
       statusChanged(t);
     }

@@ -149,6 +149,7 @@ public final class CoShimNode {
         Runnable printStats = () -> databases.forEach((name, shim) -> {
             if (shim instanceof SpeculativeCoShim<?, ?> speculative) {
                 System.out.println("stats " + name + ": " + speculative.stats());
+                System.out.println("speculation " + name + ": " + speculative.stats().speculationSummary());
             }
         });
         Runtime.getRuntime().addShutdownHook(new Thread(printStats, "coshim-stats-final"));

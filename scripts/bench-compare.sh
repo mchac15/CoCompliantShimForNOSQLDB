@@ -158,7 +158,7 @@ for rep in $(seq 1 "$reps"); do
         java -cp "$cp" ch.epfl.coshim.bench.MicroBench --variant "$variant" --shims "$shim_list" "$@" \
             --csv "$csv" --label "rep$rep" || status=1
         stop_nodes
-        grep -h '^stats' "$logs"/rep"$rep"-"$variant"-s*.log | sed 's/^/  node /'
+        grep -hE '^(stats|speculation)' "$logs"/rep"$rep"-"$variant"-s*.log | sed 's/^/  node /'
         echo
     done
 done
