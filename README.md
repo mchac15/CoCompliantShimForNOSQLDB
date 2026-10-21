@@ -11,6 +11,7 @@ global transactions that mix both kinds of shim.
 | Module | Depends on | Contents |
 | --- | --- | --- |
 | `store-api` | nothing | `KvStore<K, V>`: the whole database behind `get` / `store`, plus `InMemoryKvStore`; `TableKey` (table, key): a shim manages several tables of its database |
+| `store-sql` | `store-api` | `SqlKvStore`: a MySQL or PostgreSQL database as a `KvStore` (URL `jdbc:coshim:mysql://...` / `jdbc:coshim:pg://...`), with the tables, keys and statements of the benchmark's Sonata participants (`micro-i (key int, value bigint)`, `select` / `update`) but autocommit at READ COMMITTED; `KvStores.fromUrl` picks in-memory or SQL from the URL |
 | `shim-core` | `store-api` | `CoShim`: the requests a shim receives from client connections (start / get / put / end / prepare / commit / abort). It never runs client code; `SpeculativeCoShim` implements pseudo.txt, and with `speculative = false` is the non-speculative strict-2PL baseline (lock() waits for predecessors to *commit*, no cascades); `ShimStats` counts its commits and aborts by cause; `NoCcShim` is a pass-through shim (no concurrency control) used in tests |
 | `shim-net` | `shim-core` | **Shim nodes**: `CoShimServer` hosts one or more databases, one `CoShim` each, and serves them over TCP to the participants only (shared-token handshake, optional client allowlist); `RemoteCoShim` is the client the RMs use, bound to one database; `CoShimNode` runs a node |
 | `coshim-jdbc` | `shim-core` | The shim as a JDBC "driver": `CoShimDataSource` (`DataSource` + `XADataSource`, URL `jdbc:coshim://host:port/database`), `CoShimXAResource`, `KvSession` (`get(table, key)` / `put(table, key, value)` instead of SQL). No Seata dependency |
@@ -83,6 +84,8 @@ drivers with Sonata's hook in the RM.
 COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode --port 7000 --shim speculative \
     --databases shop,billing --lock-timeout-ms 1000 [--stats-interval-s 10] [--allow RM-host ...]
 # --shim speculative | nonspeculative | nocc; commit/abort counters are logged every interval and at shutdown
+# --store memory (default) | jdbc:coshim:mysql://host:3306 | jdbc:coshim:pg://host:5432 [?tables=a,b&entries=N&pool=N]
+#   database D of the node lives in SQL database D on that server; the tables are refilled with keys 0..N-1 at start
 ```
 
 ```java
@@ -239,8 +242,80 @@ to it; the script prints a comparison table and exits 1 if a run warned or faile
 node; those runs are skipped when no TC is reachable (`-Dbench.tc=host:port`, default
 127.0.0.1:8091).
 
+## Benchmark: speculative shim vs Sonata
+
+The same `MicroBench` runs Sonata. A participant in `--shims` is a shim database
+(`host:port/db`) or a MySQL/PG database (`jdbc:mysql://...`, `jdbc:postgresql://...`). The latter is
+a Hikari pool at SERIALIZABLE wrapped in Seata's stock `DataSourceProxyXA`, as in Acta. With
+`--sonata true` (`sonata.enableGlobalSerializability`; Sonata's other settings at their defaults:
+`sonata_dummy`, 1,000,000 rows, SSI helper batch 10), Seata adds Sonata's dummy write before
+`xa prepare`. Everything else (TM, TC, attempts, retries, audit) is the same code as for the shim.
+
+```
+ MicroBench (TM + RM) ──▶ Seata TC :8091
+   ├ speculative / nonspeculative: DataSourceProxyCoShim ─TCP─▶ CoShimNode :7000, :7001 (in memory)
+   ├ speculative-mysql / -pg, ...:  DataSourceProxyCoShim ─TCP─▶ CoShimNode ─SqlKvStore─▶ the same servers
+   └ sonata-mysql / sonata-pg:     DataSourceProxyXA(Hikari) ─JDBC─▶ MySQL :3306, :3307 / PG :5432, :5433
+```
+
+With `<shim>-mysql` / `<shim>-pg`, node I stores its database `sI` in database `sI` of server I
+(`SqlKvStore`, created by `bench-dbs.sh createdb`), on the same servers as Sonata. Layout and
+statements are Sonata's: tables `micro-0 .. micro-(branches-1)`, `(key int primary key, value bigint)`,
+refilled with `--table-size` keys at 0 when the node starts, `select value ... where key = ?` and
+`update ... set value = ? where key = ?`; the pool has Sonata's size (`threads * branches * 2 + 4`,
+all opened up front). What differs is only who does the concurrency control: the shim's statements
+run in autocommit at READ COMMITTED (reads during execution unless a predecessor's write is
+buffered, writes applied at commit), Sonata's in SERIALIZABLE XA transactions plus its dummy write.
+
+`scripts/bench-dbs.sh start mysql|postgres N` runs one server per participant in Docker (host
+network), with the settings of Acta's deployment (`../acta-server/scripts/deploy`, e.g. MySQL 8.4,
+`innodb_lock_wait_timeout=60`; PG 16, `lock_timeout=60s`, `max_prepared_transactions=1500`) and
+**fsync off**, so that they, like the shim's in-memory store, do not pay for durability (MySQL:
+`innodb_flush_log_at_trx_commit=0`, `sync_binlog=0`, `innodb_flush_method=nosync`; PG: `fsync`,
+`synchronous_commit`, `full_page_writes` off). Memory sizes are scaled down to one machine (2G
+buffer pool / 2GB `shared_buffers`; overridable). Before each run, `MicroBench` resets the micro
+tables to 0, fills `sonata_dummy`, and rolls back XA transactions left prepared by a killed run.
+
+```sh
+VARIANTS="speculative-mysql sonata-mysql speculative-pg sonata-pg" scripts/bench-compare.sh --skew 0.99 --threads 100
+scripts/bench-dbs.sh stop mysql; scripts/bench-dbs.sh stop postgres   # if you started them yourself
+```
+
+`scripts/bench-sql-compare.sh` runs that comparison as a sweep (skews 0.5, 0.9, 0.99 × 3 reps by
+default, about 30 min) on servers it starts once, and writes `bench-results/sql-compare-<ts>/summary.md`:
+throughput, abort rate and latencies per skew and variant (mean and range over the reps), the
+shim / Sonata ratios per server kind, and the shim nodes' abort causes. `--summarize DIR` rebuilds
+the summary from an existing sweep.
+
+```sh
+scripts/bench-sql-compare.sh                                   # the default sweep
+SKEWS="0.9 0.99" REPS=5 LOCK_TIMEOUT_MS=100 scripts/bench-sql-compare.sh --threads 50
+```
+
+`scripts/bench-lock-timeout-sweep.py` repeats that sweep over the shim's lock timeout (1, 5, 10, 20,
+50, 100 ms; skews 0.5 and 0.99; the speculative and non-speculative shim and Sonata on MySQL and
+PostgreSQL; 50 threads, table size 10000; one run per configuration, `--reps N` for more; about 45 min)
+and plots, per skew, throughput and abort rate against the lock timeout (`bench-results/lock-timeout-<ts>/skew-<s>.png`, all skews in
+`overview.png`). The lock timeout only reaches the shim nodes, so Sonata runs once per skew and is
+drawn flat (`--sonata-each-timeout` reruns it at every timeout). It needs matplotlib; `--out DIR`
+resumes a sweep that stopped, `plot DIR` re-plots one.
+
+```sh
+python -m venv .venv && .venv/bin/pip install matplotlib
+.venv/bin/python scripts/bench-lock-timeout-sweep.py                     # the default sweep
+.venv/bin/python scripts/bench-lock-timeout-sweep.py --reps 1 --lock-timeouts 1 10 100 -- --warmup-s 5
+.venv/bin/python scripts/bench-lock-timeout-sweep.py plot bench-results/lock-timeout-<ts>
+```
+
+`bench-compare.sh` starts the databases it needs (and stops them at the end) unless they already
+run. The CSV gains `branch_failures`: failed branches in the measurement window by cause
+(`deadlock`, `lock_timeout`, `serialization`, `xa_rollback` = NO vote, `shim_abort`, `tc_refused`,
+`other:...`).
+
+Sonata's switch is read once per JVM, so a run is all-Sonata or not. A mixed global transaction
+(a shim branch and a MySQL branch in the same `--shims`) works with `--sonata true`, since the hook
+only applies to MySQL/PG data sources.
+
 ## Next steps
 
 - Add a real key-value backend behind `KvStore`.
-- Compare with Sonata on MySQL/PG through Acta (a `COSHIM` mode whose branches reach the shim nodes
-  over TCP), with a mixed global transaction (a MySQL/Sonata branch and a coshim branch).

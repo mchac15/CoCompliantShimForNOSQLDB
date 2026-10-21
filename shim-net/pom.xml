@@ -19,5 +19,10 @@
             <groupId>ch.epfl.coshim</groupId>
             <artifactId>shim-core</artifactId>
         </dependency>
+        <!-- SqlKvStore: CoShimNode on MySQL / PostgreSQL -->
+        <dependency>
+            <groupId>ch.epfl.coshim</groupId>
+            <artifactId>store-sql</artifactId>
+        </dependency>
     </dependencies>
 </project>

@@ -3,9 +3,9 @@ package ch.epfl.coshim.net;
 import ch.epfl.coshim.core.CoShim;
 import ch.epfl.coshim.core.NoCcShim;
 import ch.epfl.coshim.core.SpeculativeCoShim;
-import ch.epfl.coshim.store.InMemoryKvStore;
 import ch.epfl.coshim.store.KvStore;
 import ch.epfl.coshim.store.TableKey;
+import ch.epfl.coshim.store.sql.KvStores;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
@@ -18,12 +18,13 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Runs one shim node hosting one or more databases, one shim each (String keys and values, one
- * in-memory store per database for now).
+ * Runs one shim node hosting one or more databases, one shim each (String keys and values), each
+ * on its own store: in memory, or a MySQL / PostgreSQL database ({@link KvStores}).
  *
  * <pre>
  *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
  *       [--lock-timeout-ms T] [--stats-interval-s I] [--allow HOST ...]
+ *       [--store memory|URL]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | nocc (no concurrency
@@ -33,6 +34,10 @@ import java.util.concurrent.TimeUnit;
  *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
  *     --allow             a client address allowed to connect (e.g. an RM host), repeatable; default:
  *                         any authenticated client
+ *     --store             memory (default), or a server URL jdbc:coshim:mysql://host:port or
+ *                         jdbc:coshim:pg://host:port, with SqlKvStore's parameters (?tables=...&
+ *                         entries=N&pool=N): each database D of the node is stored in the SQL
+ *                         database D on that server (which must exist)
  *
  *   Positional form (still accepted): CoShimNode [port] [shim] [databases] [allowed-client ...]
  * </pre>
@@ -46,7 +51,7 @@ public final class CoShimNode {
 
     /** The parsed command line. */
     record Options(int port, String shim, String[] databases, Duration lockTimeout, long statsIntervalSeconds,
-            Set<InetAddress> allowed) {
+            Set<InetAddress> allowed, String store) {
 
         static Options parse(String[] args) throws Exception {
             int port = 7000;
@@ -57,6 +62,7 @@ public final class CoShimNode {
             long lockTimeoutMs = 200;
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
+            String store = "memory";
             if (args.length > 0 && args[0].startsWith("--")) {
                 for (int i = 0; i < args.length; i++) {
                     String flag = args[i];
@@ -71,6 +77,7 @@ public final class CoShimNode {
                         case "--lock-timeout-ms" -> lockTimeoutMs = Long.parseLong(value);
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
+                        case "--store" -> store = value;
                         default -> throw new IllegalArgumentException("unknown option " + flag);
                     }
                 }
@@ -83,7 +90,18 @@ public final class CoShimNode {
                 }
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs),
-                    statsIntervalSeconds, allowed);
+                    statsIntervalSeconds, allowed, store);
+        }
+
+        /** {@code database}'s store: the {@code --store} URL with {@code /database} appended (before any {@code ?}). */
+        KvStore<TableKey<String>, String> newStore(String database) {
+            if (store.equals("memory")) {
+                return KvStores.fromUrl(store);
+            }
+            int query = store.indexOf('?');
+            String server = query < 0 ? store : store.substring(0, query);
+            String params = query < 0 ? "" : store.substring(query);
+            return KvStores.fromUrl(server + "/" + database + params);
         }
 
         CoShim<TableKey<String>, String> newShim(KvStore<TableKey<String>, String> store) {
@@ -108,7 +126,16 @@ public final class CoShimNode {
 
         Map<String, CoShim<TableKey<String>, String>> databases = new LinkedHashMap<>();
         for (String name : options.databases()) {
-            KvStore<TableKey<String>, String> store = new InMemoryKvStore<>();
+            KvStore<TableKey<String>, String> store = options.newStore(name);
+            if (store instanceof AutoCloseable closeable) {
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                    try {
+                        closeable.close();
+                    } catch (Exception e) {
+                        System.err.println("closing the store of " + name + " failed: " + e);
+                    }
+                }, "coshim-store-close-" + name));
+            }
             databases.put(name, options.newShim(store));
         }
         CoShimServer<TableKey<String>, String> server = new CoShimServer<>(
@@ -116,6 +143,7 @@ public final class CoShimNode {
                 options.allowed());
         System.out.println("coshim node (" + options.shim() + ", lock timeout " + options.lockTimeout().toMillis()
                 + " ms) on port " + server.getPort() + ", databases " + databases.keySet()
+                + ", store " + options.store()
                 + (options.allowed().isEmpty() ? "" : ", allowed clients " + options.allowed()));
 
         Runnable printStats = () -> databases.forEach((name, shim) -> {

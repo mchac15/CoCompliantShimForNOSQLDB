@@ -13,8 +13,9 @@ import java.util.List;
  * over TCP.
  *
  * @param variant          label of the run in the results (the variant the nodes were started with)
- * @param shims            the shim databases, {@code host:port/database}; each branch goes to one of
- *                         them at random
+ * @param shims            the participants: shim databases ({@code host:port/database}) or SQL databases
+ *                         ({@code jdbc:mysql://...}, {@code jdbc:postgresql://...}); each branch goes to
+ *                         one of them at random
  * @param tc               the Seata TC, {@code host:port}
  * @param threads          closed-loop workers (Acta's concurrency)
  * @param tableSize        keys per table; branch i of every txn uses table micro-i
@@ -29,15 +30,17 @@ import java.util.List;
  * @param txnTimeout       global transaction timeout, enforced by the TC (rolls the branches back)
  * @param parallelBranches run the branches of a global transaction at the same time (each still
  *                         start, ops, end, prepare) instead of one after the other
+ * @param sonata           turn Sonata on for the SQL databases ({@code sonata.enableGlobalSerializability};
+ *                         Sonata's other settings stay at their defaults). Seata reads it once per JVM
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
-        boolean parallelBranches) {
+        boolean parallelBranches, boolean sonata) {
 
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false);
+                false, false);
     }
 
     /** Keys per table in the hot range. */
@@ -47,9 +50,10 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
 
     /** Same checks as Acta's Micro run endpoint: every txn must find distinct hot and cold keys. */
     public BenchConfig validate() {
-        require(!shims.isEmpty(), "--shims needs at least one host:port/database");
+        require(!shims.isEmpty(), "--shims needs at least one host:port/database or jdbc: URL");
         for (String shim : shims) {
-            require(shim.matches("[^:/]+:\\d+/.+"), "--shims entries are host:port/database: " + shim);
+            require(shim.matches("[^:/]+:\\d+/.+") || shim.matches("jdbc:(mysql|postgresql)://.+"),
+                    "--shims entries are host:port/database, jdbc:mysql://... or jdbc:postgresql://...: " + shim);
         }
         require(tc.matches("[^:]+:\\d+"), "--tc is host:port: " + tc);
         require(threads > 0, "--threads must be > 0");
@@ -92,6 +96,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         Duration measure = c.measure;
         Duration txnTimeout = c.txnTimeout;
         boolean parallelBranches = c.parallelBranches;
+        boolean sonata = c.sonata;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -118,11 +123,12 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--measure-s" -> measure = seconds(v);
                 case "--txn-timeout-ms" -> txnTimeout = Duration.ofMillis(Long.parseLong(v));
                 case "--parallel-branches" -> parallelBranches = Boolean.parseBoolean(v);
+                case "--sonata" -> sonata = Boolean.parseBoolean(v);
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
-                measure, txnTimeout, parallelBranches).validate();
+                measure, txnTimeout, parallelBranches, sonata).validate();
     }
 
     private static Duration seconds(String v) {
