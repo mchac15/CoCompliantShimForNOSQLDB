@@ -25,6 +25,13 @@ public class Transaction<K, V> {
   /** Age for deadlock prevention (smaller = older); see {@link LockNode#hasYoungerHolderNotIn}. */
   private final long ts;
   private Status status;
+  /**
+   * Has ever been executed (guarded by the monitor). A txn that never was has no reader of its
+   * write buffer: no successor gets past its node before it reaches the speculation point.
+   */
+  private boolean reachedExecuted;
+  /** Doomed by wound-wait ({@link #wound()}), not by a cascade: statistics only. */
+  private boolean wounded;
 
   /** A lock granted while the txns ahead on its chain were not all committed yet (speculation). */
   private record Grant(long atNanos, List<? extends Transaction<?, ?>> pending) {}
@@ -120,6 +127,7 @@ public class Transaction<K, V> {
   public void setStatus(Status newStatus) {
     synchronized (this) {
       this.status = newStatus;
+      reachedExecuted |= newStatus == Status.EXECUTED;
     }
   }
 
@@ -132,12 +140,38 @@ public class Transaction<K, V> {
     Status before = status;
     if (from.contains(before)) {
       status = to;
+      reachedExecuted |= to == Status.EXECUTED;
     }
     return before;
   }
 
   public boolean compareAndSwapStatus(Status from, Status to) {
     return compareAndSwapStatus(EnumSet.of(from), to) == from;
+  }
+
+  /**
+   * Wound-wait's mark: started → must_abort, so the txn can no longer reach executed (nor vote).
+   * The caller then runs abort_transaction on it outside any latch.
+   *
+   * @return false if it was not started (nothing changed): someone else already doomed it, or it
+   *     executed and no longer blocks a lock() wait
+   */
+  synchronized boolean wound() {
+    if (status != Status.STARTED) {
+      return false;
+    }
+    status = Status.MUST_ABORT;
+    wounded = true;
+    return true;
+  }
+
+  public synchronized boolean isWounded() {
+    return wounded;
+  }
+
+  /** Was ever executed: only then can a successor have read its write buffer. */
+  public synchronized boolean hasReachedExecuted() {
+    return reachedExecuted;
   }
 
   /**

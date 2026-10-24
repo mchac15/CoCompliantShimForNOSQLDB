@@ -2,6 +2,7 @@ package ch.epfl.coshim.core;
 
 import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.KvStore;
+import ch.epfl.coshim.types.DeadlockPolicy;
 import ch.epfl.coshim.types.LockType;
 import ch.epfl.coshim.types.LocksMap;
 import ch.epfl.coshim.types.LocksMap.LockResult;
@@ -67,7 +68,26 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
    */
   public SpeculativeCoShim(
       KvStore<K, V> store, Duration lockTimeout, Duration tombstoneTtl, boolean speculative) {
-    this.locksMap = new LocksMap<>(speculative);
+    this(store, lockTimeout, tombstoneTtl, speculative, DeadlockPolicy.WAIT_DIE);
+  }
+
+  /**
+   * @param deadlockPolicy how lock()/upgrade() avoid waiting in a cycle (lock_timeout stays the
+   *     backstop either way)
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy) {
+    // a wound-wait victim is already must_abort: abort_transaction releases its locks, on the
+    // wounder's thread, outside any latch
+    this.locksMap =
+        new LocksMap<>(
+            speculative,
+            Objects.requireNonNull(deadlockPolicy),
+            victim -> abortTransaction(victim, AbortCause.WOUNDED));
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
     this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);
@@ -259,9 +279,14 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     };
   }
 
+  /** Why a must_abort txn was doomed, whichever site finally aborts it. */
+  private static AbortCause doomedBy(Transaction<?, ?> txn) {
+    return txn.isWounded() ? AbortCause.WOUNDED : AbortCause.CASCADE;
+  }
+
   /**
-   * @param cause why the caller aborts txn; a txn that was must_abort counts as a cascade whatever
-   *     the site that finally aborts it
+   * @param cause why the caller aborts txn; a txn that was must_abort counts as a cascade (or a
+   *     wound) whatever the site that finally aborts it
    */
   private void abortTransaction(Transaction<K, V> txn, AbortCause cause) {
     Status before = txn.compareAndSwapStatus(ABORTABLE, Status.ABORTED);
@@ -270,7 +295,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     }
     txn.markResolved();
     List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
-    stats.aborted(before == Status.MUST_ABORT ? AbortCause.CASCADE : cause, txn.maxDepth(),
+    stats.aborted(before == Status.MUST_ABORT ? doomedBy(txn) : cause, txn.maxDepth(),
         txn.cascadeFanout());
     transactionsMap.remove(txn.getTransactionId(), txn);
     for (Transaction<K, V> t : doomed) {
