@@ -19,6 +19,8 @@ public final class ShimStats {
     LOCK_TIMEOUT,
     /** lock()/upgrade() would have waited for a younger txn (deadlock prevention). */
     DEADLOCK_PREVENTION,
+    /** Wound-wait: an older txn wanted a lock this one held while still running. */
+    WOUNDED,
     /** Lost an upgrade race: read-modify-write against read-modify-write. */
     UPGRADE_CONFLICT,
     /** Doomed by a predecessor's abort (was must_abort), wherever it was finally aborted. */

@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import org.junit.jupiter.api.Test;
 
@@ -32,6 +33,9 @@ import org.junit.jupiter.api.Test;
  *
  * <p>Each worker plays the shim (status CASes, buffers, store) the way pseudo.txt does. A written
  * value is the writer's id, so a read tells which txn it read from.
+ *
+ * <p>The wound-wait run also gives every txn an age, so the workers wound each other (from inside
+ * their own lock() waits) on top of the coordinator's aborts.
  */
 class LocksMapStressTest {
 
@@ -41,7 +45,10 @@ class LocksMapStressTest {
   private static final Duration LOCK_TIMEOUT = Duration.ofMillis(20);
   private static final Set<Status> ABORTABLE = EnumSet.of(Status.STARTED, Status.EXECUTED, Status.MUST_ABORT);
 
-  private final LocksMap<String, String> locks = new LocksMap<>();
+  private LocksMap<String, String> locks = new LocksMap<>();
+  /** 0: every txn has the same age, so deadlock prevention never triggers. */
+  private AtomicLong ages = null;
+  private final AtomicInteger wounded = new AtomicInteger();
   private final Map<String, String> store = new ConcurrentHashMap<>();
   private final Map<String, Transaction<String, String>> txns = new ConcurrentHashMap<>();
   private final List<Transaction<String, String>> live = new CopyOnWriteArrayList<>();
@@ -53,6 +60,23 @@ class LocksMapStressTest {
 
   @Test
   void perKeyLatchingKeepsTheAlgorithmsInvariants() {
+    checkInvariants();
+  }
+
+  @Test
+  void woundWaitKeepsTheAlgorithmsInvariants() {
+    ages = new AtomicLong();
+    locks = new LocksMap<>(true, DeadlockPolicy.WOUND_WAIT, victim -> {
+      if (victim.isWounded()) {
+        wounded.incrementAndGet();
+      }
+      abortTransaction(victim);
+    });
+    checkInvariants();
+    assertTrue(wounded.get() > 0, "the run exercised wounds");
+  }
+
+  private void checkInvariants() {
     assertTimeoutPreemptively(Duration.ofSeconds(120), this::run, "a wait never returned");
 
     assertTrue(violations.isEmpty(),() -> violations.size() + " violations, e.g. " + violations.peek());
@@ -95,7 +119,8 @@ class LocksMapStressTest {
   private void worker(int id) {
     Random rnd = new Random(id);
     for (int i = 0; i < TXNS_PER_WORKER; i++) {
-      Transaction<String, String> t = new Transaction<>(id + "-" + i, Status.STARTED, null);
+      Transaction<String, String> t = new Transaction<>(
+          id + "-" + i, Status.STARTED, null, ages == null ? 0 : ages.incrementAndGet());
       txns.put(t.getTransactionId(), t);
       live.add(t);
       if (execute(t, rnd) && rnd.nextInt(10) != 0 && prepare(t)) {

@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * locks_map of pseudo.txt, and the shim's only entry point to the lock table: the shim never sees a
@@ -85,6 +86,9 @@ public class LocksMap<K, V> {
   /** What lock()/upgrade() wait for: every predecessor holder in this set. */
   private final Set<Status> lockReady;
   private final boolean speculative;
+  private final DeadlockPolicy deadlockPolicy;
+  /** abort_transaction of a wound-wait victim (already must_abort), run outside any latch. */
+  private final Consumer<Transaction<K, V>> woundHandler;
 
   /** The speculative lock table of pseudo.txt. */
   public LocksMap() {
@@ -97,8 +101,20 @@ public class LocksMap<K, V> {
    *     an uncommitted value and an abort never cascades
    */
   public LocksMap(boolean speculative) {
+    this(speculative, DeadlockPolicy.WAIT_DIE, null);
+  }
+
+  /**
+   * @param woundHandler aborts a wound-wait victim (a txn this table moved to must_abort): the
+   *     shim's abort_transaction. Null: abort it here, which is enough when nobody else keeps txn
+   *     state (the lock table alone)
+   */
+  public LocksMap(
+      boolean speculative, DeadlockPolicy deadlockPolicy, Consumer<Transaction<K, V>> woundHandler) {
     this.speculative = speculative;
     this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
+    this.deadlockPolicy = deadlockPolicy;
+    this.woundHandler = woundHandler != null ? woundHandler : this::abortVictim;
   }
 
   /**
@@ -151,7 +167,7 @@ public class LocksMap<K, V> {
     for (K key : txn.frozenLocks().keySet()) {
       Chain<K, V> chain = locksMap.get(key);
       // no chain: txn's locks were released by a foreign abort_transaction, as in lock()
-      if (chain == null || chain.awaitPredecessor(txn, RESOLVED, false, 0) != Chain.WaitResult.READY) {
+      if (chain == null || chain.awaitResolved(txn, RESOLVED) != Chain.WaitResult.READY) {
         return false;
       }
     }
@@ -225,12 +241,40 @@ public class LocksMap<K, V> {
     return locksMap.get(key);
   }
 
+  /**
+   * The bounded wait of lock()/upgrade(). On WOUND the victims are already must_abort; they are
+   * aborted here, outside every latch (their release takes the map entry of each of their keys,
+   * txn's own key included), and txn waits again with the same deadline until their nodes empty.
+   * chain stays txn's chain meanwhile: txn's own node keeps it from being emptied and removed.
+   */
   private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline) {
-    return switch (chain.awaitPredecessor(txn, lockReady, true, deadline)) {
-      case READY -> LockResult.ACQUIRED;
-      case DOOMED -> LockResult.MUST_ABORT;
-      case TIMED_OUT -> LockResult.TIMED_OUT;
-      case DIE -> LockResult.DIE;
-    };
+    while (true) {
+      List<Transaction<K, V>> victims = new ArrayList<>();
+      switch (chain.awaitLockReady(txn, lockReady, deadline, deadlockPolicy, victims)) {
+        case READY -> {
+          return LockResult.ACQUIRED;
+        }
+        case DOOMED -> {
+          return LockResult.MUST_ABORT;
+        }
+        case TIMED_OUT -> {
+          return LockResult.TIMED_OUT;
+        }
+        case DIE -> {
+          return LockResult.DIE;
+        }
+        case WOUND -> victims.forEach(woundHandler);
+      }
+    }
+  }
+
+  /**
+   * The default wound handler: abort_transaction's part on the chains for a victim. It never
+   * reached executed, so its release cascades to nobody.
+   */
+  private void abortVictim(Transaction<K, V> victim) {
+    if (victim.compareAndSwapStatus(Status.MUST_ABORT, Status.ABORTED)) {
+      abortAndRelease(victim);
+    }
   }
 }

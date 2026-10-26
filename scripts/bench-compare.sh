@@ -27,7 +27,8 @@
 # Examples: scripts/bench-compare.sh --reps 3 --skew 0.99 --threads 100
 #           SHIMS=4 scripts/bench-compare.sh --parallel-branches true --txn-timeout-ms 500
 #           VARIANTS="speculative sonata-mysql sonata-pg" scripts/bench-compare.sh
-# Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), VARIANTS ("speculative nonspeculative"),
+# Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), DEADLOCK (wait-die | wound-wait, default
+#      wait-die), VARIANTS ("speculative nonspeculative"),
 #      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o), and
 #      scripts/bench-dbs.sh's MYSQL_PORT, PG_PORT, ...
 # Exit code 1 if any run printed a warning or failed its audit.
@@ -42,6 +43,7 @@ fi
 shims="${SHIMS:-2}"
 base_port="${NODE_PORT:-7000}"
 lock_timeout="${LOCK_TIMEOUT_MS:-1000}"
+deadlock="${DEADLOCK:-wait-die}"
 variants="${VARIANTS:-speculative nonspeculative}"
 export COSHIM_TOKEN="${COSHIM_TOKEN:-bench-$RANDOM$RANDOM}"
 cd "$root"
@@ -143,7 +145,7 @@ for rep in $(seq 1 "$reps"); do
                 store="${server/jdbc:/jdbc:coshim:}?tables=$tables&entries=$table_size&pool=$sql_pool"
             fi
             java -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "${variant%-*}" --databases "s$s" \
-                --lock-timeout-ms "$lock_timeout" --stats-interval-s 0 --store "$store" \
+                --lock-timeout-ms "$lock_timeout" --deadlock "$deadlock" --stats-interval-s 0 --store "$store" \
                 > "$logs/rep$rep-$variant-s$s.log" 2>&1 &
             nodes+=($!)
             until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
