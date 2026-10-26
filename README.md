@@ -330,6 +330,25 @@ Sonata's switch is read once per JVM, so a run is all-Sonata or not. A mixed glo
 (a shim branch and a MySQL branch in the same `--shims`) works with `--sonata true`, since the hook
 only applies to MySQL/PG data sources.
 
+### Final micro benchmark
+
+`scripts/bench-final.sh` runs every combination of threads (20, 50, 100, 200) and skew (0.9, 0.99)
+for the speculative and non-speculative shim under both deadlock policies (variant suffix
+`@wait-die` / `@wound-wait`, understood by `bench-compare.sh`) and Sonata, on MySQL and PostgreSQL,
+3 reps each, with the realistic workload (`--ops-mean 3 --think-mean-us 2000 --think-sd-us 1000`).
+Timeouts only break cross-database deadlocks (local ones are prevented or detected), so every lock
+wait is 30 s (shim nodes and servers) and the TC's global timeout 60 s. About 4 h; rerun with
+`OUT=<dir>` to resume. `summary.md` / `summary.csv` report throughput, per-op and per-txn latency
+p50 / p99 and retries per txn p50 / p99. Latencies cover a committed txn's whole execution, retries
+included, minus the think time it paused for (the txns CSV has `think_us`, `active_us`,
+`op_latency_us`), so they do not depend on the pauses and op counts each txn drew.
+
+```bash
+scripts/bench-final.sh                                         # the full sweep
+THREADS_LIST="20" SKEWS="0.9" REPS=1 scripts/bench-final.sh    # a quick check
+scripts/bench-final.sh --summarize bench-results/final-<ts>
+```
+
 ## Next steps
 
 - Add a real key-value backend behind `KvStore`.

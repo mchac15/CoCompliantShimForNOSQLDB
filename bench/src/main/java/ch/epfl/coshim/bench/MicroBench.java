@@ -25,6 +25,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import javax.transaction.xa.XAException;
@@ -304,6 +305,14 @@ public final class MicroBench implements AutoCloseable {
      * @param causes receives the cause of every branch that failed
      */
     Attempt attempt(List<Branch> plan, Collection<String> causes) {
+        return attempt(plan, causes, new AtomicLong());
+    }
+
+    /**
+     * @param thinkNanos receives the think time this attempt paused for: the sum over its branches when
+     *     they run in order; when they run in parallel their pauses overlap, so the longest branch's
+     */
+    Attempt attempt(List<Branch> plan, Collection<String> causes, AtomicLong thinkNanos) {
         GlobalTransaction tx = GlobalTransactionContext.createNew();
         try {
             tx.begin((int) config.txnTimeout().toMillis(), "micro");
@@ -311,8 +320,8 @@ public final class MicroBench implements AutoCloseable {
             throw new IllegalStateException("TC at " + config.tc() + ": begin failed", e);
         }
         try {
-            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan, causes)
-                    : phaseOneInOrder(tx, plan, causes);
+            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan, causes, thinkNanos)
+                    : phaseOneInOrder(tx, plan, causes, thinkNanos);
             if (!allYes) {
                 return rollback(tx);
             }
@@ -350,9 +359,10 @@ public final class MicroBench implements AutoCloseable {
         return isTimeout(tx.getLocalStatus()) ? Attempt.TIMED_OUT : Attempt.ABORTED;
     }
 
-    private boolean phaseOneInOrder(GlobalTransaction tx, List<Branch> plan, Collection<String> causes) {
+    private boolean phaseOneInOrder(GlobalTransaction tx, List<Branch> plan, Collection<String> causes,
+            AtomicLong thinkNanos) {
         for (Branch b : plan) {
-            if (!runBranch(tx.getXid(), b, false, causes)) {
+            if (!runBranch(tx.getXid(), b, false, causes, thinkNanos)) {
                 return false;
             }
         }
@@ -364,11 +374,15 @@ public final class MicroBench implements AutoCloseable {
      * outlives its attempt; the caller then rolls back if any branch failed, which the TC turns into
      * an abort on every shim (including one where a sibling still waits in prepare: it votes NO).
      */
-    private boolean phaseOneInParallel(GlobalTransaction tx, List<Branch> plan, Collection<String> causes) {
+    private boolean phaseOneInParallel(GlobalTransaction tx, List<Branch> plan, Collection<String> causes,
+            AtomicLong thinkNanos) {
         ExecutorCompletionService<Boolean> done = new ExecutorCompletionService<>(branchPool);
         Collection<String> shared = Collections.synchronizedCollection(causes);
+        List<AtomicLong> branchThink = new ArrayList<>();
         for (Branch b : plan) {
-            done.submit(() -> runBranch(tx.getXid(), b, true, shared));
+            AtomicLong think = new AtomicLong();
+            branchThink.add(think);
+            done.submit(() -> runBranch(tx.getXid(), b, true, shared, think));
         }
         boolean allYes = true;
         RuntimeException error = null;
@@ -385,6 +399,7 @@ public final class MicroBench implements AutoCloseable {
                 allYes = false;
             }
         }
+        thinkNanos.addAndGet(branchThink.stream().mapToLong(AtomicLong::get).max().orElse(0));
         if (error != null) {
             throw error;
         }
@@ -398,10 +413,12 @@ public final class MicroBench implements AutoCloseable {
      * the prepare, holding its locks meanwhile.
      *
      * @param bindXid true when running on a pool thread, which must join the global transaction
+     * @param thinkNanos receives the time this branch paused for
      * @return true iff the branch voted YES; false if the participant aborted it, voted NO, or the
      *     TC refused the branch (e.g. the txn already timed out)
      */
-    private boolean runBranch(String xid, Branch b, boolean bindXid, Collection<String> causes) {
+    private boolean runBranch(String xid, Branch b, boolean bindXid, Collection<String> causes,
+            AtomicLong thinkNanos) {
         if (bindXid) {
             RootContext.bind(xid);
         }
@@ -411,16 +428,16 @@ public final class MicroBench implements AutoCloseable {
             try {
                 boolean first = true;
                 for (int k : b.readKeys()) {
-                    first = think(first);
+                    first = think(first, thinkNanos);
                     p.get(c, b.table(), k);
                 }
                 for (int k : b.writeKeys()) {
-                    first = think(first);
+                    first = think(first, thinkNanos);
                     long value = config.rmw() ? p.get(c, b.table(), k) + 1
                             : ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
                     p.put(c, b.table(), k, value);
                 }
-                think(false);
+                think(false, thinkNanos);
                 c.commit();   // xa end + xa prepare: the participant votes
                 return true;
             } catch (SQLException e) {
@@ -442,11 +459,16 @@ public final class MicroBench implements AutoCloseable {
         }
     }
 
-    /** Pauses for one think time unless {@code first}; returns false (the next op is not the first). */
-    private boolean think(boolean first) {
+    /**
+     * Pauses for one think time unless {@code first}, adding the time actually paused to {@code
+     * thinkNanos}; returns false (the next op is not the first).
+     */
+    private boolean think(boolean first, AtomicLong thinkNanos) {
         long nanos = first ? 0 : config.drawThinkNanos();
         if (nanos > 0) {
+            long t0 = System.nanoTime();
             LockSupport.parkNanos(nanos);
+            thinkNanos.addAndGet(System.nanoTime() - t0);
         }
         return false;
     }
@@ -530,6 +552,7 @@ public final class MicroBench implements AutoCloseable {
             int attempts = 0;
             long planStart = 0;
             List<String> causes = new ArrayList<>();
+            AtomicLong thinkNanos = new AtomicLong();   // over every attempt of the plan
             while (!stop.get() && System.nanoTime() < measureEnd) {
                 long t0 = System.nanoTime();
                 if (attempts++ == 0) {
@@ -538,7 +561,7 @@ public final class MicroBench implements AutoCloseable {
                 int causesBefore = causes.size();
                 Attempt result;
                 try {
-                    result = attempt(plan, causes);
+                    result = attempt(plan, causes, thinkNanos);
                 } catch (RuntimeException e) {
                     error = e;
                     stop.set(true);
@@ -569,17 +592,19 @@ public final class MicroBench implements AutoCloseable {
                 }
                 if (result == Attempt.COMMITTED || result == Attempt.UNKNOWN) {
                     if (measured) {
-                        txns.add(BenchResult.Txn.of(plan, attempts, result.name(), causes, (t1 - planStart) / 1000));
+                        txns.add(BenchResult.Txn.of(plan, attempts, result.name(), causes, (t1 - planStart) / 1000,
+                                thinkNanos.get() / 1000));
                     }
                     plan = nextPlan();
                     attempts = 0;
                     causes = new ArrayList<>();
+                    thinkNanos = new AtomicLong();
                 }
             }
             if (attempts > 0 && planStart < measureEnd) {
                 // still retrying when the window closed: the txns that never commit must count too
                 txns.add(BenchResult.Txn.of(plan, attempts, "UNFINISHED", causes,
-                        (System.nanoTime() - planStart) / 1000));
+                        (System.nanoTime() - planStart) / 1000, thinkNanos.get() / 1000));
             }
         }
 

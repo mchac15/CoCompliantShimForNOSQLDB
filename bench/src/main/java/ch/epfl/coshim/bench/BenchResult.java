@@ -6,6 +6,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
+import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
 /**
@@ -39,19 +40,37 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
      * @param outcome    COMMITTED, UNKNOWN or UNFINISHED
      * @param causes     why each failed attempt failed (branch failure causes, tc_timeout, aborted)
      * @param latencyUs  from the first attempt's begin to the last attempt's end
+     * @param thinkUs    the think time paused for over all its attempts ({@code --think-mean-us})
      */
     public record Txn(int attempts, int reads, int writes, int branches, String outcome, List<String> causes,
-            long latencyUs) {
+            long latencyUs, long thinkUs) {
 
         static Txn of(List<MicroBench.Branch> plan, int attempts, String outcome, List<String> causes,
-                long latencyUs) {
+                long latencyUs, long thinkUs) {
             return new Txn(attempts, plan.stream().mapToInt(b -> b.readKeys().size()).sum(),
                     plan.stream().mapToInt(b -> b.writeKeys().size()).sum(), plan.size(), outcome,
-                    List.copyOf(causes), latencyUs);
+                    List.copyOf(causes), latencyUs, thinkUs);
         }
 
         int ops() {
             return reads + writes;
+        }
+
+        /** The whole execution, retries included, without the injected think time. */
+        long activeUs() {
+            return Math.max(0, latencyUs - thinkUs);
+        }
+
+        /**
+         * {@link #activeUs} per operation of the plan: the cost of one operation over the txn's whole
+         * execution, independent of how many operations and pauses it drew. Retries make it grow.
+         */
+        long opLatencyUs() {
+            return activeUs() / Math.max(1, ops());
+        }
+
+        int retries() {
+            return attempts - 1;
         }
     }
 
@@ -83,6 +102,34 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
     /** Mean attempts per txn (1 = no retries). */
     public double meanAttempts() {
         return txns.isEmpty() ? 0 : txns.stream().mapToInt(Txn::attempts).average().orElse(0);
+    }
+
+    private List<Txn> committedTxns() {
+        return txns.stream().filter(t -> t.outcome().equals("COMMITTED")).toList();
+    }
+
+    /**
+     * Percentile of the per-operation latency of the committed txns ({@link Txn#opLatencyUs}: whole
+     * execution with retries, think time excluded, per operation); -1 if none committed.
+     */
+    public long opLatencyPercentileUs(int percentile) {
+        return percentile(committedTxns().stream().mapToLong(Txn::opLatencyUs), percentile);
+    }
+
+    /** Percentile of the whole execution time of the committed txns, retries included, think time excluded. */
+    public long activeLatencyPercentileUs(int percentile) {
+        return percentile(committedTxns().stream().mapToLong(Txn::activeUs), percentile);
+    }
+
+    /** Percentile of the retries per txn (committed, unknown, and still retrying at the window's end). */
+    public long retriesPercentile(int percentile) {
+        return percentile(txns.stream().mapToLong(Txn::retries), percentile);
+    }
+
+    /** Same nearest-rank rule as {@link #latencyPercentileUs}; -1 if empty. */
+    private static long percentile(LongStream values, int percentile) {
+        long[] sorted = values.sorted().toArray();
+        return sorted.length == 0 ? -1 : sorted[Math.min(sorted.length - 1, sorted.length * percentile / 100)];
     }
 
     /** Share of the txns that needed at least one retry (or never committed). */
@@ -166,6 +213,10 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
         sb.append(String.format(Locale.ROOT, "  commit latency: mean %d us, p50 %d us, p99 %d us, max %d us%n",
                 meanLatencyUs(), latencyPercentileUs(50), latencyPercentileUs(99),
                 commitLatencyUs.isEmpty() ? -1 : commitLatencyUs.get(commitLatencyUs.size() - 1)));
+        sb.append(String.format(Locale.ROOT, "  without think time, retries included: per op p50 %d us, p99 %d us;"
+                        + " per txn p50 %d us, p99 %d us; retries p50 %d, p99 %d%n",
+                opLatencyPercentileUs(50), opLatencyPercentileUs(99), activeLatencyPercentileUs(50),
+                activeLatencyPercentileUs(99), retriesPercentile(50), retriesPercentile(99)));
         sb.append("  audit: ").append(!audited() ? "n/a (blind writes or failed run)"
                 : (auditOk() ? "OK" : "FAILED") + " (expected " + auditExpectedMin
                         + (auditExpectedMax > auditExpectedMin ? ".." + auditExpectedMax : "")
@@ -189,7 +240,8 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         "rmw", "txn_timeout_ms", "parallel_branches", "measure_s", "committed", "tps", "aborted",
                         "timed_out", "unknown", "abort_rate", "mean_us", "p50_us", "p99_us", "audit_ok",
                         "branch_failures", "ops_mean", "ops_sd", "ops_max", "think_mean_us", "think_sd_us",
-                        "mean_attempts", "retried_share")
+                        "mean_attempts", "retried_share", "op_p50_us", "op_p99_us", "txn_active_p50_us",
+                        "txn_active_p99_us", "retries_p50", "retries_p99")
                 .collect(Collectors.joining(","));
     }
 
@@ -202,20 +254,24 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         latencyPercentileUs(99), audited() ? auditOk() : "n/a", failuresText(";"), config.opsMean(),
                         config.opsSd(), config.opsMax(), config.thinkMeanUs(), config.thinkSdUs(),
                         String.format(Locale.ROOT, "%.3f", meanAttempts()),
-                        String.format(Locale.ROOT, "%.4f", retriedShare()))
+                        String.format(Locale.ROOT, "%.4f", retriedShare()), opLatencyPercentileUs(50),
+                        opLatencyPercentileUs(99), activeLatencyPercentileUs(50), activeLatencyPercentileUs(99),
+                        retriesPercentile(50), retriesPercentile(99))
                 .map(String::valueOf)
                 .collect(Collectors.joining(","));
     }
 
     public static String txnCsvHeader() {
-        return "label,variant,skew,attempts,reads,writes,ops,branches,outcome,first_cause,causes,latency_us";
+        return "label,variant,skew,attempts,reads,writes,ops,branches,outcome,first_cause,causes,latency_us,think_us,"
+                + "active_us,op_latency_us,threads";
     }
 
     /** One row per txn, for {@code <csv>-txns.csv}. */
     public List<String> txnRows(String label) {
         return txns.stream().map(t -> Stream.of(label, config.variant(), config.skewness(), t.attempts(), t.reads(),
                         t.writes(), t.ops(), t.branches(), t.outcome(), t.causes().isEmpty() ? "" : t.causes().get(0),
-                        String.join(";", t.causes()), t.latencyUs())
+                        String.join(";", t.causes()), t.latencyUs(), t.thinkUs(), t.activeUs(), t.opLatencyUs(),
+                        config.threads())
                 .map(String::valueOf).collect(Collectors.joining(","))).toList();
     }
 
