@@ -389,7 +389,7 @@ class LocksMapTest {
   }
 
   @Test
-  void onlyTheYoungerHoldersOfASharedNodeAreWoundedAndTheOlderAreWaitedFor() throws Exception {
+  void aYoungerSharedHolderIsWoundedOnlyOnceTheOlderOnesNoLongerBlock() throws Exception {
     Transaction<String, String> oldest = txn("oldest", 1);
     Transaction<String, String> mid = txn("mid", 2);
     Transaction<String, String> youngest = txn("youngest", 3);
@@ -399,9 +399,55 @@ class LocksMapTest {
         CompletableFuture.supplyAsync(() -> ww.lock("x", mid, LockMode.EXCLUSIVE, LONG));
     assertBlocked(f);
 
+    // mid waits for oldest anyway: wounding youngest now would buy nothing
+    assertEquals(Status.STARTED, youngest.getStatus());
+    assertFalse(youngest.isWounded());
+    assertEquals(List.of(Set.of(oldest, youngest), Set.of(mid)), chain(ww, "x"));
+
+    set(ww, oldest, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
     assertEquals(Status.ABORTED, youngest.getStatus());
-    assertEquals(Status.STARTED, oldest.getStatus());
+    assertTrue(youngest.isWounded());
+    assertEquals(Status.STARTED, mid.getStatus());
+  }
+
+  @Test
+  void aYoungerHolderThatExecutesWhileTheWounderWaitsForAnOlderOneIsNeverWounded() throws Exception {
+    Transaction<String, String> oldest = txn("oldest", 1);
+    Transaction<String, String> mid = txn("mid", 2);
+    Transaction<String, String> youngest = txn("youngest", 3);
+    ww.lock("x", oldest, LockMode.SHARED, LONG);
+    ww.lock("x", youngest, LockMode.SHARED, LONG);
+    CompletableFuture<LockResult> f =
+        CompletableFuture.supplyAsync(() -> ww.lock("x", mid, LockMode.EXCLUSIVE, LONG));
+    assertBlocked(f);
+
+    set(ww, youngest, Status.EXECUTED);
+    assertBlocked(f);
+    set(ww, oldest, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+    assertEquals(Status.EXECUTED, youngest.getStatus());
+    assertFalse(youngest.isWounded());
+  }
+
+  @Test
+  void aDoomedRunningHolderIsReleasedEvenWhileAnOlderHolderStillBlocks() throws Exception {
+    Transaction<String, String> oldest = txn("oldest", 1);
+    Transaction<String, String> mid = txn("mid", 2);
+    Transaction<String, String> doomed = txn("doomed", 3);
+    ww.lock("x", oldest, LockMode.SHARED, LONG);
+    ww.lock("x", doomed, LockMode.SHARED, LONG);
+    ww.lock("y", doomed, LockMode.SHARED, LONG);
+    assertTrue(doomed.compareAndSwapStatus(Status.STARTED, Status.MUST_ABORT));   // a cascade, mid-run
+    CompletableFuture<LockResult> f =
+        CompletableFuture.supplyAsync(() -> ww.lock("x", mid, LockMode.EXCLUSIVE, LONG));
+    assertBlocked(f);
+
+    assertEquals(Status.ABORTED, doomed.getStatus());
+    assertFalse(doomed.isWounded(), "doomed by the cascade, not wounded");
+    assertFalse(ww.containsKey("y"));
     assertEquals(List.of(Set.of(oldest), Set.of(mid)), chain(ww, "x"));
+
     set(ww, oldest, Status.EXECUTED);
     assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
   }
@@ -436,6 +482,27 @@ class LocksMapTest {
     young.compareAndSwapStatus(Status.PREPARED, Status.COMMITTING);
     s2pl.release(young);
     assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  @Test
+  void nonSpeculativeWoundWaitWoundsOnlyOnceNoExecutedYoungerHolderBlocks() throws Exception {
+    LocksMap<String, String> s2pl = new LocksMap<>(false, DeadlockPolicy.WOUND_WAIT, null);
+    Transaction<String, String> old = txn("old", 1);
+    Transaction<String, String> executed = txn("executed", 2);
+    Transaction<String, String> running = txn("running", 3);
+    s2pl.lock("x", executed, LockMode.SHARED, LONG);
+    s2pl.lock("x", running, LockMode.SHARED, LONG);
+    set(s2pl, executed, Status.EXECUTED);
+    CompletableFuture<LockResult> f =
+        CompletableFuture.supplyAsync(() -> s2pl.lock("x", old, LockMode.EXCLUSIVE, LONG));
+    assertBlocked(f);
+    assertEquals(Status.STARTED, running.getStatus(), "old waits for the executed one anyway");
+
+    executed.compareAndSwapStatus(Status.EXECUTED, Status.COMMITTING);
+    s2pl.release(executed);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+    assertEquals(Status.ABORTED, running.getStatus());
+    assertTrue(running.isWounded());
   }
 
   @Test

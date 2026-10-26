@@ -16,12 +16,15 @@ import java.util.concurrent.TimeUnit;
  * <p>Latching: {@link LocksMap} calls the methods that modify the chain ({@link #acquire}, {@link
  * #upgrade}, {@link #release}, {@link #abortAndRelease}) only inside {@code locksMap.compute(key,
  * ...)}, so they run under the key's map entry, and each of them is also {@code synchronized} on the
- * chain. Readers ({@link #awaitPredecessor}, {@link #read}) only take the chain's monitor, which is
- * enough to see a consistent chain, and waiters {@code wait()} on it: every change that can satisfy
- * a wait predicate ends with {@code notifyAll()}. Lock order: map entry, then chain, then txn.
+ * chain. Readers ({@link #awaitLockReady}, {@link #awaitResolved}, {@link #read}) only take the
+ * chain's monitor, which is enough to see a consistent chain, and waiters {@code wait()} on it:
+ * every change that can satisfy a wait predicate ends with {@code notifyAll()}. Lock order: map
+ * entry, then chain, then txn.
  */
 class Chain<K, V> {
   private static final Set<Status> MARKABLE = EnumSet.of(Status.STARTED, Status.EXECUTED);
+  /** Holders already on their way out of the chain: they never stop a wound from unblocking. */
+  private static final Set<Status> LEAVING = EnumSet.of(Status.MUST_ABORT, Status.ABORTED);
 
   static enum UpgradeResult {
     /** txn is no longer started, or read-modify-write against read-modify-write: txn aborts. */
@@ -141,16 +144,14 @@ class Chain<K, V> {
   }
 
   /**
-   * The wait loop of lock()/upgrade() (ready = at least executed, bounded) and of prepare() (ready =
-   * committed, unbounded): waits until every holder of the predecessor of txn's node on this key is
-   * in {@code ready}. The predecessor is re-read on every wake-up, since it is spliced out or
-   * replaced while waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn
-   * waits until it is spliced out (the cascade marks the dependents before that).
+   * The wait loop of lock()/upgrade() (ready = at least executed): waits, at most until {@code
+   * deadlineNanos}, until every holder of the predecessor of txn's node on this key is in {@code
+   * ready}. The predecessor is re-read on every wake-up, since it is spliced out or replaced while
+   * waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn waits until it is
+   * spliced out (the cascade marks the dependents before that).
    *
-   * <p>Deadlock prevention, in the bounded (execution phase) wait only, so that every wait-for edge
-   * goes from a younger txn to an older one and no cycle can form. Chains are FIFO, so the common
-   * case (younger behind older) just waits. prepare() is unbounded and never dies nor wounds: its
-   * waits are left to the coordinator.
+   * <p>Deadlock prevention, so that every wait-for edge goes from a younger txn to an older one and
+   * no cycle can form. Chains are FIFO, so the common case (younger behind older) just waits.
    *
    * <ul>
    *   <li>wait-die: a txn that would wait for a younger one returns DIE instead.
@@ -162,12 +163,36 @@ class Chain<K, V> {
    *       like any other doomed holder until their release splices them out (with notifyAll), so
    *       nobody is wounded twice and the loop never spins. A younger holder that already executed
    *       does not block lock(), so it is never wounded; an older one is waited for.
+   *       <p>Wounding happens only when it unblocks txn: while pred also holds a txn that cannot be
+   *       wounded (an older running one, or in the non-speculative baseline an executed / prepared
+   *       younger one), txn just waits and decides again on that txn's status change. The younger
+   *       ones may execute meanwhile and then need not die. Still no cycle: txn only stays blocked
+   *       on older txns or on txns past started (which wait on no lock), and as soon as those are
+   *       gone it wounds the younger ones it would otherwise wait for.
    * </ul>
    *
-   * @param deadlineNanos a {@link System#nanoTime()} deadline, used only if {@code bounded}
+   * @param deadlineNanos a {@link System#nanoTime()} deadline
    * @param victims receives the txns marked on WOUND (only with WOUND_WAIT)
    */
-  synchronized WaitResult awaitPredecessor(
+  synchronized WaitResult awaitLockReady(
+      Transaction<K, V> txn,
+      Set<Status> ready,
+      long deadlineNanos,
+      DeadlockPolicy policy,
+      List<Transaction<K, V>> victims) {
+    return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
+  }
+
+  /**
+   * The wait loop of prepare() (ready = committed): as {@link #awaitLockReady}, but unbounded and
+   * with no deadlock prevention (it never dies nor wounds): its waits are left to the coordinator.
+   * Returns READY or DOOMED (TIMED_OUT only if the thread is interrupted).
+   */
+  synchronized WaitResult awaitResolved(Transaction<K, V> txn, Set<Status> ready) {
+    return awaitPredecessor(txn, ready, false, 0, null, null);
+  }
+
+  private WaitResult awaitPredecessor(
       Transaction<K, V> txn,
       Set<Status> ready,
       boolean bounded,
@@ -188,7 +213,7 @@ class Chain<K, V> {
       if (bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, ready)) {
         return WaitResult.DIE;
       }
-      if (bounded && policy == DeadlockPolicy.WOUND_WAIT && wound(txn, pred, victims)) {
+      if (bounded && policy == DeadlockPolicy.WOUND_WAIT && wound(txn, pred, ready, victims)) {
         return WaitResult.WOUND;
       }
       try {
@@ -210,15 +235,30 @@ class Chain<K, V> {
 
   /**
    * Wound-wait's marking, under this monitor: CASes every younger started holder of pred to
-   * must_abort. Also hands over the holders that a cascade doomed while they were still running:
+   * must_abort, but only when every holder of pred not in {@code ready} can be wounded or is already
+   * leaving (must_abort / aborted): otherwise wounding would not unblock txn, which waits instead.
+   * Also hands over, in any case, the holders that a cascade doomed while they were still running:
    * nobody else releases those until their own thread calls the shim again (e.g. during client think
    * time), and aborting them never cascades.
    *
    * @return true iff victims is non-empty: the caller must abort them before waiting again
    */
-  private boolean wound(Transaction<K, V> txn, LockNode<K, V> pred, List<Transaction<K, V>> victims) {
+  private boolean wound(
+      Transaction<K, V> txn,
+      LockNode<K, V> pred,
+      Set<Status> ready,
+      List<Transaction<K, V>> victims) {
+    boolean blocked = false;
     for (Transaction<K, V> t : pred.getHolders()) {
-      if (t.getTs() > txn.getTs() && t.wound()) {
+      Status s = t.getStatus();
+      if (!ready.contains(s)
+          && !LEAVING.contains(s)
+          && !(s == Status.STARTED && t.getTs() > txn.getTs())) {
+        blocked = true;   // an older live txn, or a younger one past started: not woundable
+      }
+    }
+    for (Transaction<K, V> t : pred.getHolders()) {
+      if (!blocked && t.getTs() > txn.getTs() && t.wound()) {
         victims.add(t);
       } else if (t.getStatus() == Status.MUST_ABORT && !t.hasReachedExecuted()) {
         victims.add(t);
