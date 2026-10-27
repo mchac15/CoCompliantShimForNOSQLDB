@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The final micro benchmark: the speculative and the non-speculative shim (under both deadlock
-# policies) and Sonata, all on the same MySQL / PostgreSQL servers, over every combination of thread
-# count and skew, with the realistic workload, and a summary of the results.
+# The final micro benchmark: the speculative and the non-speculative shim (wound-wait) and Sonata, all
+# on the same MySQL / PostgreSQL servers, over every combination of thread count and skew, and a
+# summary of the results, including what speculation saved and what its cascades cost.
 #
 #   scripts/bench-final.sh [MicroBench options...]     # runs the sweep (or resumes it), then summarizes
 #   scripts/bench-final.sh --summarize DIR             # summarizes an existing sweep again
@@ -16,19 +16,25 @@
 # innodb_lock_wait_timeout / lock_timeout), and the TC's global timeout TXN_TIMEOUT_MS is a backstop
 # above it.
 #
-# Workload: MicroBench's defaults (10000 keys per table, 2 branches in order, rmw writes) with the
-# realistic options --ops-mean 3 --think-mean-us 2000 --think-sd-us 1000; extra options are passed on.
+# Workload: MicroBench's defaults (10000 keys per table, 2 branches in order, rmw writes, each branch's
+# reads and writes in a random order) with --ops-mean 3 and no think time: with a pause between
+# operations, the few ms speculation saves are lost in the think time and the comparison says
+# nothing. Extra options are passed on.
 #
 # Output, in DIR = bench-results/final-<timestamp>/:
 #   t<T>-skew<S>.csv, txns-t<T>-skew<S>.csv, t<T>-skew<S>-nodes/   the runs, their txns, node logs
 #   summary.md, summary.csv   per threads, skew and variant: throughput (mean over reps, min-max);
 #                             per-op latency p50 / p99 and per-txn execution p50 / p99 (committed txns,
 #                             retries included, think time excluded, pooled over the reps); retries
-#                             per txn p50 / p99 (pooled); abort rate; audits
+#                             per txn p50 / p99 (pooled); abort rate; audits; and, from the shim nodes'
+#                             logs, per branch commit: the lock wait speculation saved (gross, and net
+#                             of the wait it moved into prepare), the work lost to cascade aborts, and
+#                             net saved = net - lost
 #
-# Defaults: threads 20 50 100 200, skews 0.9 0.99, 3 reps of 10 s warm-up + 30 s measured, 2
-# participants, 10 variants: about 4 h.
-# Env: THREADS_LIST ("20 50 100 200"), SKEWS ("0.9 0.99"), REPS (3), WARMUP_S (10), MEASURE_S (30),
+# Defaults: threads 20 50 100 200, skews 0.8 0.9 0.95, 3 reps of 10 s warm-up + 30 s measured, 2
+# participants, 6 variants (wait-die starves retried txns, which get a fresh age: add the @wait-die
+# variants back through VARIANTS): about 4 h.
+# Env: THREADS_LIST ("20 50 100 200"), SKEWS ("0.8 0.9 0.95"), REPS (3), WARMUP_S (10), MEASURE_S (30),
 #      LOCK_TIMEOUT_MS (30000), TXN_TIMEOUT_MS (60000), VARIANTS (below), OUT, KEEP_DBS (1: leave the
 #      servers running), REUSE_DBS (1: use servers already running, whatever their lock timeouts),
 #      and bench-compare.sh's SHIMS, NODE_PORT, ...
@@ -62,6 +68,23 @@ for f in glob.glob(os.path.join(out, "txns-t*-skew*.csv")):
 if not runs:
     sys.exit("no t*-skew*.csv in " + out)
 
+# the shim nodes' last speculation line (the final counters), summed over nodes and reps
+SPEC_KEYS = ("commits", "saved_us_total", "saved_net_us_total", "cascade_lost_us_total")
+spec = {}
+for d in glob.glob(os.path.join(out, "t[0-9]*-skew*-nodes")):
+    t, s = cell_key(os.path.basename(d)[:-len("-nodes")] + ".csv")
+    for log in glob.glob(os.path.join(d, "rep*-*-s*.log")):
+        variant = re.sub(r"^rep\d+-|-s\d+\.log$", "", os.path.basename(log))
+        lines = [l for l in open(log, errors="replace") if l.startswith("speculation")]
+        if not lines:
+            continue
+        fields = dict(kv.split("=", 1) for kv in lines[-1].split() if "=" in kv)
+        if not all(k in fields for k in SPEC_KEYS):
+            continue   # a log from before these counters existed
+        acc = spec.setdefault((t, s, variant), dict.fromkeys(SPEC_KEYS, 0))
+        for k in SPEC_KEYS:
+            acc[k] += int(fields[k])
+
 def pct(values, p):
     # nearest rank, as BenchResult
     v = sorted(values)
@@ -83,6 +106,12 @@ for k in sorted(order, key=lambda k: (k[0], k[1], order.index(k))):
         tc_timeouts=sum(int(r["timed_out"]) for r in rs), unknown=sum(int(r["unknown"]) for r in rs),
         unfinished=sum(t["outcome"] == "UNFINISHED" for t in ts),
         audits_ok=sum(r["audit_ok"] in ("true", "n/a") for r in rs)))
+    sp = spec.get(k)
+    per = (lambda key: round(sp[key] / sp["commits"]) if sp and sp["commits"] else "")
+    rows[-1].update(saved_gross_us=per("saved_us_total"), saved_net_us=per("saved_net_us_total"),
+                    cascade_lost_us=per("cascade_lost_us_total"),
+                    net_saved_us=(round((sp["saved_net_us_total"] - sp["cascade_lost_us_total"]) / sp["commits"])
+                                  if sp and sp["commits"] else ""))
 
 with open(os.path.join(out, "summary.csv"), "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -95,19 +124,24 @@ if os.path.exists(setup):
     print("".join("    " + l for l in open(setup)))
 print("Latencies: committed txns, from the first attempt's begin to the commit, retries included, think time")
 print("excluded; per op = that divided by the txn's ops. Latency and retry percentiles are pooled over the")
-print("reps; tps and abort rate are means over the reps.\n")
+print("reps; tps and abort rate are means over the reps.")
+print("Speculation, per branch commit on the shims (warm-up included, summed over nodes and reps): saved =")
+print("lock wait avoided (gross), net = minus the wait moved into prepare, lost = work of the cascade-aborted")
+print("txns, net saved = net - lost.\n")
 for (t, s) in sorted({(r["threads"], r["skew"]) for r in rows}):
     print(f"## {t} threads, skew {s}\n")
     print("| variant | reps | tps | tps min-max | op p50 us | op p99 us | txn p50 us | txn p99 us "
-          "| retries p50 | retries p99 | abort rate | TC timeouts | unfinished | audits OK |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+          "| retries p50 | retries p99 | abort rate | TC timeouts | unfinished | audits OK "
+          "| saved us | net us | lost us | net saved us |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
         if (r["threads"], r["skew"]) != (t, s):
             continue
         print(f"| {r['variant']} | {r['reps']} | {r['tps']:.1f} | {r['tps_min']:.1f}-{r['tps_max']:.1f} "
               f"| {r['op_p50_us']} | {r['op_p99_us']} | {r['txn_p50_us']} | {r['txn_p99_us']} "
               f"| {r['retries_p50']} | {r['retries_p99']} | {100 * r['abort_rate']:.2f}% | {r['tc_timeouts']} "
-              f"| {r['unfinished']} | {r['audits_ok']}/{r['reps']} |")
+              f"| {r['unfinished']} | {r['audits_ok']}/{r['reps']} | {r['saved_gross_us']} | {r['saved_net_us']} "
+              f"| {r['cascade_lost_us']} | {r['net_saved_us']} |")
     print()
 print(f"Raw runs: {out}/t*-skew*.csv, txns: {out}/txns-t*-skew*.csv, node logs: {out}/t*-skew*-nodes/;")
 print(f"this table as CSV: {out}/summary.csv.")
@@ -128,13 +162,12 @@ for arg in "$@"; do
 done
 
 threads_list="${THREADS_LIST:-20 50 100 200}"
-skews="${SKEWS:-0.9 0.99}"
+skews="${SKEWS:-0.8 0.9 0.95}"
 reps="${REPS:-3}"
 lock_timeout="${LOCK_TIMEOUT_MS:-30000}"
 txn_timeout="${TXN_TIMEOUT_MS:-60000}"
-variants="${VARIANTS:-speculative-mysql@wait-die speculative-mysql@wound-wait nonspeculative-mysql@wait-die \
-nonspeculative-mysql@wound-wait sonata-mysql speculative-pg@wait-die speculative-pg@wound-wait \
-nonspeculative-pg@wait-die nonspeculative-pg@wound-wait sonata-pg}"
+variants="${VARIANTS:-speculative-mysql@wound-wait nonspeculative-mysql@wound-wait sonata-mysql \
+speculative-pg@wound-wait nonspeculative-pg@wound-wait sonata-pg}"
 shims="${SHIMS:-2}"
 out="${OUT:-$root/bench-results/final-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$out"
@@ -175,7 +208,7 @@ for kind in "${kinds[@]}"; do
     fi
 done
 
-workload=(--ops-mean 3 --think-mean-us 2000 --think-sd-us 1000)
+workload=(--ops-mean 3)
 if [[ ! -f "$out/setup.txt" ]]; then
     {
         echo "date:      $(date '+%Y-%m-%d %H:%M')   commit: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo '?')"

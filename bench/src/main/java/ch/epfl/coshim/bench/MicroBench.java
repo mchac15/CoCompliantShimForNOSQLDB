@@ -84,7 +84,15 @@ public final class MicroBench implements AutoCloseable {
     static final String TX_SERVICE_GROUP = "default_tx_group";
 
     /** One branch of a plan: which shim, which table, which keys. */
-    record Branch(int shim, String table, List<Integer> readKeys, List<Integer> writeKeys) {}
+    /**
+     * One branch of a plan. {@code ops} is the order the branch runs its reads and writes in: both
+     * lists shuffled together, so hot and cold keys, reads and writes, come in a random order (and a
+     * retry replays the same order).
+     */
+    record Branch(int shim, String table, List<Integer> readKeys, List<Integer> writeKeys, List<Op> ops) {}
+
+    /** One operation of a branch: a read, or a write (read-modify-write with {@code rmw}) of key. */
+    record Op(int key, boolean write) {}
 
     enum Attempt { COMMITTED, ABORTED, TIMED_OUT, UNKNOWN }
 
@@ -274,7 +282,11 @@ public final class MicroBench implements AutoCloseable {
             } while (r + w == 0);
             List<Integer> reads = workingSet(config, r, used);
             List<Integer> writes = workingSet(config, w, used);
-            plan.add(new Branch(random.nextInt(shims), table(b), reads, writes));
+            List<Op> ops = new ArrayList<>();
+            reads.forEach(k -> ops.add(new Op(k, false)));
+            writes.forEach(k -> ops.add(new Op(k, true)));
+            Collections.shuffle(ops, random);
+            plan.add(new Branch(random.nextInt(shims), table(b), reads, writes, List.copyOf(ops)));
         }
         return plan;
     }
@@ -427,15 +439,15 @@ public final class MicroBench implements AutoCloseable {
             c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
             try {
                 boolean first = true;
-                for (int k : b.readKeys()) {
+                for (Op op : b.ops()) {
                     first = think(first, thinkNanos);
-                    p.get(c, b.table(), k);
-                }
-                for (int k : b.writeKeys()) {
-                    first = think(first, thinkNanos);
-                    long value = config.rmw() ? p.get(c, b.table(), k) + 1
+                    if (!op.write()) {
+                        p.get(c, b.table(), op.key());
+                        continue;
+                    }
+                    long value = config.rmw() ? p.get(c, b.table(), op.key()) + 1
                             : ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
-                    p.put(c, b.table(), k, value);
+                    p.put(c, b.table(), op.key(), value);
                 }
                 think(false, thinkNanos);
                 c.commit();   // xa end + xa prepare: the participant votes

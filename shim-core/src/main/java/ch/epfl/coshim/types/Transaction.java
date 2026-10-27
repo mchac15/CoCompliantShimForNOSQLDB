@@ -42,6 +42,10 @@ public class Transaction<K, V> {
   private final List<Grant> grants = new ArrayList<>();
   private int maxDepth;
   private int cascadeFanout;
+  /** When this txn was created, in {@link System#nanoTime()}. */
+  private final long createdAtNanos = System.nanoTime();
+  /** How long prepare() waited for its predecessors to commit. */
+  private long prepareWaitNanos;
 
   /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
   public Transaction(String transactionId, Status status, Long expiresAtMillis) {
@@ -221,6 +225,18 @@ public class Transaction<K, V> {
   public synchronized void markResolved() {
     resolvedAtNanos = System.nanoTime();
     grants.clear();
+  }
+
+  public long createdAtNanos() {
+    return createdAtNanos;
+  }
+
+  public synchronized long prepareWaitNanos() {
+    return prepareWaitNanos;
+  }
+
+  public synchronized void setPrepareWaitNanos(long nanos) {
+    prepareWaitNanos = nanos;
   }
 
   /** How many txns the abort of this one marked must_abort directly (cascade fan-out). */

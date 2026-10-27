@@ -21,8 +21,8 @@ import java.util.concurrent.ThreadLocalRandom;
  * @param threads          closed-loop workers (Acta's concurrency)
  * @param tableSize        keys per table; branch i of every txn uses table micro-i
  * @param branches         branches (subtransactions) per global transaction
- * @param reads            pure reads per branch, done first
- * @param writes           writes per branch, done after the reads
+ * @param reads            pure reads per branch
+ * @param writes           writes per branch; a branch runs its reads and writes in a random order
  * @param skewness         share of each branch's keys drawn from the hot range, the first
  *                         (1 - skewness) * tableSize keys (Acta's definition, in [0.5, 1))
  * @param rmw              writes are v := get(k) + 1 instead of blind random values; enables the audit

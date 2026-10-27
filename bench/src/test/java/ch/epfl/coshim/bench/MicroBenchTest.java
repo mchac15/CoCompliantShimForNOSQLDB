@@ -92,6 +92,27 @@ class MicroBenchTest {
     }
 
     @Test
+    void branchesRunTheirReadsAndWritesInARandomOrder() {
+        // 10 ops at skew 0.9: 9 hot keys and 1 cold one per list
+        BenchConfig c = config("--table-size", "1000", "--reads", "10", "--writes", "10", "--skew", "0.9");
+        boolean writeBeforeRead = false;
+        boolean coldBeforeHot = false;
+        for (int i = 0; i < 1000; i++) {
+            for (MicroBench.Branch b : MicroBench.randomPlan(c, 2)) {
+                List<MicroBench.Op> ops = b.ops();
+                assertEquals(b.readKeys().stream().sorted().toList(),
+                        ops.stream().filter(o -> !o.write()).map(MicroBench.Op::key).sorted().toList());
+                assertEquals(b.writeKeys().stream().sorted().toList(),
+                        ops.stream().filter(MicroBench.Op::write).map(MicroBench.Op::key).sorted().toList());
+                writeBeforeRead |= ops.get(0).write();
+                coldBeforeHot |= ops.get(0).key() >= c.hotRangeSize();
+            }
+        }
+        assertTrue(writeBeforeRead, "writes are not always after the reads");
+        assertTrue(coldBeforeHot, "cold keys are not always after the hot ones");
+    }
+
+    @Test
     void latencyExcludesThinkTimeAndCountsRetries() {
         // 4 ops each: two first tries (400 us active each), 3 tries with 1200 us of pauses, one still retrying
         List<BenchResult.Txn> txns = List.of(

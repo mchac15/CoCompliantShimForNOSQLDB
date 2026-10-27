@@ -212,7 +212,9 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       abortTransaction(txn, AbortCause.CASCADE); // a late cascade landed after the wait
       return Vote.NO;
     }
-    stats.prepared(System.nanoTime() - waitStart);
+    long waited = System.nanoTime() - waitStart;
+    txn.setPrepareWaitNanos(waited);
+    stats.prepared(waited);
     return Vote.YES;
   }
 
@@ -235,7 +237,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     locksMap.release(txn);
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
-    stats.committed(txn.maxDepth(), grants, saved);
+    stats.committed(txn.maxDepth(), grants, saved, txn.prepareWaitNanos());
   }
 
   @Override
@@ -296,7 +298,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     txn.markResolved();
     List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
     stats.aborted(before == Status.MUST_ABORT ? doomedBy(txn) : cause, txn.maxDepth(),
-        txn.cascadeFanout());
+        txn.cascadeFanout(), System.nanoTime() - txn.createdAtNanos());
     transactionsMap.remove(txn.getTransactionId(), txn);
     for (Transaction<K, V> t : doomed) {
       abortTransaction(t, AbortCause.CASCADE);

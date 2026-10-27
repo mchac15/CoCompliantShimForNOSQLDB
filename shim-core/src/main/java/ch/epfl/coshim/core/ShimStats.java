@@ -47,6 +47,10 @@ public final class ShimStats {
   private final LongAdder speculativeGrants = new LongAdder();
   private final LongAdder prepareWaitUs = new LongAdder();
   private final LongAdder prepares = new LongAdder();
+  /** Net saving of each commit: max(0, saved - its own prepare wait), in µs. */
+  private final LongAdder savedNetUs = new LongAdder();
+  /** Time from creation to abort of the txns aborted by a cascade (work speculation lost), in µs. */
+  private final LongAdder cascadeLostUs = new LongAdder();
   /** Running sums of (depth, saved µs) over the commits, for their Pearson correlation. */
   private double n, sx, sy, sxx, syy, sxy;
 
@@ -69,11 +73,15 @@ public final class ShimStats {
   /**
    * @param depth the txn's max dependency depth at a lock grant
    * @param grants its locks granted on uncommitted predecessors
-   * @param savedNanos estimate of the lock waiting that speculation saved it
+   * @param savedNanos estimate of the lock waiting that speculation saved it (gross: as if each
+   *     speculative grant had waited until its predecessors resolved)
+   * @param prepareWaitNanos how long its prepare() waited: speculation moves the wait there instead of
+   *     removing it, so the net saving is {@code max(0, savedNanos - prepareWaitNanos)}
    */
-  void committed(int depth, int grants, long savedNanos) {
+  void committed(int depth, int grants, long savedNanos, long prepareWaitNanos) {
     commits.increment();
     long savedUs = TimeUnit.NANOSECONDS.toMicros(savedNanos);
+    savedNetUs.add(TimeUnit.NANOSECONDS.toMicros(Math.max(0, savedNanos - prepareWaitNanos)));
     commitsByDepth[bucket(depth)].increment();
     savedUsByDepth[bucket(depth)].add(savedUs);
     speculativeGrants.add(grants);
@@ -87,9 +95,16 @@ public final class ShimStats {
     }
   }
 
-  /** @param fanout txns this abort marked must_abort directly */
-  void aborted(AbortCause cause, int depth, int fanout) {
+  /**
+   * @param fanout txns this abort marked must_abort directly
+   * @param lifetimeNanos time from the txn's creation to this abort: counted as lost to speculation
+   *     when the cause is a cascade
+   */
+  void aborted(AbortCause cause, int depth, int fanout, long lifetimeNanos) {
     aborts.get(cause).increment();
+    if (cause == AbortCause.CASCADE) {
+      cascadeLostUs.add(TimeUnit.NANOSECONDS.toMicros(lifetimeNanos));
+    }
     abortsByDepth[bucket(depth)].increment();
     if (fanout > 0) {
       cascadeFanout[bucket(fanout)].increment();
@@ -112,6 +127,16 @@ public final class ShimStats {
 
   public long aborts() {
     return aborts.values().stream().mapToLong(LongAdder::sum).sum();
+  }
+
+  /** Σ over the commits of max(0, saved - prepare wait), in µs. */
+  public long savedNetUs() {
+    return savedNetUs.sum();
+  }
+
+  /** Σ over the cascade aborts of the time from the txn's creation to its abort, in µs. */
+  public long cascadeLostUs() {
+    return cascadeLostUs.sum();
   }
 
   /** Commits whose max dependency depth falls in that bucket. */
@@ -138,7 +163,9 @@ public final class ShimStats {
 
   /**
    * One line on what speculation did: share of commits that speculated, saved time, prepare waits,
-   * and per depth bucket {@code d:commits/aborts/mean saved µs}, cascade fan-out {@code k:aborts}.
+   * and per depth bucket {@code d:commits/aborts/mean saved µs}, cascade fan-out {@code k:aborts};
+   * then the totals (µs) the bench sums over nodes: commits, gross and net saved, lost to cascades,
+   * and net saved per commit (net saved minus lost, per commit).
    */
   public String speculationSummary() {
     long c = commits();
@@ -166,6 +193,10 @@ public final class ShimStats {
         sb.append(k).append(k == BUCKETS - 1 ? "+" : "").append(':').append(f).append(' ');
       }
     }
+    long net = savedNetUs.sum() - cascadeLostUs.sum();
+    sb.append(String.format(Locale.ROOT,
+        "commits=%d saved_us_total=%d saved_net_us_total=%d cascade_lost_us_total=%d net_saved_us_per_commit=%.0f",
+        c, saved, savedNetUs.sum(), cascadeLostUs.sum(), c == 0 ? 0 : (double) net / c));
     return sb.toString().trim();
   }
 

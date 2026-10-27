@@ -113,6 +113,46 @@ class SpeculativeCoShimTest {
     }
 
     @Test
+    void theNetSavingSubtractsTheWaitMovedToPrepare() throws Exception {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r");
+        shim.get("r", "x");
+        shim.end("r");
+        // r has nothing left to do: its whole wait for w moves into prepare, nothing is saved
+        CompletableFuture<Vote> r = CompletableFuture.supplyAsync(() -> shim.prepare("r"));
+        Thread.sleep(50);
+        assertEquals(Vote.YES, shim.prepare("w"));
+        shim.commit("w");
+        assertEquals(Vote.YES, r.get(2, TimeUnit.SECONDS));
+        shim.commit("r");
+        assertTrue(shim.stats().savedUsAtDepth(1) >= 50_000, "gross: " + shim.stats().speculationSummary());
+        assertTrue(shim.stats().savedNetUs() < 20_000, "net: " + shim.stats().speculationSummary());
+    }
+
+    @Test
+    void theNetSavingIsTheGrossOneWhenPrepareDoesNotWait() throws Exception {
+        speculativeGrantIsCountedWithTheWaitItSaved();   // r prepares after w committed
+        assertTrue(shim.stats().savedNetUs() >= 50_000, shim.stats().speculationSummary());
+    }
+
+    @Test
+    void aCascadeAbortCountsTheWorkItLost() throws Exception {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r");
+        shim.get("r", "x");
+        Thread.sleep(30);
+        shim.end("r");   // executed on w's value
+        shim.abort("w");   // r is doomed and, already executed, aborted at once
+        assertEquals(1, shim.stats().aborts(AbortCause.CASCADE));
+        assertTrue(shim.stats().cascadeLostUs() >= 30_000, shim.stats().speculationSummary());
+        assertTrue(shim.stats().speculationSummary().contains("cascade_lost_us_total="));
+    }
+
+    @Test
     void cascadeFanoutIsCounted() {
         shim.start("w");
         shim.put("w", "x", "1");
