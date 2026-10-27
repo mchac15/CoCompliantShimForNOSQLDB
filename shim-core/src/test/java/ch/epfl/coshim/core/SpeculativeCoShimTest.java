@@ -4,9 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.InMemoryKvStore;
+import ch.epfl.coshim.types.DeadlockPolicy;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -91,6 +93,38 @@ class SpeculativeCoShimTest {
         assertEquals(0, shim.stats().commits());
     }
 
+    @Test
+    void speculativeGrantIsCountedWithTheWaitItSaved() throws Exception {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r");
+        shim.get("r", "x");   // granted on w, executed but not committed: depth 1
+        shim.end("r");
+        Thread.sleep(50);
+        assertEquals(Vote.YES, shim.prepare("w"));
+        shim.commit("w");
+        assertEquals(Vote.YES, shim.prepare("r"));
+        shim.commit("r");
+        assertEquals(1, shim.stats().commitsAtDepth(0), "w speculated on nothing");
+        assertEquals(1, shim.stats().commitsAtDepth(1));
+        assertTrue(shim.stats().savedUsAtDepth(1) >= 50_000, shim.stats().speculationSummary());
+        assertEquals(0, shim.stats().savedUsAtDepth(0));
+    }
+
+    @Test
+    void cascadeFanoutIsCounted() {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r1");
+        shim.get("r1", "x");
+        shim.start("r2");
+        shim.get("r2", "x");
+        shim.abort("w");
+        assertEquals(1, shim.stats().abortsWithFanout(2), shim.stats().speculationSummary());
+    }
+
     // ---- non-speculative baseline: same shim, lock() waits for the predecessors to commit ----
 
     private final SpeculativeCoShim<String, String> s2pl =
@@ -146,6 +180,34 @@ class SpeculativeCoShimTest {
         assertThrows(TxnAbortedException.class, () -> shortTimeout.put("r", "x", "2"));
         assertEquals(1, shortTimeout.stats().aborts(AbortCause.LOCK_TIMEOUT));
         assertEquals(Vote.YES, shortTimeout.prepare("w"), "the timeout only aborts the waiter");
+    }
+
+    @Test
+    void woundWaitAbortsTheYoungerRunningWriterAndTheOlderTxnCommits() {
+        SpeculativeCoShim<String, String> ww = new SpeculativeCoShim<>(
+                store, LOCK_TIMEOUT, SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, DeadlockPolicy.WOUND_WAIT);
+        store.store("x", "0");
+        ww.start("old");
+        ww.start("young");
+        ww.put("young", "x", "1");
+        ww.put("young", "y", "1");
+
+        assertEquals("0", ww.get("old", "x"), "young is wounded and released: old reads the store");
+        assertEquals(1, ww.stats().aborts(AbortCause.WOUNDED));
+        assertEquals(0, ww.stats().aborts(AbortCause.CASCADE), "the wounder is not doomed by the release");
+
+        assertThrows(TxnAbortedException.class, () -> ww.put("young", "z", "1"));
+        assertEquals(Outcome.FAILED, ww.end("young"));
+        assertEquals(Vote.NO, ww.prepare("young"));
+        ww.abort("young");   // the coordinator's rollback: nothing left to do
+        assertEquals(1, ww.stats().aborts(), "counted once, as a wound");
+
+        ww.put("old", "y", "2");
+        assertEquals(Outcome.SUCCEEDED, ww.end("old"));
+        assertEquals(Vote.YES, ww.prepare("old"));
+        ww.commit("old");
+        assertEquals("0", store.get("x"));
+        assertEquals("2", store.get("y"));
     }
 
     @Test

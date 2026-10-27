@@ -3,6 +3,7 @@ package ch.epfl.coshim.bench;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Parameters of one {@link MicroBench} run. The defaults are the "simple test": Acta's Micro workload
@@ -32,15 +33,63 @@ import java.util.List;
  *                         start, ops, end, prepare) instead of one after the other
  * @param sonata           turn Sonata on for the SQL databases ({@code sonata.enableGlobalSerializability};
  *                         Sonata's other settings stay at their defaults). Seata reads it once per JVM
+ * @param opsMean          > 0: every branch draws its reads and its writes from a normal distribution of
+ *                         this mean truncated to [0, opsMax] (not both 0), instead of {@code reads} /
+ *                         {@code writes}; <= 0: the fixed counts
+ * @param opsSd            standard deviation of that distribution
+ * @param opsMax           largest number of reads (or writes) a branch draws
+ * @param thinkMeanUs      > 0: the application pauses for a normal draw of this mean (µs, truncated at
+ *                         0) before every operation of a branch but the first and before its commit,
+ *                         standing for the network hop and the work between two requests; 0: no pause
+ * @param thinkSdUs        standard deviation of that pause (µs)
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
-        boolean parallelBranches, boolean sonata) {
+        boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
+        double thinkSdUs) {
 
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false);
+                false, false, 0, 1.5, 10, 0, 1000);
+    }
+
+    /** Reads of one branch: {@code reads}, or a draw from the distribution. */
+    public int drawReads() {
+        return opsMean > 0 ? drawOps() : reads;
+    }
+
+    /** Writes of one branch: {@code writes}, or a draw from the distribution. */
+    public int drawWrites() {
+        return opsMean > 0 ? drawOps() : writes;
+    }
+
+    /** round(N(opsMean, opsSd)), drawn again until it is in [0, opsMax] (a truncated normal). */
+    private int drawOps() {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        while (true) {
+            long v = Math.round(random.nextGaussian(opsMean, opsSd));
+            if (v >= 0 && v <= opsMax) {
+                return (int) v;
+            }
+        }
+    }
+
+    /** One think time in ns: N(thinkMeanUs, thinkSdUs) truncated at 0; 0 when off. */
+    public long drawThinkNanos() {
+        if (thinkMeanUs <= 0) {
+            return 0;
+        }
+        return Math.max(0, Math.round(ThreadLocalRandom.current().nextGaussian(thinkMeanUs, thinkSdUs) * 1000));
+    }
+
+    /** The most reads (writes) a branch can have. */
+    private int maxReads() {
+        return opsMean > 0 ? opsMax : reads;
+    }
+
+    private int maxWrites() {
+        return opsMean > 0 ? opsMax : writes;
     }
 
     /** Keys per table in the hot range. */
@@ -66,8 +115,10 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         require(!warmup.isNegative(), "--warmup-s must be >= 0");
         require(txnTimeout.toMillis() >= 1 && txnTimeout.toMillis() <= Integer.MAX_VALUE,
                 "--txn-timeout-ms must be in [1, 2^31)");
-        long hotPerBranch = (long) Math.ceil(reads * skewness) + (long) Math.ceil(writes * skewness);
-        long coldPerBranch = (long) reads + writes - hotPerBranch;
+        require(opsMean <= 0 || (opsSd > 0 && opsMax >= 1), "--ops-sd must be > 0 and --ops-max >= 1");
+        require(thinkMeanUs <= 0 || thinkSdUs >= 0, "--think-sd-us must be >= 0");
+        long hotPerBranch = (long) Math.ceil(maxReads() * skewness) + (long) Math.ceil(maxWrites() * skewness);
+        long coldPerBranch = (long) maxReads() + maxWrites() - hotPerBranch;
         require(hotPerBranch * branches <= hotRangeSize(), "requested hot keys exceed the hot range");
         require(coldPerBranch * branches <= tableSize - hotRangeSize(), "requested cold keys exceed the cold range");
         return this;
@@ -97,6 +148,11 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         Duration txnTimeout = c.txnTimeout;
         boolean parallelBranches = c.parallelBranches;
         boolean sonata = c.sonata;
+        double opsMean = c.opsMean;
+        double opsSd = c.opsSd;
+        int opsMax = c.opsMax;
+        double thinkMeanUs = c.thinkMeanUs;
+        double thinkSdUs = c.thinkSdUs;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -124,11 +180,17 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--txn-timeout-ms" -> txnTimeout = Duration.ofMillis(Long.parseLong(v));
                 case "--parallel-branches" -> parallelBranches = Boolean.parseBoolean(v);
                 case "--sonata" -> sonata = Boolean.parseBoolean(v);
+                case "--ops-mean" -> opsMean = Double.parseDouble(v);
+                case "--ops-sd" -> opsSd = Double.parseDouble(v);
+                case "--ops-max" -> opsMax = Integer.parseInt(v);
+                case "--think-mean-us" -> thinkMeanUs = Double.parseDouble(v);
+                case "--think-sd-us" -> thinkSdUs = Double.parseDouble(v);
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
-                measure, txnTimeout, parallelBranches, sonata).validate();
+                measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs)
+                .validate();
     }
 
     private static Duration seconds(String v) {

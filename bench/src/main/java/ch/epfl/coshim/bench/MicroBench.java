@@ -10,6 +10,8 @@ import java.sql.SQLTransactionRollbackException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +26,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.LockSupport;
 import javax.transaction.xa.XAException;
 import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.core.context.RootContext;
@@ -96,6 +99,9 @@ public final class MicroBench implements AutoCloseable {
     });
     private final LongAdder committedTotal = new LongAdder();
     private final LongAdder unknownTotal = new LongAdder();
+    /** Writes of the committed (unknown) txns, whole run: what the audit expects to find. */
+    private final LongAdder committedWrites = new LongAdder();
+    private final LongAdder unknownWrites = new LongAdder();
     private final AtomicBoolean stop = new AtomicBoolean();
     /** Failed branches in the measurement window, by cause. */
     private final Map<String, LongAdder> branchFailures = new ConcurrentHashMap<>();
@@ -183,7 +189,9 @@ public final class MicroBench implements AutoCloseable {
         long timedOut = 0;
         long unknown = 0;
         List<Long> latencies = new ArrayList<>();
+        List<BenchResult.Txn> txns = new ArrayList<>();
         for (Worker w : workers) {
+            txns.addAll(w.txns);
             committed += w.committed;
             aborted += w.aborted;
             timedOut += w.timedOut;
@@ -196,15 +204,14 @@ public final class MicroBench implements AutoCloseable {
         long expectedMax = -1;
         long actual = -1;
         if (config.rmw() && stuck == 0 && warning == null) {
-            long perTxn = (long) config.branches() * config.writes();
-            expectedMin = committedTotal.sum() * perTxn;
-            expectedMax = (committedTotal.sum() + unknownTotal.sum()) * perTxn;
+            expectedMin = committedWrites.sum();
+            expectedMax = committedWrites.sum() + unknownWrites.sum();
             actual = storedSum(expectedMin);
         }
         Map<String, Long> failures = new TreeMap<>();
         branchFailures.forEach((cause, n) -> failures.put(cause, n.sum()));
         return new BenchResult(config, committed, aborted, timedOut, unknown, latencies, expectedMin, expectedMax,
-                actual, failures, warning);
+                actual, failures, txns, warning);
     }
 
     /**
@@ -258,8 +265,14 @@ public final class MicroBench implements AutoCloseable {
         Set<Integer> used = new HashSet<>();
         List<Branch> plan = new ArrayList<>();
         for (int b = 0; b < config.branches(); b++) {
-            List<Integer> reads = workingSet(config, config.reads(), used);
-            List<Integer> writes = workingSet(config, config.writes(), used);
+            int r;
+            int w;
+            do {
+                r = config.drawReads();
+                w = config.drawWrites();
+            } while (r + w == 0);
+            List<Integer> reads = workingSet(config, r, used);
+            List<Integer> writes = workingSet(config, w, used);
             plan.add(new Branch(random.nextInt(shims), table(b), reads, writes));
         }
         return plan;
@@ -285,8 +298,12 @@ public final class MicroBench implements AutoCloseable {
         return keys;
     }
 
-    /** One global transaction attempt: TM begin, phase 1 of every branch, TM commit or rollback. */
-    Attempt attempt(List<Branch> plan) {
+    /**
+     * One global transaction attempt: TM begin, phase 1 of every branch, TM commit or rollback.
+     *
+     * @param causes receives the cause of every branch that failed
+     */
+    Attempt attempt(List<Branch> plan, Collection<String> causes) {
         GlobalTransaction tx = GlobalTransactionContext.createNew();
         try {
             tx.begin((int) config.txnTimeout().toMillis(), "micro");
@@ -294,7 +311,8 @@ public final class MicroBench implements AutoCloseable {
             throw new IllegalStateException("TC at " + config.tc() + ": begin failed", e);
         }
         try {
-            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan) : phaseOneInOrder(tx, plan);
+            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan, causes)
+                    : phaseOneInOrder(tx, plan, causes);
             if (!allYes) {
                 return rollback(tx);
             }
@@ -332,9 +350,9 @@ public final class MicroBench implements AutoCloseable {
         return isTimeout(tx.getLocalStatus()) ? Attempt.TIMED_OUT : Attempt.ABORTED;
     }
 
-    private boolean phaseOneInOrder(GlobalTransaction tx, List<Branch> plan) {
+    private boolean phaseOneInOrder(GlobalTransaction tx, List<Branch> plan, Collection<String> causes) {
         for (Branch b : plan) {
-            if (!runBranch(tx.getXid(), b, false)) {
+            if (!runBranch(tx.getXid(), b, false, causes)) {
                 return false;
             }
         }
@@ -346,10 +364,11 @@ public final class MicroBench implements AutoCloseable {
      * outlives its attempt; the caller then rolls back if any branch failed, which the TC turns into
      * an abort on every shim (including one where a sibling still waits in prepare: it votes NO).
      */
-    private boolean phaseOneInParallel(GlobalTransaction tx, List<Branch> plan) {
+    private boolean phaseOneInParallel(GlobalTransaction tx, List<Branch> plan, Collection<String> causes) {
         ExecutorCompletionService<Boolean> done = new ExecutorCompletionService<>(branchPool);
+        Collection<String> shared = Collections.synchronizedCollection(causes);
         for (Branch b : plan) {
-            done.submit(() -> runBranch(tx.getXid(), b, true));
+            done.submit(() -> runBranch(tx.getXid(), b, true, shared));
         }
         boolean allYes = true;
         RuntimeException error = null;
@@ -374,13 +393,15 @@ public final class MicroBench implements AutoCloseable {
 
     /**
      * Phase 1 of one branch over an XA connection to its participant: register + start, the
-     * reads/writes, end + prepare (with Sonata, its dummy write comes right before prepare).
+     * reads/writes, end + prepare (with Sonata, its dummy write comes right before prepare). With
+     * {@code thinkMeanUs}, the application pauses before every operation but the first and before
+     * the prepare, holding its locks meanwhile.
      *
      * @param bindXid true when running on a pool thread, which must join the global transaction
      * @return true iff the branch voted YES; false if the participant aborted it, voted NO, or the
      *     TC refused the branch (e.g. the txn already timed out)
      */
-    private boolean runBranch(String xid, Branch b, boolean bindXid) {
+    private boolean runBranch(String xid, Branch b, boolean bindXid, Collection<String> causes) {
         if (bindXid) {
             RootContext.bind(xid);
         }
@@ -388,18 +409,22 @@ public final class MicroBench implements AutoCloseable {
         try (Connection c = p.dataSource().getConnection()) {
             c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
             try {
+                boolean first = true;
                 for (int k : b.readKeys()) {
+                    first = think(first);
                     p.get(c, b.table(), k);
                 }
                 for (int k : b.writeKeys()) {
+                    first = think(first);
                     long value = config.rmw() ? p.get(c, b.table(), k) + 1
                             : ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
                     p.put(c, b.table(), k, value);
                 }
+                think(false);
                 c.commit();   // xa end + xa prepare: the participant votes
                 return true;
             } catch (SQLException e) {
-                countFailure(e);
+                countFailure(e, causes);
                 try {
                     c.rollback();
                 } catch (SQLException ignored) {
@@ -408,7 +433,7 @@ public final class MicroBench implements AutoCloseable {
                 return false;
             }
         } catch (SQLException e) {
-            countFailure(e);
+            countFailure(e, causes);
             return false;   // the branch could not be registered, started or prepared
         } finally {
             if (bindXid) {
@@ -417,10 +442,21 @@ public final class MicroBench implements AutoCloseable {
         }
     }
 
-    private void countFailure(SQLException e) {
+    /** Pauses for one think time unless {@code first}; returns false (the next op is not the first). */
+    private boolean think(boolean first) {
+        long nanos = first ? 0 : config.drawThinkNanos();
+        if (nanos > 0) {
+            LockSupport.parkNanos(nanos);
+        }
+        return false;
+    }
+
+    private void countFailure(SQLException e, Collection<String> causes) {
+        String cause = failureCause(e);
+        causes.add(cause);
         long now = System.nanoTime();
         if (now >= measureStart && now < measureEnd) {
-            branchFailures.computeIfAbsent(failureCause(e), c -> new LongAdder()).increment();
+            branchFailures.computeIfAbsent(cause, c -> new LongAdder()).increment();
         }
     }
 
@@ -479,6 +515,8 @@ public final class MicroBench implements AutoCloseable {
         long timedOut;
         long unknown;
         final List<Long> latenciesUs = new ArrayList<>();
+        /** Every txn (plan) that ended in the window, retries included. */
+        final List<BenchResult.Txn> txns = new ArrayList<>();
         volatile Throwable error;
 
         Worker(long measureStart, long measureEnd) {
@@ -489,11 +527,18 @@ public final class MicroBench implements AutoCloseable {
         @Override
         public void run() {
             List<Branch> plan = nextPlan();
+            int attempts = 0;
+            long planStart = 0;
+            List<String> causes = new ArrayList<>();
             while (!stop.get() && System.nanoTime() < measureEnd) {
                 long t0 = System.nanoTime();
+                if (attempts++ == 0) {
+                    planStart = t0;
+                }
+                int causesBefore = causes.size();
                 Attempt result;
                 try {
-                    result = attempt(plan);
+                    result = attempt(plan, causes);
                 } catch (RuntimeException e) {
                     error = e;
                     stop.set(true);
@@ -501,25 +546,45 @@ public final class MicroBench implements AutoCloseable {
                 }
                 long t1 = System.nanoTime();
                 boolean measured = t1 >= measureStart && t1 < measureEnd;
+                if (result != Attempt.COMMITTED && causes.size() == causesBefore) {
+                    causes.add(result == Attempt.TIMED_OUT ? "tc_timeout" : result.name().toLowerCase());
+                }
                 switch (result) {
                     case COMMITTED -> {
                         committedTotal.increment();
+                        committedWrites.add(writes(plan));
                         if (measured) {
                             committed++;
                             latenciesUs.add((t1 - t0) / 1000);
                         }
-                        plan = nextPlan();
                     }
                     case ABORTED -> aborted += measured ? 1 : 0;
                     case TIMED_OUT -> timedOut += measured ? 1 : 0;
                     case UNKNOWN -> {
                         // may or may not have committed: never retry it, and widen the audit's range
                         unknownTotal.increment();
+                        unknownWrites.add(writes(plan));
                         unknown += measured ? 1 : 0;
-                        plan = nextPlan();
                     }
                 }
+                if (result == Attempt.COMMITTED || result == Attempt.UNKNOWN) {
+                    if (measured) {
+                        txns.add(BenchResult.Txn.of(plan, attempts, result.name(), causes, (t1 - planStart) / 1000));
+                    }
+                    plan = nextPlan();
+                    attempts = 0;
+                    causes = new ArrayList<>();
+                }
             }
+            if (attempts > 0 && planStart < measureEnd) {
+                // still retrying when the window closed: the txns that never commit must count too
+                txns.add(BenchResult.Txn.of(plan, attempts, "UNFINISHED", causes,
+                        (System.nanoTime() - planStart) / 1000));
+            }
+        }
+
+        private static long writes(List<Branch> plan) {
+            return plan.stream().mapToLong(b -> b.writeKeys().size()).sum();
         }
     }
 
@@ -570,6 +635,12 @@ public final class MicroBench implements AutoCloseable {
         Path file = Path.of(csv).toAbsolutePath();
         appendCsv(file, result.csvRow(label == null ? "" : label));
         System.out.println("  results appended to " + file);
+        // txns-<name>, not <name>-txns: the scripts glob skew-*.csv for the runs
+        Path txnFile = file.resolveSibling("txns-" + file.getFileName());
+        for (String row : result.txnRows(label == null ? "" : label)) {
+            appendCsv(txnFile, row, BenchResult.txnCsvHeader());
+        }
+        System.out.println("  per-txn rows appended to " + txnFile);
         System.exit(result.ok() ? 0 : 1);
     }
 
@@ -583,11 +654,15 @@ public final class MicroBench implements AutoCloseable {
     }
 
     private static void appendCsv(Path file, String row) throws IOException {
+        appendCsv(file, row, BenchResult.csvHeader());
+    }
+
+    private static void appendCsv(Path file, String row, String header) throws IOException {
         if (file.getParent() != null) {
             Files.createDirectories(file.getParent());
         }
         if (!Files.exists(file)) {
-            Files.writeString(file, BenchResult.csvHeader() + System.lineSeparator());
+            Files.writeString(file, header + System.lineSeparator());
         }
         Files.writeString(file, row + System.lineSeparator(), StandardOpenOption.APPEND);
     }

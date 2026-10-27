@@ -201,7 +201,7 @@ its shim (`setAutoCommit(false)` registers and starts the branch, the gets/puts 
 the same plan, as Acta does). On timeout the TC itself rolls the branches back on the shims. The
 variant (speculative or not) and the lock timeout are options of the nodes, not of the benchmark.
 With `--rmw true` (default) every write is `get + 1` and the run ends with an audit, read back
-through the shims (sum of all values = committed txns × branches × writes).
+through the shims (sum of all values = writes of the committed txns).
 
 **Start a TC** once (stock Apache Seata 2.6.0; the download steps are in `../acta-server`'s README,
 which keeps it in `runtime/seata`), with a small heap and an existing log directory:
@@ -234,10 +234,24 @@ other's commit in `prepare` on different shims; the shim has no timeout there, o
 `--txn-timeout-ms` breaks such a cycle (column `timed_out`).
 
 Options: `--variant --shims --tc --threads --table-size --branches --reads --writes --skew --rmw
---warmup-s --measure-s --txn-timeout-ms --parallel-branches`; script environment: `SHIMS`,
+--warmup-s --measure-s --txn-timeout-ms --parallel-branches --ops-mean --ops-sd --ops-max --think-mean-us
+--think-sd-us`; script environment: `SHIMS`,
 `NODE_PORT`, `LOCK_TIMEOUT_MS`, `VARIANTS`, `CSV`. Every run is appended to
 `bench-results/<timestamp>.csv`, with the nodes' logs (final commit/abort counters per cause) next
 to it; the script prints a comparison table and exits 1 if a run warned or failed its audit.
+
+A more realistic workload: `--ops-mean 3` draws each branch's reads and writes from a normal
+distribution (sd `--ops-sd`, default 1.5) truncated to [0, `--ops-max`] (default 10), and
+`--think-mean-us 2000 --think-sd-us 1000` pauses the application for N(2 ms, 1 ms) before every
+operation but the first and before each prepare (a network hop plus work between requests), so
+locks are held longer and every retry pays the pauses again. Each run also writes
+`txns-<csv name>`, one row per transaction (attempts, reads, writes, failure causes, latency
+including retries), and the summary shows retries by transaction size. The nodes print a
+`speculation` line next to `stats`: share of commits that speculated, estimated lock wait saved
+(each speculative lock grant replayed as if it had waited for the txns ahead to resolve), the
+depth/saved correlation, prepare waits, a `depth=d:commits/aborts/mean saved µs` histogram (d =
+most nodes with uncommitted holders ahead of a lock grant) and the cascade fan-out.
+
 `MicroBenchTest` runs both variants and both branch modes briefly through a TC and an in-JVM shim
 node; those runs are skipped when no TC is reachable (`-Dbench.tc=host:port`, default
 127.0.0.1:8091).
