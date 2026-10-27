@@ -17,9 +17,10 @@
 # above it.
 #
 # Workload: MicroBench's defaults (10000 keys per table, 2 branches in order, rmw writes, each branch's
-# reads and writes in a random order) with --ops-mean 3 and no think time: with a pause between
-# operations, the few ms speculation saves are lost in the think time and the comparison says
-# nothing. Extra options are passed on.
+# reads and writes in a random order) with --ops-mean 3 --think-mean-us 2000 --think-sd-us 1000.
+# Keep the think time: without it the servers saturate, txns queue for the CPU rather than for locks,
+# and speculation has nothing to overlap (50 threads, skew 0.9: +1-2 % tps without, +10-11 % with).
+# Extra options are passed on and override these.
 #
 # Output, in DIR = bench-results/final-<timestamp>/:
 #   t<T>-skew<S>.csv, txns-t<T>-skew<S>.csv, t<T>-skew<S>-nodes/   the runs, their txns, node logs
@@ -31,10 +32,10 @@
 #                             of the wait it moved into prepare), the work lost to cascade aborts, and
 #                             net saved = net - lost
 #
-# Defaults: threads 20 50 100 200, skews 0.8 0.9 0.95, 3 reps of 10 s warm-up + 30 s measured, 2
-# participants, 6 variants (wait-die starves retried txns, which get a fresh age: add the @wait-die
-# variants back through VARIANTS): about 4 h.
-# Env: THREADS_LIST ("20 50 100 200"), SKEWS ("0.8 0.9 0.95"), REPS (3), WARMUP_S (10), MEASURE_S (30),
+# Defaults: threads 20 50 100 200, skews 0.8 0.9 0.95 0.99, 3 reps of 10 s warm-up + 30 s measured,
+# 2 participants, 6 variants (wait-die starves retried txns, which get a fresh age: add the
+# @wait-die variants back through VARIANTS): 288 runs, about 7 h.
+# Env: THREADS_LIST ("20 50 100 200"), SKEWS ("0.8 0.9 0.95 0.99"), REPS (3), WARMUP_S (10), MEASURE_S (30),
 #      LOCK_TIMEOUT_MS (30000), TXN_TIMEOUT_MS (60000), VARIANTS (below), OUT, KEEP_DBS (1: leave the
 #      servers running), REUSE_DBS (1: use servers already running, whatever their lock timeouts),
 #      and bench-compare.sh's SHIMS, NODE_PORT, ...
@@ -162,7 +163,7 @@ for arg in "$@"; do
 done
 
 threads_list="${THREADS_LIST:-20 50 100 200}"
-skews="${SKEWS:-0.8 0.9 0.95}"
+skews="${SKEWS:-0.8 0.9 0.95 0.99}"
 reps="${REPS:-3}"
 lock_timeout="${LOCK_TIMEOUT_MS:-30000}"
 txn_timeout="${TXN_TIMEOUT_MS:-60000}"
@@ -208,7 +209,7 @@ for kind in "${kinds[@]}"; do
     fi
 done
 
-workload=(--ops-mean 3)
+workload=(--ops-mean 3 --think-mean-us 2000 --think-sd-us 1000)
 if [[ ! -f "$out/setup.txt" ]]; then
     {
         echo "date:      $(date '+%Y-%m-%d %H:%M')   commit: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo '?')"

@@ -333,9 +333,11 @@ only applies to MySQL/PG data sources.
 ### Final micro benchmark
 
 `scripts/bench-final.sh` runs every combination of threads (20, 50, 100, 200) and skew (0.8, 0.9,
-0.95) for the speculative and the non-speculative shim (wound-wait) and Sonata, on MySQL and
-PostgreSQL, 3 reps each. The workload is `--ops-mean 3` with **no think time**: a pause between
-operations would drown the few ms speculation saves. A branch runs its reads and writes in a random
+0.95, 0.99) for the speculative and the non-speculative shim (wound-wait) and Sonata, on MySQL and
+PostgreSQL, 3 reps each (288 runs, about 7 h). The workload is `--ops-mean 3 --think-mean-us 2000
+--think-sd-us 1000`. Keep the think time: without it the servers saturate, txns queue for the CPU
+rather than for locks, and speculation has nothing to overlap (50 threads, skew 0.9: speculation
++1-2 % tps without think time, +10-11 % with it). A branch runs its reads and writes in a random
 order (always, in `MicroBench`), so hot accesses are not all at the end of a branch. Wait-die is left
 out by default: a retried txn gets a fresh age, so it starves (add `<variant>@wait-die` through
 `VARIANTS`; `bench-compare.sh` understands the `@wait-die` / `@wound-wait` suffix).
