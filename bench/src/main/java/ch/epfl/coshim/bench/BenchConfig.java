@@ -42,16 +42,18 @@ import java.util.concurrent.ThreadLocalRandom;
  *                         0) before every operation of a branch but the first and before its commit,
  *                         standing for the network hop and the work between two requests; 0: no pause
  * @param thinkSdUs        standard deviation of that pause (µs)
+ * @param sampleMs         > 0: every that many ms, the commits and aborts of the whole run (warm-up and drain
+ *                         included) are sampled into {@code timeseries-<csv name>}; 0: no samples
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
         boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
-        double thinkSdUs) {
+        double thinkSdUs, int sampleMs) {
 
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000);
+                false, false, 0, 1.5, 10, 0, 1000, 1000);
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -117,6 +119,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 "--txn-timeout-ms must be in [1, 2^31)");
         require(opsMean <= 0 || (opsSd > 0 && opsMax >= 1), "--ops-sd must be > 0 and --ops-max >= 1");
         require(thinkMeanUs <= 0 || thinkSdUs >= 0, "--think-sd-us must be >= 0");
+        require(sampleMs >= 0, "--sample-ms must be >= 0");
         long hotPerBranch = (long) Math.ceil(maxReads() * skewness) + (long) Math.ceil(maxWrites() * skewness);
         long coldPerBranch = (long) maxReads() + maxWrites() - hotPerBranch;
         require(hotPerBranch * branches <= hotRangeSize(), "requested hot keys exceed the hot range");
@@ -153,6 +156,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         int opsMax = c.opsMax;
         double thinkMeanUs = c.thinkMeanUs;
         double thinkSdUs = c.thinkSdUs;
+        int sampleMs = c.sampleMs;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -185,11 +189,12 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--ops-max" -> opsMax = Integer.parseInt(v);
                 case "--think-mean-us" -> thinkMeanUs = Double.parseDouble(v);
                 case "--think-sd-us" -> thinkSdUs = Double.parseDouble(v);
+                case "--sample-ms" -> sampleMs = Integer.parseInt(v);
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
-                measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs)
+                measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs)
                 .validate();
     }
 

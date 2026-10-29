@@ -14,6 +14,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -108,6 +109,16 @@ public final class MicroBench implements AutoCloseable {
     });
     private final LongAdder committedTotal = new LongAdder();
     private final LongAdder unknownTotal = new LongAdder();
+    /** Attempts rolled back (aborted or timed out by the TC), warm-up included: for the samples. */
+    private final LongAdder abortedTotal = new LongAdder();
+    /** Throughput over time ({@code --sample-ms}), filled by {@link #run}. */
+    private final List<Sample> samples = Collections.synchronizedList(new ArrayList<>());
+
+    /**
+     * One sample of the whole run: at {@code atMs} since the start, the commits and rolled-back attempts
+     * since the previous sample, over {@code intervalMs}.
+     */
+    record Sample(long atMs, String phase, long intervalMs, long commits, long aborts) {}
     /** Writes of the committed (unknown) txns, whole run: what the audit expects to find. */
     private final LongAdder committedWrites = new LongAdder();
     private final LongAdder unknownWrites = new LongAdder();
@@ -140,6 +151,63 @@ public final class MicroBench implements AutoCloseable {
         }
     }
 
+    /**
+     * Samples the commits and the rolled-back attempts every {@code sampleMs} until interrupted (when the
+     * workers are done), then once more for the last partial interval.
+     */
+    private Thread startSampler(long start) {
+        Thread t = new Thread(() -> {
+            long prevAt = start;
+            long prevCommits = 0;
+            long prevAborts = 0;
+            long next = start;
+            boolean last = false;
+            while (!last) {
+                next += TimeUnit.MILLISECONDS.toNanos(config.sampleMs());
+                long sleep = next - System.nanoTime();
+                if (sleep > 0) {
+                    try {
+                        TimeUnit.NANOSECONDS.sleep(sleep);
+                    } catch (InterruptedException e) {
+                        last = true;
+                    }
+                }
+                long now = System.nanoTime();
+                long commits = committedTotal.sum();
+                long aborts = abortedTotal.sum();
+                String phase = now <= measureStart ? "warmup" : now <= measureEnd ? "measure" : "drain";
+                samples.add(new Sample(TimeUnit.NANOSECONDS.toMillis(now - start), phase,
+                        TimeUnit.NANOSECONDS.toMillis(now - prevAt), commits - prevCommits, aborts - prevAborts));
+                prevAt = now;
+                prevCommits = commits;
+                prevAborts = aborts;
+            }
+        }, "bench-sampler");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    List<Sample> samples() {
+        synchronized (samples) {
+            return List.copyOf(samples);
+        }
+    }
+
+    static String sampleCsvHeader() {
+        return "label,variant,threads,skew,t_s,phase,interval_ms,commits,aborts,tps,abort_rate";
+    }
+
+    /** One row per sample, for {@code timeseries-<csv name>}. */
+    static List<String> sampleRows(BenchConfig config, String label, List<Sample> samples) {
+        return samples.stream().map(s -> String.join(",", label, config.variant(), String.valueOf(config.threads()),
+                String.valueOf(config.skewness()), String.format(Locale.ROOT, "%.3f", s.atMs() / 1000.0), s.phase(),
+                String.valueOf(s.intervalMs()), String.valueOf(s.commits()), String.valueOf(s.aborts()),
+                String.format(Locale.ROOT, "%.1f", s.intervalMs() == 0 ? 0 : s.commits() * 1000.0 / s.intervalMs()),
+                String.format(Locale.ROOT, "%.4f", s.commits() + s.aborts() == 0 ? 0
+                        : (double) s.aborts() / (s.commits() + s.aborts())))).toList();
+    }
+
     /** Seata's TM and RM clients are per JVM: connect them once, to one TC. */
     static synchronized void initSeata(String tc) {
         if (seataTc != null) {
@@ -161,6 +229,7 @@ public final class MicroBench implements AutoCloseable {
         this.measureStart = measureStart;
         this.measureEnd = measureEnd;
 
+        Thread sampler = config.sampleMs() > 0 ? startSampler(start) : null;
         List<Worker> workers = new ArrayList<>();
         List<Thread> threads = new ArrayList<>();
         for (int i = 0; i < config.threads(); i++) {
@@ -175,6 +244,10 @@ public final class MicroBench implements AutoCloseable {
         long drainDeadline = measureEnd + config.txnTimeout().toNanos() + TimeUnit.SECONDS.toNanos(10);
         for (Thread t : threads) {
             t.join(Math.max(1, TimeUnit.NANOSECONDS.toMillis(drainDeadline - System.nanoTime())));
+        }
+        if (sampler != null) {
+            sampler.interrupt();
+            sampler.join(1000);
         }
         String warning = null;
         long stuck = threads.stream().filter(Thread::isAlive).count();
@@ -593,8 +666,14 @@ public final class MicroBench implements AutoCloseable {
                             latenciesUs.add((t1 - t0) / 1000);
                         }
                     }
-                    case ABORTED -> aborted += measured ? 1 : 0;
-                    case TIMED_OUT -> timedOut += measured ? 1 : 0;
+                    case ABORTED -> {
+                        abortedTotal.increment();
+                        aborted += measured ? 1 : 0;
+                    }
+                    case TIMED_OUT -> {
+                        abortedTotal.increment();
+                        timedOut += measured ? 1 : 0;
+                    }
                     case UNKNOWN -> {
                         // may or may not have committed: never retry it, and widen the audit's range
                         unknownTotal.increment();
@@ -665,8 +744,10 @@ public final class MicroBench implements AutoCloseable {
         String label = option(args, "--label");
 
         BenchResult result;
+        List<Sample> samples;
         try (MicroBench bench = new MicroBench(config, token)) {
             result = bench.run();
+            samples = bench.samples();
         }
         System.out.println(result.summary());
         Path file = Path.of(csv).toAbsolutePath();
@@ -678,6 +759,13 @@ public final class MicroBench implements AutoCloseable {
             appendCsv(txnFile, row, BenchResult.txnCsvHeader());
         }
         System.out.println("  per-txn rows appended to " + txnFile);
+        if (!samples.isEmpty()) {
+            Path sampleFile = file.resolveSibling("timeseries-" + file.getFileName());
+            for (String row : sampleRows(config, label == null ? "" : label, samples)) {
+                appendCsv(sampleFile, row, sampleCsvHeader());
+            }
+            System.out.println("  throughput samples appended to " + sampleFile);
+        }
         System.exit(result.ok() ? 0 : 1);
     }
 
