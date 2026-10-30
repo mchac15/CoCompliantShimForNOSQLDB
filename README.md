@@ -330,6 +330,42 @@ Sonata's switch is read once per JVM, so a run is all-Sonata or not. A mixed glo
 (a shim branch and a MySQL branch in the same `--shims`) works with `--sonata true`, since the hook
 only applies to MySQL/PG data sources.
 
+### Final micro benchmark
+
+`scripts/bench-final.sh` runs every combination of threads (20, 50, 100, 200) and skew (0.8, 0.9,
+0.95, 0.99) for the speculative and the non-speculative shim (wound-wait) and Sonata, on MySQL and
+PostgreSQL, 3 reps each (288 runs, about 7 h). The workload is `--ops-mean 3 --think-mean-us 2000
+--think-sd-us 1000`. Keep the think time: without it the servers saturate, txns queue for the CPU
+rather than for locks, and speculation has nothing to overlap (50 threads, skew 0.9: speculation
++1-2 % tps without think time, +10-11 % with it). A branch runs its reads and writes in a random
+order (always, in `MicroBench`), so hot accesses are not all at the end of a branch. Wait-die is left
+out by default: a retried txn gets a fresh age, so it starves (add `<variant>@wait-die` through
+`VARIANTS`; `bench-compare.sh` understands the `@wait-die` / `@wound-wait` suffix).
+
+Timeouts only break cross-database deadlocks (local ones are prevented or detected), so every lock
+wait is 30 s (shim nodes and servers) and the TC's global timeout 60 s. About 4 h; rerun with
+`OUT=<dir>` to resume. `summary.md` / `summary.csv` report throughput, per-op and per-txn latency
+p50 / p99 (a committed txn's whole execution, retries included, minus any think time) and retries
+per txn p50 / p99, and, from the shim nodes' `speculation` log lines, per branch commit:
+
+- **saved**: the lock wait speculation avoided (each speculative grant replayed as if it had waited
+  for its predecessors to resolve);
+- **net**: minus the wait it moved into `prepare()` (a speculative txn still waits there for its
+  predecessors to commit, so only the overlap with its own remaining work is saved);
+- **lost**: the work of the txns a cascade aborted (creation to abort);
+- **net saved** = net - lost.
+
+`scripts/bench-final-plot.py DIR` draws `DIR/final.png` from `summary.csv`: per server kind and
+skew, throughput, per-op latency p50 / p99, retries p50 / p99 and net saved against the thread count.
+
+```bash
+scripts/bench-final.sh                                         # the full sweep
+THREADS_LIST="20" SKEWS="0.9" REPS=1 scripts/bench-final.sh    # a quick check
+scripts/bench-final.sh --summarize bench-results/final-<ts>
+python -m venv .venv && .venv/bin/pip install matplotlib
+.venv/bin/python scripts/bench-final-plot.py bench-results/final-<ts>
+```
+
 ## Next steps
 
 - Add a real key-value backend behind `KvStore`.

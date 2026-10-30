@@ -13,6 +13,8 @@
 #   nonspeculative-mysql, ...          its database sI in SQL database sI on server I of the Sonata
 #                                      variants (same servers, same settings, same tables and keys,
 #                                      same statements; see SqlKvStore), refilled at node start
+#   <shim variant>@wait-die,           a shim variant with that deadlock policy instead of DEADLOCK's
+#   <shim variant>@wound-wait          (e.g. speculative-pg@wound-wait); the label keeps the suffix
 #   sonata-mysql, sonata-pg            Sonata: SHIMS MySQL / PostgreSQL servers (scripts/bench-dbs.sh:
 #                                      Acta's settings, fsync off) behind Seata's stock XA proxy, with
 #                                      sonata.enableGlobalSerializability (Sonata's other settings at
@@ -27,7 +29,8 @@
 # Examples: scripts/bench-compare.sh --reps 3 --skew 0.99 --threads 100
 #           SHIMS=4 scripts/bench-compare.sh --parallel-branches true --txn-timeout-ms 500
 #           VARIANTS="speculative sonata-mysql sonata-pg" scripts/bench-compare.sh
-# Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), DEADLOCK (wait-die | wound-wait, default
+# Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), STATS_INTERVAL_S (0: the nodes log their
+#      counters at shutdown only; N: also every N s), DEADLOCK (wait-die | wound-wait, default
 #      wait-die), VARIANTS ("speculative nonspeculative"),
 #      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o), and
 #      scripts/bench-dbs.sh's MYSQL_PORT, PG_PORT, ...
@@ -103,7 +106,7 @@ trap 'stop_nodes; stop_dbs; rm -f "$cp_file"' EXIT
 
 # kind of SQL server a variant runs on (mysql, postgres), or nothing for the in-memory shim
 db_kind() {
-    case "$1" in
+    case "${1%@*}" in
         *-mysql) echo mysql ;;
         *-pg) echo postgres ;;
     esac
@@ -134,6 +137,11 @@ for rep in $(seq 1 "$reps"); do
                 ;;
         esac
         kind="$(db_kind "$variant")"
+        shim="${variant%@*}"            # speculative-pg@wound-wait -> speculative-pg
+        shim="${shim%-mysql}"
+        shim="${shim%-pg}"              # -> speculative
+        policy="$deadlock"
+        [[ $variant != *@* ]] || policy="${variant#*@}"
         for ((s = 0; s < shims; s++)); do
             port=$((base_port + s))
             store=memory
@@ -144,8 +152,8 @@ for rep in $(seq 1 "$reps"); do
                 [[ $kind == mysql ]] || server="${server/postgresql/pg}"
                 store="${server/jdbc:/jdbc:coshim:}?tables=$tables&entries=$table_size&pool=$sql_pool"
             fi
-            java -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "${variant%-*}" --databases "s$s" \
-                --lock-timeout-ms "$lock_timeout" --deadlock "$deadlock" --stats-interval-s 0 --store "$store" \
+            java -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "$shim" --databases "s$s" \
+                --lock-timeout-ms "$lock_timeout" --deadlock "$policy" --stats-interval-s "${STATS_INTERVAL_S:-0}" --store "$store" \
                 > "$logs/rep$rep-$variant-s$s.log" 2>&1 &
             nodes+=($!)
             until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
@@ -160,7 +168,9 @@ for rep in $(seq 1 "$reps"); do
         java -cp "$cp" ch.epfl.coshim.bench.MicroBench --variant "$variant" --shims "$shim_list" "$@" \
             --csv "$csv" --label "rep$rep" || status=1
         stop_nodes
-        grep -hE '^(stats|speculation)' "$logs"/rep"$rep"-"$variant"-s*.log | sed 's/^/  node /'
+        for log in "$logs"/rep"$rep"-"$variant"-s*.log; do   # the final counters (the last lines)
+            grep -hE '^(stats|speculation)' "$log" | tail -2 | sed 's/^/  node /'
+        done
         echo
     done
 done

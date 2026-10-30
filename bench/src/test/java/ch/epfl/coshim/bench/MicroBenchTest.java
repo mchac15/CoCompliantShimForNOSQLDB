@@ -92,6 +92,58 @@ class MicroBenchTest {
     }
 
     @Test
+    void branchesRunTheirReadsAndWritesInARandomOrder() {
+        // 10 ops at skew 0.9: 9 hot keys and 1 cold one per list
+        BenchConfig c = config("--table-size", "1000", "--reads", "10", "--writes", "10", "--skew", "0.9");
+        boolean writeBeforeRead = false;
+        boolean coldBeforeHot = false;
+        for (int i = 0; i < 1000; i++) {
+            for (MicroBench.Branch b : MicroBench.randomPlan(c, 2)) {
+                List<MicroBench.Op> ops = b.ops();
+                assertEquals(b.readKeys().stream().sorted().toList(),
+                        ops.stream().filter(o -> !o.write()).map(MicroBench.Op::key).sorted().toList());
+                assertEquals(b.writeKeys().stream().sorted().toList(),
+                        ops.stream().filter(MicroBench.Op::write).map(MicroBench.Op::key).sorted().toList());
+                writeBeforeRead |= ops.get(0).write();
+                coldBeforeHot |= ops.get(0).key() >= c.hotRangeSize();
+            }
+        }
+        assertTrue(writeBeforeRead, "writes are not always after the reads");
+        assertTrue(coldBeforeHot, "cold keys are not always after the hot ones");
+    }
+
+    @Test
+    void samplesBecomeThroughputRows() {
+        BenchConfig c = config("--variant", "speculative-pg@wound-wait", "--threads", "50", "--sample-ms", "500");
+        assertEquals(500, c.sampleMs());
+        List<String> rows = MicroBench.sampleRows(c, "rep1", List.of(
+                new MicroBench.Sample(500, "warmup", 500, 100, 25),
+                new MicroBench.Sample(1000, "measure", 500, 0, 0)));
+        assertEquals("rep1,speculative-pg@wound-wait,50,0.9,0.500,warmup,500,100,25,200.0,0.2000", rows.get(0));
+        assertEquals("rep1,speculative-pg@wound-wait,50,0.9,1.000,measure,500,0,0,0.0,0.0000", rows.get(1));
+        assertEquals(MicroBench.sampleCsvHeader().split(",").length, rows.get(0).split(",").length);
+        assertThrows(IllegalArgumentException.class, () -> config("--sample-ms", "-1"));
+    }
+
+    @Test
+    void latencyExcludesThinkTimeAndCountsRetries() {
+        // 4 ops each: two first tries (400 us active each), 3 tries with 1200 us of pauses, one still retrying
+        List<BenchResult.Txn> txns = List.of(
+                new BenchResult.Txn(1, 2, 2, 2, "COMMITTED", List.of(), 800, 400),
+                new BenchResult.Txn(1, 2, 2, 2, "COMMITTED", List.of(), 1000, 600),
+                new BenchResult.Txn(3, 2, 2, 2, "COMMITTED", List.of("shim_abort", "shim_abort"), 2400, 1200),
+                new BenchResult.Txn(5, 2, 2, 2, "UNFINISHED", List.of(), 9000, 1000));
+        BenchResult r = new BenchResult(config(), 2, 2, 0, 0, List.of(500L, 600L), -1, -1, -1, Map.of(), txns, null);
+
+        assertEquals(100, r.opLatencyPercentileUs(50), "(800 - 400) / 4; unfinished txns have no latency");
+        assertEquals(300, r.opLatencyPercentileUs(99), "(2400 - 1200) / 4: the retries' work counts");
+        assertEquals(1200, r.activeLatencyPercentileUs(99));
+        assertEquals(2, r.retriesPercentile(50));
+        assertEquals(4, r.retriesPercentile(99), "a txn still retrying counts with its retries so far");
+        assertEquals(BenchResult.csvHeader().split(",").length, r.csvRow("x").split(",").length);
+    }
+
+    @Test
     void parseRejectsImpossibleWorkloads() {
         assertThrows(IllegalArgumentException.class, () -> config("--table-size", "10", "--skew", "0.9"));
         assertThrows(IllegalArgumentException.class, () -> config("--shims", "localhost:7000"));

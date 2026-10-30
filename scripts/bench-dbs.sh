@@ -17,7 +17,8 @@
 # per server); set them back with the variables below on a large machine.
 #
 # Env: MYSQL_PORT (3306), PG_PORT (5432), MYSQL_IMAGE (mysql:8.4), POSTGRES_IMAGE (postgres:16),
-#      MYSQL_BUFFER_POOL (2G), PG_SHARED_BUFFERS (2GB), PG_SHM_SIZE (4g).
+#      MYSQL_BUFFER_POOL (2G), PG_SHARED_BUFFERS (2GB), PG_SHM_SIZE (4g),
+#      MYSQL_LOCK_WAIT_TIMEOUT_S (60), PG_LOCK_TIMEOUT (60s): how long a lock wait lasts on the servers.
 set -euo pipefail
 
 cmd="${1:-}"
@@ -63,7 +64,7 @@ start_mysql() {
         "${MYSQL_IMAGE:-mysql:8.4}" \
         --bind-address=127.0.0.1 --port="$port" --mysqlx=OFF \
         --max-connections=6000 \
-        --innodb-lock-wait-timeout=60 \
+        --innodb-lock-wait-timeout="${MYSQL_LOCK_WAIT_TIMEOUT_S:-60}" \
         --innodb-use-native-aio=OFF \
         --innodb-buffer-pool-size="${MYSQL_BUFFER_POOL:-2G}" \
         --innodb-redo-log-capacity=4G \
@@ -78,7 +79,7 @@ start_postgres() {
         "${POSTGRES_IMAGE:-postgres:16}" \
         postgres -c listen_addresses=127.0.0.1 -p "$port" \
         -c max_connections=6000 \
-        -c lock_timeout=60s \
+        -c lock_timeout="${PG_LOCK_TIMEOUT:-60s}" \
         -c deadlock_timeout=1s \
         -c max_prepared_transactions=1500 \
         -c max_locks_per_transaction=256 \
