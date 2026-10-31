@@ -116,9 +116,10 @@ public final class MicroBench implements AutoCloseable {
 
     /**
      * One sample of the whole run: at {@code atMs} since the start, the commits and rolled-back attempts
-     * since the previous sample, over {@code intervalMs}.
+     * since the previous sample, over {@code intervalMs}; {@code wallMs} is the wall clock, to line it
+     * up with the GC and system logs.
      */
-    record Sample(long atMs, String phase, long intervalMs, long commits, long aborts) {}
+    record Sample(long atMs, String phase, long intervalMs, long commits, long aborts, long wallMs) {}
     /** Writes of the committed (unknown) txns, whole run: what the audit expects to find. */
     private final LongAdder committedWrites = new LongAdder();
     private final LongAdder unknownWrites = new LongAdder();
@@ -177,7 +178,8 @@ public final class MicroBench implements AutoCloseable {
                 long aborts = abortedTotal.sum();
                 String phase = now <= measureStart ? "warmup" : now <= measureEnd ? "measure" : "drain";
                 samples.add(new Sample(TimeUnit.NANOSECONDS.toMillis(now - start), phase,
-                        TimeUnit.NANOSECONDS.toMillis(now - prevAt), commits - prevCommits, aborts - prevAborts));
+                        TimeUnit.NANOSECONDS.toMillis(now - prevAt), commits - prevCommits, aborts - prevAborts,
+                        System.currentTimeMillis()));
                 prevAt = now;
                 prevCommits = commits;
                 prevAborts = aborts;
@@ -195,7 +197,7 @@ public final class MicroBench implements AutoCloseable {
     }
 
     static String sampleCsvHeader() {
-        return "label,variant,threads,skew,t_s,phase,interval_ms,commits,aborts,tps,abort_rate";
+        return "label,variant,threads,skew,t_s,phase,interval_ms,commits,aborts,tps,abort_rate,wall_ms";
     }
 
     /** One row per sample, for {@code timeseries-<csv name>}. */
@@ -205,7 +207,7 @@ public final class MicroBench implements AutoCloseable {
                 String.valueOf(s.intervalMs()), String.valueOf(s.commits()), String.valueOf(s.aborts()),
                 String.format(Locale.ROOT, "%.1f", s.intervalMs() == 0 ? 0 : s.commits() * 1000.0 / s.intervalMs()),
                 String.format(Locale.ROOT, "%.4f", s.commits() + s.aborts() == 0 ? 0
-                        : (double) s.aborts() / (s.commits() + s.aborts())))).toList();
+                        : (double) s.aborts() / (s.commits() + s.aborts())), String.valueOf(s.wallMs()))).toList();
     }
 
     /** Seata's TM and RM clients are per JVM: connect them once, to one TC. */

@@ -51,12 +51,21 @@ public final class ShimStats {
   private final LongAdder savedNetUs = new LongAdder();
   /** Time from creation to abort of the txns aborted by a cascade (work speculation lost), in µs. */
   private final LongAdder cascadeLostUs = new LongAdder();
+  // the time budget of the branches: where a committed one spent its life, what the aborted ones wasted
+  private final LongAdder committedLifetimeUs = new LongAdder();
+  private final LongAdder committedLockWaitUs = new LongAdder();
+  private final LongAdder committedPrepareWaitUs = new LongAdder();
+  private final LongAdder committedPostVoteUs = new LongAdder();
+  private final LongAdder abortedLockWaitUs = new LongAdder();
+  private final LongAdder abortedPrepareWaitUs = new LongAdder();
+  private final Map<AbortCause, LongAdder> lostUs = new EnumMap<>(AbortCause.class);
   /** Running sums of (depth, saved µs) over the commits, for their Pearson correlation. */
   private double n, sx, sy, sxx, syy, sxy;
 
   ShimStats() {
     for (AbortCause cause : AbortCause.values()) {
       aborts.put(cause, new LongAdder());
+      lostUs.put(cause, new LongAdder());
     }
   }
 
@@ -139,6 +148,52 @@ public final class ShimStats {
     return cascadeLostUs.sum();
   }
 
+  /**
+   * The time budget of a committed branch.
+   *
+   * @param lifetimeNanos creation to the end of commit()
+   * @param lockWaitNanos inside lock()/upgrade()
+   * @param prepareWaitNanos inside prepare(), waiting for its predecessors to commit
+   * @param postVoteNanos from the YES vote to the end of commit(): waiting for the global decision
+   */
+  void committedBudget(long lifetimeNanos, long lockWaitNanos, long prepareWaitNanos, long postVoteNanos) {
+    committedLifetimeUs.add(TimeUnit.NANOSECONDS.toMicros(lifetimeNanos));
+    committedLockWaitUs.add(TimeUnit.NANOSECONDS.toMicros(lockWaitNanos));
+    committedPrepareWaitUs.add(TimeUnit.NANOSECONDS.toMicros(prepareWaitNanos));
+    committedPostVoteUs.add(TimeUnit.NANOSECONDS.toMicros(postVoteNanos));
+  }
+
+  /** The time an aborted branch wasted: creation to abort, by the cause of the abort. */
+  void abortedBudget(AbortCause cause, long lifetimeNanos, long lockWaitNanos, long prepareWaitNanos) {
+    lostUs.get(cause).add(TimeUnit.NANOSECONDS.toMicros(lifetimeNanos));
+    abortedLockWaitUs.add(TimeUnit.NANOSECONDS.toMicros(lockWaitNanos));
+    abortedPrepareWaitUs.add(TimeUnit.NANOSECONDS.toMicros(prepareWaitNanos));
+  }
+
+  public long committedLifetimeUs() {
+    return committedLifetimeUs.sum();
+  }
+
+  public long committedLockWaitUs() {
+    return committedLockWaitUs.sum();
+  }
+
+  public long committedPrepareWaitUs() {
+    return committedPrepareWaitUs.sum();
+  }
+
+  public long committedPostVoteUs() {
+    return committedPostVoteUs.sum();
+  }
+
+  public long lostUs(AbortCause cause) {
+    return lostUs.get(cause).sum();
+  }
+
+  public long abortedLockWaitUs() {
+    return abortedLockWaitUs.sum();
+  }
+
   /** Commits whose max dependency depth falls in that bucket. */
   public long commitsAtDepth(int depth) {
     return commitsByDepth[bucket(depth)].sum();
@@ -165,7 +220,9 @@ public final class ShimStats {
    * One line on what speculation did: share of commits that speculated, saved time, prepare waits,
    * and per depth bucket {@code d:commits/aborts/mean saved µs}, cascade fan-out {@code k:aborts};
    * then the totals (µs) the bench sums over nodes: commits, gross and net saved, lost to cascades,
-   * and net saved per commit (net saved minus lost, per commit).
+   * net saved per commit (net saved minus lost, per commit), and the time budget (committed branches:
+   * lifetime, lock wait, prepare wait, post-vote wait; aborted ones: lock and prepare wait, lifetime
+   * by cause).
    */
   public String speculationSummary() {
     long c = commits();
@@ -197,6 +254,14 @@ public final class ShimStats {
     sb.append(String.format(Locale.ROOT,
         "commits=%d saved_us_total=%d saved_net_us_total=%d cascade_lost_us_total=%d net_saved_us_per_commit=%.0f",
         c, saved, savedNetUs.sum(), cascadeLostUs.sum(), c == 0 ? 0 : (double) net / c));
+    sb.append(String.format(Locale.ROOT,
+        " committed_lifetime_us_total=%d committed_lock_wait_us_total=%d committed_prepare_wait_us_total=%d"
+            + " committed_post_vote_us_total=%d aborted_lock_wait_us_total=%d aborted_prepare_wait_us_total=%d",
+        committedLifetimeUs.sum(), committedLockWaitUs.sum(), committedPrepareWaitUs.sum(), committedPostVoteUs.sum(),
+        abortedLockWaitUs.sum(), abortedPrepareWaitUs.sum()));
+    for (AbortCause cause : AbortCause.values()) {
+      sb.append(" lost_").append(cause.name().toLowerCase()).append("_us_total=").append(lostUs(cause));
+    }
     return sb.toString().trim();
   }
 

@@ -153,6 +153,53 @@ class SpeculativeCoShimTest {
     }
 
     @Test
+    void theTimeBudgetSplitsACommittedBranch() throws Exception {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r");
+        shim.get("r", "x");
+        shim.end("r");
+        CompletableFuture<Vote> r = CompletableFuture.supplyAsync(() -> shim.prepare("r"));   // waits for w
+        assertEquals(Vote.YES, shim.prepare("w"));
+        Thread.sleep(50);   // w voted YES, waiting for the global decision
+        shim.commit("w");
+        assertEquals(Vote.YES, r.get(2, TimeUnit.SECONDS));
+        shim.commit("r");
+        assertTrue(shim.stats().committedPostVoteUs() >= 50_000, shim.stats().speculationSummary());
+        assertTrue(shim.stats().committedPrepareWaitUs() >= 40_000, "r's wait: " + shim.stats().speculationSummary());
+        assertTrue(shim.stats().committedLifetimeUs() >= shim.stats().committedPostVoteUs());
+    }
+
+    @Test
+    void theTimeBudgetCountsLockWaitsWithoutSpeculation() throws Exception {
+        s2pl.start("w");
+        s2pl.put("w", "x", "1");
+        s2pl.end("w");
+        s2pl.start("r");
+        CompletableFuture<String> read = CompletableFuture.supplyAsync(() -> s2pl.get("r", "x"));   // blocks on w
+        Thread.sleep(50);
+        assertEquals(Vote.YES, s2pl.prepare("w"));
+        s2pl.commit("w");
+        assertEquals("1", read.get(2, TimeUnit.SECONDS));
+        s2pl.end("r");
+        assertEquals(Vote.YES, s2pl.prepare("r"));
+        s2pl.commit("r");
+        assertTrue(s2pl.stats().committedLockWaitUs() >= 40_000, s2pl.stats().speculationSummary());
+    }
+
+    @Test
+    void aWastedBranchCountsUnderItsAbortCause() throws Exception {
+        shim.start("t");
+        shim.put("t", "x", "1");
+        Thread.sleep(30);
+        shim.abort("t");
+        assertTrue(shim.stats().lostUs(AbortCause.COORDINATOR) >= 30_000, shim.stats().speculationSummary());
+        assertEquals(0, shim.stats().lostUs(AbortCause.CASCADE));
+        assertTrue(shim.stats().speculationSummary().contains("lost_coordinator_us_total="));
+    }
+
+    @Test
     void cascadeFanoutIsCounted() {
         shim.start("w");
         shim.put("w", "x", "1");

@@ -366,6 +366,25 @@ python -m venv .venv && .venv/bin/pip install matplotlib
 .venv/bin/python scripts/bench-final-plot.py bench-results/final-<ts>
 ```
 
+### Peak throughput and time budget
+
+`scripts/bench-peak.py` searches, for each server kind, skew and shim (speculative, non-speculative;
+same workload as `bench-final.sh`, no Sonata), the thread count with the highest throughput, 3 reps
+per point (`--threads T...` measures fixed thread counts instead, for both shims at equal load). A
+run's throughput is the median of its per-second samples, so a global stall does not decide a peak,
+and per-commit figures stop at the end of the workload, before the audit's read commits. Finished
+points are kept: rerun with `--out DIR` to resume. Besides `peak.md`, `peak-curves.png` and
+`timeseries-<db>.png`, it reports where the time of a branch commit goes in both shims (`budget-<db>.png`:
+active, lock wait, prepare wait, and the lifetime of aborted branches by cause), and `stalls.csv` lines
+up every throughput dip with the GC and safepoint pauses of the client and the nodes, `vmstat` and the
+TC's GC counters.
+
+```bash
+.venv/bin/python scripts/bench-peak.py --out bench-results/peak                    # the search
+.venv/bin/python scripts/bench-peak.py --out bench-results/budget --skews 0.95 0.99 --threads 50 75 100 125 150
+.venv/bin/python scripts/bench-peak.py summarize DIR    # also: plot DIR, stalls DIR
+```
+
 ## Next steps
 
 - Add a real key-value backend behind `KvStore`.

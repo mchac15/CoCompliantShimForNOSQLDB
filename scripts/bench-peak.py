@@ -3,7 +3,9 @@
 
     scripts/bench-peak.py [run] [options] [-- MicroBench options...]   # searches (resumes with --out DIR)
     scripts/bench-peak.py summarize DIR                                # peak.md, peak.csv, points.csv
-    scripts/bench-peak.py plot DIR                                     # peak-curves.png, timeseries-<db>.png
+    scripts/bench-peak.py plot DIR                                     # peak-curves.png, timeseries-<db>.png,
+                                                                       # budget-<db>.png
+    scripts/bench-peak.py stalls DIR                                   # stalls.csv: throughput dips vs GC, system
 
 For every server kind x skew x system (speculative / non-speculative shim, wound-wait, on MySQL /
 PostgreSQL; no Sonata), it searches the thread count with the highest mean throughput:
@@ -13,26 +15,38 @@ PostgreSQL; no Sonata), it searches the thread count with the highest mean throu
      [--min-threads, --max-threads];
   3. then probe the middle of each side of the best point whose gap to its measured neighbor is
      more than --tol x best threads (0.25: 25 threads around 100), until neither is.
+With --threads T...: no search, exactly those thread counts for every config (same points for both
+systems, to compare them at equal load).
 
 Every point is --reps (3) runs of scripts/bench-compare.sh (one variant; all of them with the workload
 of scripts/bench-final.sh: --ops-mean 3, 2 ms think time, random op order, lock waits 30 s on the
-nodes and the servers, TC 60 s), and the search goes by their mean. The searches advance round-robin
+nodes and the servers, TC 60 s), and the search goes by their mean throughput, each run's being the
+median of its per-second samples in the measurement window: a global stall does not decide a peak (the
+raw mean is kept as tps_raw). The searches advance round-robin
 (speculative and non-speculative of one config next to each other in time). A finished point is
 never measured again: rerun with --out DIR to resume after an interruption.
 
 Each run also records its throughput over time (MicroBench --sample-ms: commits and aborts every
 second, warm-up and drain included, in timeseries-t<T>.csv) and the shim nodes log their counters
-every --stats-interval-s (1) s (stats / speculation lines in t<T>-nodes/).
+every --stats-interval-s (1) s (stats / speculation lines in t<T>-nodes/). Per-commit figures use the
+counters at the last second the workload was active, since the audit's read commits come after it.
+
+Diagnostics of the stalls: GC and safepoint logs of the client and the nodes (t<T>-nodes/*.gc), and in
+diag/ vmstat and the TC's GC counters (jstat), all on the wall clock; `stalls` lines up each dip with them.
 
 Output, in DIR = bench-results/peak-<timestamp>/:
   <db>-skew<s>-<system>/t<T>.csv, txns-t<T>.csv, timeseries-t<T>.csv, t<T>-nodes/   one point
-  points.csv     every point: threads, tps mean / min / max / CV, abort rate, op latency, and for the
-                 shims' speculation (from the nodes' final counters): saved net, lost to cascades,
-                 cascades per 100 commits
+  points.csv     every point: threads, tps mean / min / max / CV, abort rate, op latency, and per branch
+                 commit: saved, aborts by cause, and the time budget (below)
   peak.csv, peak.md   per config: the peak (threads, tps), whether it is bracketed by measured
                  points on both sides, the runner-up; speculative vs non-speculative at their peaks
   peak-curves.png, timeseries-<db>.png   (with matplotlib) throughput against threads, and over time
                  at each peak
+  budget-<db>.png   where the time of a branch commit goes, speculative vs non-speculative, per thread
+                 count: a committed branch's active time (work and think time), lock wait and prepare
+                 wait, plus the lifetime of the aborted branches it took, by abort cause. Post-vote wait
+                 is in peak.md only: a prepared branch waits while its thread runs the next branch, so it
+                 is not extra thread time
 
 Needs a running Seata TC (see README.md) and Docker; plot needs matplotlib.
 Example: scripts/bench-peak.py --skews 0.9 0.95 --reps 3
@@ -48,6 +62,8 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -74,8 +90,21 @@ def read_point(d, threads):
     return list(csv.DictReader(open(f))) if f.exists() else []
 
 
+def robust_tps(d, threads):
+    """Per run: the median of its per-second samples in the measurement window, or its raw tps without samples."""
+    f = d / f"timeseries-t{threads}.csv"
+    reps = {}
+    if f.exists():
+        for r in csv.DictReader(open(f)):
+            if r["phase"] == "measure":
+                reps.setdefault(r["label"], []).append(float(r["tps"]))
+    # the last sample may cover a partial interval
+    medians = [statistics.median(v[:-1] or v) for v in reps.values()]
+    return medians or [float(r["tps"]) for r in read_point(d, threads)]
+
+
 def measure(args, out, db, skew, system, threads):
-    """Runs one point unless it is done; returns its mean tps."""
+    """Runs one point unless it is done; returns its mean (robust) tps."""
     d = config_dir(out, db, skew, system)
     d.mkdir(parents=True, exist_ok=True)
     done = d / f"t{threads}.done"
@@ -87,7 +116,7 @@ def measure(args, out, db, skew, system, threads):
         print(f"=== {db} skew {skew:g} {system}: {threads} threads x {args.reps}", flush=True)
         env = dict(os.environ, CSV=str(d / f"t{threads}.csv"), VARIANTS=variant(db, system),
                    LOCK_TIMEOUT_MS=str(args.lock_timeout_ms), SHIMS="2",
-                   STATS_INTERVAL_S=str(args.stats_interval_s))
+                   STATS_INTERVAL_S=str(args.stats_interval_s), GC_LOGS="1")
         cmd = [str(ROOT / "scripts" / "bench-compare.sh"), "--reps", str(args.reps), "--tc", args.tc,
                "--threads", str(threads),
                "--skew", f"{skew:g}", "--warmup-s", f"{args.warmup_s:g}", "--measure-s", f"{args.measure_s:g}",
@@ -101,7 +130,7 @@ def measure(args, out, db, skew, system, threads):
         if rc != 0:
             print(f"  warning: a run of this point warned or failed its audit (see the log above)", flush=True)
         done.touch()
-    return statistics.mean(float(r["tps"]) for r in read_point(d, threads))
+    return statistics.mean(robust_tps(d, threads))
 
 
 # ---- the search ----
@@ -127,6 +156,43 @@ def search(seeds, lo, hi, tol):
             if i < len(xs) - 1 and xs[i + 1] - best > gap:
                 pending.append(round((best + xs[i + 1]) / 2))
         pending = sorted(p for p in set(pending) if p not in measured)
+
+
+def grid(threads):
+    """The search's interface for a fixed set of thread counts."""
+    yield sorted(set(threads))
+
+
+# ---- diagnostics of the stalls ----
+
+def start_diagnostics(out):
+    """vmstat and the TC's GC counters, every second, each line prefixed with the wall clock."""
+    d = out / "diag"
+    d.mkdir(exist_ok=True)
+
+    def stamped(cmd, path):
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError as e:
+            print(f"diagnostics: {cmd[0]} is not available ({e})")
+            return None
+
+        def pump():
+            with open(path, "a") as f:
+                for line in proc.stdout:
+                    f.write(f"{time.time():.3f} {line}")
+                    f.flush()
+
+        threading.Thread(target=pump, daemon=True).start()
+        return proc
+
+    procs = [stamped(["vmstat", "1"], d / "vmstat.log")]
+    pids = subprocess.run(["pgrep", "-f", "seata-server"], capture_output=True, text=True).stdout.split()
+    if pids:
+        procs.append(stamped(["jstat", "-gcutil", pids[0], "1000"], d / "tc-gc.log"))
+    else:
+        print("diagnostics: no seata-server process found, no TC GC counters")
+    return [p for p in procs if p]
 
 
 # ---- servers ----
@@ -191,8 +257,10 @@ def run(args):
     print(setup.read_text())
 
     started = start_servers(args)
+    diagnostics = start_diagnostics(out)
     try:
-        gens = {c: search(args.seeds, args.min_threads, args.max_threads, args.tol) for c in configs}
+        gens = {c: grid(args.threads) if args.threads else search(args.seeds, args.min_threads, args.max_threads, args.tol)
+                for c in configs}
         batches = {c: next(g) for c, g in gens.items()}
         while batches:
             for c in list(batches):
@@ -203,29 +271,69 @@ def run(args):
                     del batches[c]
                     print(f"--- {c[0]} skew {c[1]:g} {c[2]}: search done", flush=True)
     finally:
+        for p in diagnostics:
+            p.terminate()
         if not args.keep_dbs:
             for kind in started:
                 subprocess.run([str(ROOT / "scripts" / "bench-dbs.sh"), "stop", kind])
     summarize(out)
+    stalls(out)
     plot(out, quiet=True)
 
 
 # ---- summary ----
 
+def counters_of(line):
+    return {k: int(v) for k, v in (kv.split("=", 1) for kv in line.split() if "=" in kv) if re.fullmatch(r"-?\d+", v)}
+
+
 def node_counters(nodes_dir, var):
-    """The shim nodes' final counters (last stats / speculation lines), summed over nodes and reps."""
+    """
+    The shim nodes' counters at the last logged second the workload was active, summed over nodes and reps.
+    The audit that follows only commits (reads), never aborts, and would swell every per-commit figure:
+    up to 2/3 of the final commits at skew 0.99.
+    """
     total = {}
     for log in glob.glob(str(nodes_dir / f"rep*-{var}-s*.log")):
-        last = {}
+        stats, spec = [], []
         for line in open(log, errors="replace"):
-            if line.startswith(("stats", "speculation")):
-                last[line.split()[0]] = line
-        for kind, line in last.items():
-            for k, v in (kv.split("=", 1) for kv in line.split() if "=" in kv):
-                # counters from the stats line; from the speculation line only its totals (it repeats commits=)
-                if re.fullmatch(r"-?\d+", v) and (kind == "stats" or k.endswith("_total")):
-                    total[k] = total.get(k, 0) + int(v)
+            if line.startswith("stats"):
+                stats.append(counters_of(line))
+            elif line.startswith("speculation"):
+                spec.append(counters_of(line))
+        if not stats:
+            continue
+        i = len(stats) - 1
+        while i > 0 and stats[i].get("aborts") == stats[i - 1].get("aborts"):
+            i -= 1
+        snapshot = dict(stats[i])
+        if i < len(spec):
+            # from the speculation line only its totals (it repeats commits=)
+            snapshot.update({k: v for k, v in spec[i].items() if k.endswith("_total")})
+        for k, v in snapshot.items():
+            total[k] = total.get(k, 0) + v
     return total
+
+
+BUDGET = [("active_us", "active"), ("lock_wait_us", "lock wait"), ("prepare_wait_us", "prepare wait"),
+          ("post_vote_us", "post-vote wait"), ("lost_wounded_us", "lost: wounded"),
+          ("lost_cascade_us", "lost: cascade"), ("lost_coordinator_us", "lost: coordinator"),
+          ("lost_other_us", "lost: other")]
+
+
+def budget(n):
+    """The time budget per branch commit, in µs, from the counters of one point; {} without them."""
+    commits = n.get("commits", 0)
+    if not commits or "committed_lifetime_us_total" not in n:
+        return {}
+    lifetime, lock, prep, post = (n[f"committed_{k}_us_total"] for k in ("lifetime", "lock_wait", "prepare_wait",
+                                                                         "post_vote"))
+    named = ("lost_wounded_us_total", "lost_cascade_us_total", "lost_coordinator_us_total")
+    other = sum(v for k, v in n.items() if k.startswith("lost_") and k.endswith("_us_total") and k not in named)
+    return {k: round(v / commits) for k, v in dict(
+        active_us=lifetime - lock - prep - post, lock_wait_us=lock, prepare_wait_us=prep, post_vote_us=post,
+        lost_wounded_us=n[named[0]], lost_cascade_us=n[named[1]], lost_coordinator_us=n[named[2]],
+        lost_other_us=other).items()}
 
 
 def load_points(out):
@@ -238,21 +346,28 @@ def load_points(out):
         for done in d.glob("t*.done"):
             t = int(done.stem[1:])
             rows = read_point(d, t)
-            tps = [float(r["tps"]) for r in rows]
+            tps = robust_tps(d, t)
             mean = statistics.mean(tps)
             n = node_counters(d / f"t{t}-nodes", variant(db, system))
             commits = n.get("commits", 0)
             per = (lambda k: round(n[k] / commits) if commits and k in n else "")
             points.append(dict(
                 db=db, skew=skew, system=system, threads=t, reps=len(rows), tps=round(mean, 1),
+                tps_raw=round(statistics.mean(float(r["tps"]) for r in rows), 1),
+                thread_us=round(1e6 * t / (mean * int(rows[0]["branches"]))) if mean and "branches" in rows[0] else "",
                 tps_min=min(tps), tps_max=max(tps),
                 tps_cv=round(100 * statistics.stdev(tps) / mean, 2) if len(tps) > 1 and mean else 0,
                 abort_rate=round(statistics.mean(float(r["abort_rate"]) for r in rows), 4),
                 op_p50_us=round(statistics.mean(float(r["op_p50_us"]) for r in rows)),
                 op_p99_us=round(statistics.mean(float(r["op_p99_us"]) for r in rows)),
-                saved_net_us=per("saved_net_us_total"), cascade_lost_us=per("cascade_lost_us_total"),
+                saved_gross_us=per("saved_us_total"), saved_net_us=per("saved_net_us_total"),
+                cascade_lost_us=per("cascade_lost_us_total"),
                 cascades_per_100=round(100 * n["cascade"] / commits, 1) if commits and "cascade" in n else "",
-                wounded_per_100=round(100 * n["wounded"] / commits, 1) if commits and "wounded" in n else ""))
+                wounded_per_100=round(100 * n["wounded"] / commits, 1) if commits and "wounded" in n else "",
+                coordinator_per_100=round(100 * n["coordinator"] / commits, 1) if commits and "coordinator" in n else "",
+                upgrade_per_100=round(100 * n["upgrade_conflict"] / commits, 1)
+                if commits and "upgrade_conflict" in n else "",
+                **{k: budget(n).get(k, "") for k, _ in BUDGET}))
     return sorted(points, key=lambda p: (p["db"], p["skew"], p["system"], p["threads"]))
 
 
@@ -295,7 +410,9 @@ def summarize(out):
     setup = out / "setup.txt"
     if setup.exists():
         lines += ["    " + l for l in setup.read_text().splitlines()] + [""]
-    lines += ["Peak = the thread count with the highest mean tps over the reps. bracketed = measured points on both",
+    lines += ["tps of a run = the median of its per-second samples in the measurement window, so that a global stall",
+              "does not count (see stalls.csv); per-commit figures stop at the end of the workload (no audit).",
+              "Peak = the thread count with the highest mean tps over the reps. bracketed = measured points on both",
               "sides of it (else it sits at the edge of the search range); flat = the runner-up's mean is inside the",
               "peak's rep min-max (the top of the curve is flat, the exact thread count does not matter).", "",
               "## Peaks", "",
@@ -321,6 +438,26 @@ def summarize(out):
             f"| {100 * (s['tps'] / n['tps'] - 1):+.1f}% | {100 * s['abort_rate']:.1f}% / {100 * n['abort_rate']:.1f}% "
             f"| {s['op_p99_us']} / {n['op_p99_us']} | {s['saved_net_us']} | {s['cascade_lost_us']} "
             f"| {s['cascades_per_100']} | {s['wounded_per_100']} / {n['wounded_per_100']} |")
+    both = sorted({(p["db"], p["skew"], p["threads"]) for p in points if p["active_us"] != ""})
+    if both:
+        lines += ["", "## Time budget per branch commit, at equal thread counts", "",
+                  "In ms. thread = threads / branch commits per second: all the thread time one branch commit costs. "
+                  "active = work and think time of a committed branch; lost = lifetime of the aborted branches, per "
+                  "commit, by cause. post-vote wait = voted YES, waiting for the global decision: it overlaps the "
+                  "thread's next branch, so it is not added to the others. thread - the others = time outside the "
+                  "shim's branches (TC, client, connections), roughly: an aborted branch's lifetime can also overlap.",
+                  "", "| db | skew | threads | system | tps | gain | thread | " + " | ".join(n for _, n in BUDGET) + " |",
+                  "|---|---|---|---|---|---|---|" + "---|" * len(BUDGET)]
+        by_key = {(p["db"], p["skew"], p["threads"], p["system"]): p for p in points}
+        for db, skew, t in both:
+            s, n = by_key.get((db, skew, t, "speculative")), by_key.get((db, skew, t, "nonspeculative"))
+            for system, p in (("spec", s), ("non-spec", n)):
+                if not p or p["active_us"] == "":
+                    continue
+                gain = f"{100 * (s['tps'] / n['tps'] - 1):+.1f}%" if s and n and system == "spec" else ""
+                thread = f"{p['thread_us'] / 1000:.1f}" if p["thread_us"] != "" else ""
+                lines.append(f"| {db} | {skew:g} | {t} | {system} | {p['tps']:.0f} | {gain} | {thread} | "
+                             + " | ".join(f"{p[k] / 1000:.1f}" for k, _ in BUDGET) + " |")
     lines += ["", f"Every point: {out}/points.csv; runs: <db>-skew<s>-<system>/t<T>.csv, throughput over time: "
               "timeseries-t<T>.csv, node logs (counters every second): t<T>-nodes/."]
     text = "\n".join(lines) + "\n"
@@ -369,6 +506,8 @@ def plot(out, quiet=False):
     handles = [Line2D([], [], color=c, marker=m, linewidth=2, markersize=6, markeredgecolor=SURFACE, label=n)
                for c, m, n in COLORS.values()]
     handles.append(Line2D([], [], color=INK_MUTED, marker="*", linestyle="none", markersize=12, label="peak"))
+
+    budget_plots(out, points, dbs, skews, plt)
 
     # throughput against threads, one panel per db x skew
     fig, axes = plt.subplots(len(dbs), len(skews), figsize=(max(4.4 * len(skews), 13), 3.8 * len(dbs)), squeeze=False,
@@ -464,12 +603,147 @@ def plot(out, quiet=False):
         print(target)
 
 
+# reference categorical slots in their fixed order (validated: adjacent pairs clear the CVD and normal-vision
+# floors); the legend, the S / N labels and the budget table in peak.md carry the identity as well
+BUDGET_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"]
+STACKED = [b for b in BUDGET if b[0] != "post_vote_us"]
+
+
+def budget_plots(out, points, dbs, skews, plt):
+    """Stacked bars per thread count: speculative (S) next to non-speculative (N), one figure per server kind."""
+    if not any(p["active_us"] != "" for p in points):
+        return
+    by_key = {(p["db"], p["skew"], p["threads"], p["system"]): p for p in points}
+    for db in dbs:
+        fig, axes = plt.subplots(len(skews), 1, figsize=(13, 3.6 * len(skews)), squeeze=False, facecolor=SURFACE)
+        for ax, skew in zip((row[0] for row in axes), skews):
+            style(ax)
+            ax.grid(False)
+            ax.grid(True, axis="y", color=GRID, linewidth=0.8)
+            threads = sorted({k[2] for k in by_key if k[:2] == (db, skew) and by_key[k]["active_us"] != ""})
+            for x, t in enumerate(threads):
+                for offset, system, tag in ((-0.2, "speculative", "S"), (0.2, "nonspeculative", "N")):
+                    p = by_key.get((db, skew, t, system))
+                    if not p or p["active_us"] == "":
+                        continue
+                    bottom = 0
+                    for (k, name), color in zip(STACKED, BUDGET_COLORS):
+                        h = p[k] / 1000
+                        ax.bar(x + offset, h, bottom=bottom, width=0.36, color=color, edgecolor=SURFACE, linewidth=1,
+                               label=name if x == 0 and tag == "S" else None, zorder=3)
+                        bottom += h
+                    ax.text(x + offset, bottom, f"{tag} {p['tps']:.0f}", ha="center", va="bottom", fontsize=8, color=INK)
+            ax.set_xticks(range(len(threads)), [f"{t} threads" for t in threads])
+            ax.set_ylabel("ms per branch commit")
+            ax.margins(y=0.12)
+            ax.set_title(f"{DB_NAMES[db]}, skew {skew:g}", color=INK, fontsize=11, fontweight="bold")
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", ncol=len(STACKED), frameon=False, bbox_to_anchor=(0.5, 1.0),
+                   fontsize=9)
+        height = fig.get_figheight()
+        fig.text(0.5, 1 - 0.32 / height, "S = speculative, N = non-speculative, number = txn/s; active = work and think "
+                 "time of the committed branch, lost = aborted branches' lifetime per commit; post-vote wait not stacked", ha="center", va="top",
+                 color=INK_MUTED, fontsize=9)
+        fig.tight_layout(rect=(0, 0, 1, 1 - 0.6 / height))
+        target = out / f"budget-{db}.png"
+        fig.savefig(target, dpi=150, facecolor=SURFACE)
+        plt.close(fig)
+        print(target)
+
+
+# ---- stalls: what happened during the throughput dips ----
+
+# the JVM prints decimals in the machine's locale: 4,772ms
+GC_LINE = re.compile(r"^\[([^\]]+)\].*\bPause\b.* (\d+(?:[.,]\d+)?)ms$")
+SAFEPOINT_LINE = re.compile(r"^\[([^\]]+)\].*\bSafepoint\b.*Total: (\d+) ns")
+
+
+def jvm_pauses(path):
+    """[(end wall time s, seconds)] of the GC pauses and safepoints of one -Xlog file."""
+    out = []
+    for line in open(path, errors="replace"):
+        m = GC_LINE.match(line)
+        scale = 1e-3
+        if not m:
+            m, scale = SAFEPOINT_LINE.match(line), 1e-9
+        if m:
+            try:
+                out.append((datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S.%f%z").timestamp(), float(m.group(2).replace(",", ".")) * scale))
+            except ValueError:
+                pass
+    return out
+
+
+def stamped_rows(path):
+    """[(wall time s, columns)] of a diag/ file."""
+    rows = []
+    if path.exists():
+        for line in open(path, errors="replace"):
+            parts = line.split()
+            try:
+                rows.append((float(parts[0]), parts[1:]))
+            except (ValueError, IndexError):
+                pass
+    return rows
+
+
+def stalls(out):
+    """stalls.csv: every sample below 60 % of its run's median, with what the JVMs and the machine did meanwhile."""
+    out = Path(out)
+    vm = stamped_rows(out / "diag" / "vmstat.log")
+    tc = stamped_rows(out / "diag" / "tc-gc.log")
+    rows = []
+    runs = 0
+    for f in sorted(out.glob("*-skew*-*/timeseries-t*.csv")):
+        reps = {}
+        for r in csv.DictReader(open(f)):
+            reps.setdefault(r["label"], []).append(r)
+        t = re.search(r"timeseries-t(\d+)", f.name).group(1)
+        nodes = f.parent / f"t{t}-nodes"
+        for label, rs in reps.items():
+            window = [r for r in rs if r["phase"] == "measure"][:-1]
+            if not window or "wall_ms" not in window[0]:
+                continue
+            runs += 1
+            med = statistics.median(float(r["tps"]) for r in window)
+            pauses = None
+            for r in window:
+                if float(r["tps"]) >= 0.6 * med:
+                    continue
+                if pauses is None:   # parsed once per run, only for the runs with a dip
+                    pauses = {re.sub(r"^.*@wound-wait-|\.gc$", "", p): jvm_pauses(p)
+                              for p in glob.glob(str(nodes / f"{label}-*.gc"))}
+                end = int(r["wall_ms"]) / 1000
+                start = end - int(r["interval_ms"]) / 1000
+                worst = {jvm: max((s for e, s in ps if start <= e <= end + 1), default=0.0) for jvm, ps in pauses.items()}
+                vms = [c for w, c in vm if start <= w <= end + 1 and len(c) >= 16 and c[0].isdigit()]
+                # the header's last column is a name; G1 prints "-" in the first columns
+                tcs = [c for w, c in tc if start - 1 <= w <= end + 1 and len(c) >= 11 and c[-1][0].isdigit()]
+                rows.append(dict(
+                    config=f.parent.name, threads=t, label=label, t_s=r["t_s"], tps=r["tps"], median_tps=round(med),
+                    client_pause_s=round(worst.get("client", 0), 3), s0_pause_s=round(worst.get("s0", 0), 3),
+                    s1_pause_s=round(worst.get("s1", 0), 3),
+                    vm_max_blocked=max((int(c[1]) for c in vms), default=""),
+                    vm_max_wa=max((int(c[15]) for c in vms), default=""), vm_min_idle=min((int(c[14]) for c in vms), default=""),
+                    vm_max_bo=max((int(c[9]) for c in vms), default=""),
+                    tc_gc_time_delta_s=round(float(tcs[-1][-1]) - float(tcs[0][-1]), 3) if len(tcs) > 1 else ""))
+    print(f"stalls: {len(rows)} samples below 60 % of the median, in {runs} runs with samples")
+    if rows:
+        with open(out / "stalls.csv", "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        print(f"  with a client GC / safepoint pause >= 0.2 s: {sum(r['client_pause_s'] >= 0.2 for r in rows)}; "
+              f"in a node: {sum(max(r['s0_pause_s'], r['s1_pause_s']) >= 0.2 for r in rows)}; "
+              f"see {out / 'stalls.csv'}")
+
+
 def main():
     argv = sys.argv[1:]
-    if argv and argv[0] in ("summarize", "plot"):
+    if argv and argv[0] in ("summarize", "plot", "stalls"):
         if len(argv) != 2:
             sys.exit(__doc__)
-        (summarize if argv[0] == "summarize" else plot)(argv[1])
+        {"summarize": summarize, "plot": plot, "stalls": stalls}[argv[0]](argv[1])
         return
     if argv and argv[0] == "run":
         argv = argv[1:]
@@ -484,6 +758,7 @@ def main():
     p.add_argument("--skews", nargs="+", type=float, default=[0.8, 0.9, 0.95, 0.99])
     p.add_argument("--systems", nargs="+", default=list(SYSTEMS), choices=list(SYSTEMS))
     p.add_argument("--seeds", nargs="+", type=int, default=[50, 100, 200])
+    p.add_argument("--threads", nargs="+", type=int, help="no search: exactly these thread counts for every config")
     p.add_argument("--min-threads", type=int, default=10)
     p.add_argument("--max-threads", type=int, default=400)
     p.add_argument("--tol", type=float, default=0.25,

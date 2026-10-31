@@ -117,10 +117,10 @@ class MicroBenchTest {
         BenchConfig c = config("--variant", "speculative-pg@wound-wait", "--threads", "50", "--sample-ms", "500");
         assertEquals(500, c.sampleMs());
         List<String> rows = MicroBench.sampleRows(c, "rep1", List.of(
-                new MicroBench.Sample(500, "warmup", 500, 100, 25),
-                new MicroBench.Sample(1000, "measure", 500, 0, 0)));
-        assertEquals("rep1,speculative-pg@wound-wait,50,0.9,0.500,warmup,500,100,25,200.0,0.2000", rows.get(0));
-        assertEquals("rep1,speculative-pg@wound-wait,50,0.9,1.000,measure,500,0,0,0.0,0.0000", rows.get(1));
+                new MicroBench.Sample(500, "warmup", 500, 100, 25, 1000500),
+                new MicroBench.Sample(1000, "measure", 500, 0, 0, 1001000)));
+        assertEquals("rep1,speculative-pg@wound-wait,50,0.9,0.500,warmup,500,100,25,200.0,0.2000,1000500", rows.get(0));
+        assertEquals("rep1,speculative-pg@wound-wait,50,0.9,1.000,measure,500,0,0,0.0,0.0000,1001000", rows.get(1));
         assertEquals(MicroBench.sampleCsvHeader().split(",").length, rows.get(0).split(",").length);
         assertThrows(IllegalArgumentException.class, () -> config("--sample-ms", "-1"));
     }
