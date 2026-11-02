@@ -56,6 +56,7 @@ import argparse
 import csv
 import glob
 import os
+import random
 import re
 import shutil
 import socket
@@ -71,7 +72,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SYSTEMS = ("speculative", "nonspeculative")
 DB_KINDS = {"mysql": "mysql", "pg": "postgres"}
 WORKLOAD = ["--ops-mean", "3", "--think-mean-us", "2000", "--think-sd-us", "1000"]
-SECONDS_PER_RUN_OVERHEAD = 45   # node start, drain, audit, JVM: measured on diascld21
+SECONDS_PER_RUN_OVERHEAD = 50   # node start, drain, audit, JVM: about 90 s per run in all on diascld21
 
 
 def variant(db, system):
@@ -232,11 +233,21 @@ def start_servers(args):
 def run(args):
     out = Path(args.out) if args.out else ROOT / "bench-results" / f"peak-{datetime.now():%Y%m%d-%H%M%S}"
     out.mkdir(parents=True, exist_ok=True)
-    configs = [(db, skew, system) for db in args.dbs for skew in args.skews for system in args.systems]
+    pairs = [(db, skew) for db in args.dbs for skew in args.skews]
+    if args.shuffle is not None:
+        # a random order of the (db, skew) pairs, so that a drift over the hours does not line up with the skew;
+        # the systems of a pair stay next to each other in time. Same seed, same order: a resume keeps it
+        random.Random(args.shuffle).shuffle(pairs)
+    configs = [(db, skew, system) for db, skew in pairs for system in args.systems]
     per_run = args.warmup_s + args.measure_s + SECONDS_PER_RUN_OVERHEAD
-    print(f"{len(configs)} configs; the seeds alone are {len(configs) * len(args.seeds) * args.reps} runs "
-          f"(~{len(configs) * len(args.seeds) * args.reps * per_run / 3600:.1f} h); a search usually adds 2-4 "
-          f"points per config")
+    if args.threads:
+        n = len(configs) * len(set(args.threads)) * args.reps
+        print(f"{len(configs)} configs x {len(set(args.threads))} thread counts x {args.reps} reps = {n} runs "
+              f"(~{n * per_run / 3600:.1f} h)")
+    else:
+        print(f"{len(configs)} configs; the seeds alone are {len(configs) * len(args.seeds) * args.reps} runs "
+              f"(~{len(configs) * len(args.seeds) * args.reps * per_run / 3600:.1f} h); a search usually adds 2-4 "
+              f"points per config")
     if not tc_up(args.tc):
         sys.exit(f"no Seata TC at {args.tc}: start one first (see README.md)")
     setup = out / "setup.txt"
@@ -759,6 +770,8 @@ def main():
     p.add_argument("--systems", nargs="+", default=list(SYSTEMS), choices=list(SYSTEMS))
     p.add_argument("--seeds", nargs="+", type=int, default=[50, 100, 200])
     p.add_argument("--threads", nargs="+", type=int, help="no search: exactly these thread counts for every config")
+    p.add_argument("--shuffle", type=int, metavar="SEED",
+                   help="run the (db, skew) pairs in a random order (this seed), not db by db and skew by skew")
     p.add_argument("--min-threads", type=int, default=10)
     p.add_argument("--max-threads", type=int, default=400)
     p.add_argument("--tol", type=float, default=0.25,
