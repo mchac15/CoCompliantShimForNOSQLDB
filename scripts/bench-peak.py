@@ -527,6 +527,13 @@ def plot(out, quiet=False):
         for j, skew in enumerate(skews):
             ax = axes[i][j]
             style(ax)
+            if not any((p["db"], p["skew"]) == (db, skew) for p in points):
+                # a sweep cut short, or still running
+                ax.text(0.5, 0.5, "not measured", transform=ax.transAxes, ha="center", va="center", color=INK_MUTED)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_title(f"{DB_NAMES[db]}, skew {skew:g}", color=INK, fontsize=11, fontweight="bold")
+                continue
             for system, (color, marker, _) in COLORS.items():
                 ps = sorted((p for p in points if (p["db"], p["skew"], p["system"]) == (db, skew, system)),
                             key=lambda p: p["threads"])
