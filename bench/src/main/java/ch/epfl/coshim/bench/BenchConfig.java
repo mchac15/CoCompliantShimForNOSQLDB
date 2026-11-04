@@ -23,8 +23,14 @@ import java.util.concurrent.ThreadLocalRandom;
  * @param branches         branches (subtransactions) per global transaction
  * @param reads            pure reads per branch
  * @param writes           writes per branch; a branch runs its reads and writes in a random order
- * @param skewness         share of each branch's keys drawn from the hot range, the first
- *                         (1 - skewness) * tableSize keys (Acta's definition, in [0.5, 1))
+ * @param skewness         share of the accesses that go to the hot range, the first (1 - skewness) * tableSize
+ *                         keys, in [0.5, 1): 0.9 = 90 % of the accesses on 10 % of the keys (Acta's definition)
+ * @param dist             how the keys of a branch are drawn: {@code hotspot}, each one independently from the
+ *                         hot range with probability {@code skewness}, else from the cold range, uniformly
+ *                         within each (the definition's intent: the share of hot accesses is the skewness,
+ *                         whatever the op count); {@code acta}, Acta's makeWorkingSet, the first
+ *                         ceil(ops * skewness) keys of each list hot (with a few ops per list every key is hot
+ *                         from skewness 0.67 on: the skewness only sets the size of the hot range)
  * @param rmw              writes are v := get(k) + 1 instead of blind random values; enables the audit
  * @param warmup           run time before measuring
  * @param measure          measured run time
@@ -48,12 +54,31 @@ import java.util.concurrent.ThreadLocalRandom;
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
         boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
-        double thinkSdUs, int sampleMs) {
+        double thinkSdUs, int sampleMs, KeyDist dist) {
+
+    /** How the keys of a branch are drawn; see {@code dist}. */
+    public enum KeyDist {
+        HOTSPOT, ACTA;
+
+        static KeyDist parse(String v) {
+            for (KeyDist d : values()) {
+                if (d.name().equalsIgnoreCase(v)) {
+                    return d;
+                }
+            }
+            throw new IllegalArgumentException("--dist is hotspot or acta: " + v);
+        }
+
+        @Override
+        public String toString() {
+            return name().toLowerCase();
+        }
+    }
 
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000, 1000);
+                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT);
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -120,8 +145,12 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         require(opsMean <= 0 || (opsSd > 0 && opsMax >= 1), "--ops-sd must be > 0 and --ops-max >= 1");
         require(thinkMeanUs <= 0 || thinkSdUs >= 0, "--think-sd-us must be >= 0");
         require(sampleMs >= 0, "--sample-ms must be >= 0");
-        long hotPerBranch = (long) Math.ceil(maxReads() * skewness) + (long) Math.ceil(maxWrites() * skewness);
-        long coldPerBranch = (long) maxReads() + maxWrites() - hotPerBranch;
+        // a txn's keys are distinct: the ranges must hold the most a txn can draw from each of them
+        long hotPerBranch = dist == KeyDist.ACTA
+                ? (long) Math.ceil(maxReads() * skewness) + (long) Math.ceil(maxWrites() * skewness)
+                : (long) maxReads() + maxWrites();   // hotspot: every key of a branch may be drawn hot
+        long coldPerBranch = dist == KeyDist.ACTA ? (long) maxReads() + maxWrites() - hotPerBranch
+                : (long) maxReads() + maxWrites();   // ... or cold
         require(hotPerBranch * branches <= hotRangeSize(), "requested hot keys exceed the hot range");
         require(coldPerBranch * branches <= tableSize - hotRangeSize(), "requested cold keys exceed the cold range");
         return this;
@@ -157,6 +186,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         double thinkMeanUs = c.thinkMeanUs;
         double thinkSdUs = c.thinkSdUs;
         int sampleMs = c.sampleMs;
+        KeyDist dist = c.dist;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -190,11 +220,13 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--think-mean-us" -> thinkMeanUs = Double.parseDouble(v);
                 case "--think-sd-us" -> thinkSdUs = Double.parseDouble(v);
                 case "--sample-ms" -> sampleMs = Integer.parseInt(v);
+                case "--dist" -> dist = KeyDist.parse(v);
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
-                measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs)
+                measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs,
+                dist)
                 .validate();
     }
 

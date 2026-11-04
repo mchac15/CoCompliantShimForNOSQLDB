@@ -2,6 +2,8 @@ package ch.epfl.coshim.bench;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.Map;
+import java.util.Set;
 import javax.sql.DataSource;
 
 /**
@@ -52,8 +54,13 @@ sealed interface Participant extends AutoCloseable permits CoShimParticipant, Sq
     /** Writes a key inside a branch. */
     void put(Connection branch, String table, int key, long value) throws SQLException;
 
-    /** The audit: sum of every value of micro-0 .. micro-(tables - 1), outside any global transaction. */
-    long sum(int tables, int tableSize) throws SQLException;
+    /**
+     * The audit: sum of every value of micro-0 .. micro-(tables - 1), outside any global transaction.
+     *
+     * @param written per table, every key the run may have written on this participant: every other key
+     *     is still 0, so it need not be read
+     */
+    long sum(int tables, int tableSize, Map<String, Set<Integer>> written) throws SQLException;
 
     @Override
     void close();

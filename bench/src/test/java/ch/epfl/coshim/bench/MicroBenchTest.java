@@ -44,9 +44,36 @@ class MicroBenchTest {
     }
 
     @Test
+    void hotspotPutsTheSkewnessShareOfTheAccessesInTheHotRange() {
+        for (double skew : new double[] {0.8, 0.9, 0.95, 0.99}) {
+            // 2 reads + 3 writes per branch: few ops, where acta rounds every key into the hot range
+            BenchConfig c = config("--table-size", "10000", "--reads", "2", "--writes", "3", "--skew", String.valueOf(skew));
+            assertEquals(BenchConfig.KeyDist.HOTSPOT, c.dist(), "hotspot is the default");
+            long hot = 0;
+            long all = 0;
+            for (int i = 0; i < 20_000; i++) {
+                Set<Integer> keys = new HashSet<>();
+                for (MicroBench.Branch b : MicroBench.randomPlan(c, 2)) {
+                    for (MicroBench.Op op : b.ops()) {
+                        assertTrue(keys.add(op.key()), "keys are distinct in a txn");
+                        assertTrue(op.key() >= 0 && op.key() < 10_000);
+                        hot += op.key() < c.hotRangeSize() ? 1 : 0;
+                        all++;
+                    }
+                }
+            }
+            assertEquals(skew, (double) hot / all, 0.005, "share of hot accesses at skew " + skew);
+        }
+        // 1M keys: the hot range is 1 % of them at 0.99, and the share holds
+        BenchConfig big = config("--table-size", "1000000", "--skew", "0.99");
+        assertEquals(10_000, big.hotRangeSize());
+        assertThrows(IllegalArgumentException.class, () -> config("--dist", "zipfish"));
+    }
+
+    @Test
     void plansFollowActasRules() {
         BenchConfig c = config("--table-size", "1000", "--branches", "3", "--reads", "2", "--writes", "3",
-                "--skew", "0.9");
+                "--skew", "0.9", "--dist", "acta");
         for (int i = 0; i < 1000; i++) {
             List<MicroBench.Branch> plan = MicroBench.randomPlan(c, 4);
             assertEquals(3, plan.size());
@@ -93,7 +120,7 @@ class MicroBenchTest {
 
     @Test
     void branchesRunTheirReadsAndWritesInARandomOrder() {
-        // 10 ops at skew 0.9: 9 hot keys and 1 cold one per list
+        // 10 ops at skew 0.9: about 9 hot keys and 1 cold one per list
         BenchConfig c = config("--table-size", "1000", "--reads", "10", "--writes", "10", "--skew", "0.9");
         boolean writeBeforeRead = false;
         boolean coldBeforeHot = false;
@@ -133,7 +160,8 @@ class MicroBenchTest {
                 new BenchResult.Txn(1, 2, 2, 2, "COMMITTED", List.of(), 1000, 600),
                 new BenchResult.Txn(3, 2, 2, 2, "COMMITTED", List.of("shim_abort", "shim_abort"), 2400, 1200),
                 new BenchResult.Txn(5, 2, 2, 2, "UNFINISHED", List.of(), 9000, 1000));
-        BenchResult r = new BenchResult(config(), 2, 2, 0, 0, List.of(500L, 600L), -1, -1, -1, Map.of(), txns, null);
+        BenchResult r = new BenchResult(config(), 2, 2, 0, 0, List.of(500L, 600L), -1, -1, -1, Map.of(), txns, null,
+                0.9);
 
         assertEquals(100, r.opLatencyPercentileUs(50), "(800 - 400) / 4; unfinished txns have no latency");
         assertEquals(300, r.opLatencyPercentileUs(99), "(2400 - 1200) / 4: the retries' work counts");

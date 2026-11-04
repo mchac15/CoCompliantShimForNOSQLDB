@@ -366,6 +366,18 @@ python -m venv .venv && .venv/bin/pip install matplotlib
 .venv/bin/python scripts/bench-final-plot.py bench-results/final-<ts>
 ```
 
+### Key distribution
+
+`--skew s` sends a share s of the accesses to the hot range, the first (1 - s) x `--table-size` keys
+(0.9: 90 % of the accesses on 10 % of the keys). With `--dist hotspot`, the default, each key of a branch
+is drawn independently: hot with probability s, uniformly within the hot or the cold range. `--dist acta`
+keeps Acta's makeWorkingSet, which takes the first ceil(ops x s) keys of each list from the hot range:
+with a few ops per list every key is then hot from s = 0.67 on, so s only sets the size of a uniformly
+accessed hot range. Results up to commit `fe98006` (final-v2, peak, skews) were measured that way. Each
+run reports the realized share in the `hot_share` column. Larger tables (`--table-size 1000000`) are
+cheap to set up: the shim's SQL store and Sonata's tables are reset in place, and the audit reads only
+the keys the run wrote.
+
 ### Peak throughput and time budget
 
 `scripts/bench-peak.py` searches, for each server kind, skew and shim (speculative, non-speculative;

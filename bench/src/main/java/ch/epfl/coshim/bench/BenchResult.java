@@ -31,7 +31,7 @@ import java.util.stream.Stream;
  */
 public record BenchResult(BenchConfig config, long committed, long aborted, long timedOut, long unknown,
         List<Long> commitLatencyUs, long auditExpectedMin, long auditExpectedMax, long auditActual,
-        Map<String, Long> branchFailures, List<Txn> txns, String warning) {
+        Map<String, Long> branchFailures, List<Txn> txns, String warning, double hotShare) {
 
     /**
      * One txn as the application saw it: all its attempts with the same plan.
@@ -200,6 +200,8 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                 config.branches(), config.reads(), config.writes(), config.skewness(), config.rmw(),
                 config.txnTimeout().toMillis(), config.parallelBranches() ? "in parallel" : "in order",
                 config.measure().toSeconds()));
+        sb.append(String.format(Locale.ROOT, "  keys: %s, %.1f %% of the accesses in the hot range (%d keys)%n",
+                config.dist(), 100 * hotShare, config.hotRangeSize()));
         if (config.opsMean() > 0 || config.thinkMeanUs() > 0) {
             sb.append(String.format(Locale.ROOT, "  ops per branch: %s   think time: %s%n",
                     config.opsMean() > 0 ? String.format(Locale.ROOT, "N(%.1f, %.1f) in [0, %d]", config.opsMean(),
@@ -241,7 +243,7 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         "timed_out", "unknown", "abort_rate", "mean_us", "p50_us", "p99_us", "audit_ok",
                         "branch_failures", "ops_mean", "ops_sd", "ops_max", "think_mean_us", "think_sd_us",
                         "mean_attempts", "retried_share", "op_p50_us", "op_p99_us", "txn_active_p50_us",
-                        "txn_active_p99_us", "retries_p50", "retries_p99")
+                        "txn_active_p99_us", "retries_p50", "retries_p99", "dist", "hot_share")
                 .collect(Collectors.joining(","));
     }
 
@@ -256,7 +258,8 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         String.format(Locale.ROOT, "%.3f", meanAttempts()),
                         String.format(Locale.ROOT, "%.4f", retriedShare()), opLatencyPercentileUs(50),
                         opLatencyPercentileUs(99), activeLatencyPercentileUs(50), activeLatencyPercentileUs(99),
-                        retriesPercentile(50), retriesPercentile(99))
+                        retriesPercentile(50), retriesPercentile(99), config.dist(),
+                        String.format(Locale.ROOT, "%.4f", hotShare))
                 .map(String::valueOf)
                 .collect(Collectors.joining(","));
     }

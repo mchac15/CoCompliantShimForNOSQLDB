@@ -111,6 +111,14 @@ public final class MicroBench implements AutoCloseable {
     private final LongAdder unknownTotal = new LongAdder();
     /** Attempts rolled back (aborted or timed out by the TC), warm-up included: for the samples. */
     private final LongAdder abortedTotal = new LongAdder();
+    /** Keys of the plans drawn (whole run) and those in the hot range: the realized skew. */
+    private final LongAdder accessedKeys = new LongAdder();
+    private final LongAdder hotKeys = new LongAdder();
+    /**
+     * Per participant, per table: every key a plan writes. Every other key keeps its initial 0, so the
+     * audit sums only these (a full scan through a shim is one read per key: 4M reads at 1M keys).
+     */
+    private final Map<Integer, Map<String, Set<Integer>>> writtenKeys = new ConcurrentHashMap<>();
     /** Throughput over time ({@code --sample-ms}), filled by {@link #run}. */
     private final List<Sample> samples = Collections.synchronizedList(new ArrayList<>());
 
@@ -294,8 +302,9 @@ public final class MicroBench implements AutoCloseable {
         }
         Map<String, Long> failures = new TreeMap<>();
         branchFailures.forEach((cause, n) -> failures.put(cause, n.sum()));
+        long accessed = accessedKeys.sum();
         return new BenchResult(config, committed, aborted, timedOut, unknown, latencies, expectedMin, expectedMax,
-                actual, failures, txns, warning);
+                actual, failures, txns, warning, accessed == 0 ? 0 : (double) hotKeys.sum() / accessed);
     }
 
     /**
@@ -309,9 +318,10 @@ public final class MicroBench implements AutoCloseable {
         for (int round = 0; round < 10; round++) {
             sum = 0;
             unsettled = null;
-            for (Participant p : participants) {
+            for (int i = 0; i < participants.size(); i++) {
+                Participant p = participants.get(i);
                 try {
-                    sum += p.sum(config.branches(), config.tableSize());
+                    sum += p.sum(config.branches(), config.tableSize(), writtenKeys.getOrDefault(i, Map.of()));
                 } catch (SQLTransactionRollbackException e) {
                     // the audit's reads take locks too: behind a branch the TC has not resolved yet,
                     // one can time out or be aborted with it. Not settled yet: read again
@@ -337,7 +347,19 @@ public final class MicroBench implements AutoCloseable {
     }
 
     private List<Branch> nextPlan() {
-        return randomPlan(config, participants.size());
+        List<Branch> plan = randomPlan(config, participants.size());
+        int hot = config.hotRangeSize();
+        for (Branch b : plan) {
+            writtenKeys.computeIfAbsent(b.shim(), p -> new ConcurrentHashMap<>())
+                    .computeIfAbsent(b.table(), t -> ConcurrentHashMap.newKeySet()).addAll(b.writeKeys());
+            for (Op op : b.ops()) {
+                accessedKeys.increment();
+                if (op.key() < hot) {
+                    hotKeys.increment();
+                }
+            }
+        }
+        return plan;
     }
 
     /**
@@ -366,11 +388,26 @@ public final class MicroBench implements AutoCloseable {
         return plan;
     }
 
-    /** Acta's makeWorkingSet: ops × skewness keys from the hot range, the rest from the cold range. */
+    /**
+     * {@code ops} distinct keys (none in {@code used}, which receives them): hotspot, each from the hot range
+     * with probability skewness, else from the cold range; acta, Acta's makeWorkingSet, ops × skewness keys
+     * from the hot range, the rest from the cold range.
+     */
     private static List<Integer> workingSet(BenchConfig config, int ops, Set<Integer> used) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
         int hot = config.hotRangeSize();
         List<Integer> keys = new ArrayList<>();
+        if (config.dist() == BenchConfig.KeyDist.HOTSPOT) {
+            while (keys.size() < ops) {
+                // validate() made both ranges large enough for a whole txn: the redraws end
+                boolean isHot = random.nextDouble() < config.skewness();
+                int candidate = isHot ? random.nextInt(0, hot) : random.nextInt(hot, config.tableSize());
+                if (used.add(candidate)) {
+                    keys.add(candidate);
+                }
+            }
+            return keys;
+        }
         while (keys.size() < ops * config.skewness()) {
             int candidate = random.nextInt(0, hot);
             if (used.add(candidate)) {
