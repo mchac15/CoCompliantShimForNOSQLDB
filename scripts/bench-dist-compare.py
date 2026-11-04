@@ -53,7 +53,7 @@ def main(argv):
             for _, pts in sweeps:
                 a, b = pts.get((s, "speculative", t)), pts.get((s, "nonspeculative", t))
                 if a and b:
-                    cells.append(f"{a['tps']:.0f} / {b['tps']:.0f} ({100 * (a['tps'] / b['tps'] - 1):+.1f}%)")
+                    cells.append(f"{a['tps']:.0f} / {b['tps']:.0f} ({bench_peak.fmt_gain(a['tps'], b['tps'])})")
                 else:
                     cells.append(f"{a['tps']:.0f} / -" if a else (f"- / {b['tps']:.0f}" if b else "-"))
             lines.append(f"| {t} | " + " | ".join(cells) + " |")
@@ -86,7 +86,9 @@ def main(argv):
                     tps_ax.plot([p["threads"] for p in ps], [p["tps"] for p in ps], color=color, linestyle=style,
                                 marker=marker, linewidth=2, markersize=5, markeredgecolor=SURFACE,
                                 markeredgewidth=1.2, zorder=3)
-            ts = sorted(t for (sk, sy, t) in pts if sk == s and sy == "speculative" and (s, "nonspeculative", t) in pts)
+            # a gain is undefined where the non-speculative shim committed nothing
+            ts = sorted(t for (sk, sy, t) in pts if sk == s and sy == "speculative" and (s, "nonspeculative", t) in pts
+                        and pts[(s, "nonspeculative", t)]["tps"] > 0)
             gains = [100 * (pts[(s, "speculative", t)]["tps"] / pts[(s, "nonspeculative", t)]["tps"] - 1) for t in ts]
             gain_ax.plot(ts, gains, color=color, marker=marker, linewidth=2, markersize=5, markeredgecolor=SURFACE,
                          markeredgewidth=1.2, zorder=3)
