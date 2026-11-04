@@ -49,7 +49,7 @@ def main(out):
             flag = lambda p: " edge" if p["threads"] in edges else ""
             lines.append(f"| {db} | {s:g} | {a['tps']:.0f} ({a['threads']}{flag(a)}) | {a['tps_min']:.0f}-{a['tps_max']:.0f} "
                          f"| {b['tps']:.0f} ({b['threads']}{flag(b)}) | {b['tps_min']:.0f}-{b['tps_max']:.0f} "
-                         f"| {100 * (a['tps'] / b['tps'] - 1):+.1f}% |")
+                         f"| {bench_peak.fmt_gain(a['tps'], b['tps'])} |")
     text = "\n".join(lines) + "\n"
     (out / "peak-max.md").write_text(text)
     print(text)
@@ -63,8 +63,10 @@ def main(out):
                          "xtick.color": INK_MUTED, "ytick.color": INK_MUTED, "text.color": INK})
     fig, axes = plt.subplots(3, len(dbs), figsize=(7.2 * len(dbs), 10), squeeze=False, sharex=True,
                              gridspec_kw={"height_ratios": [3, 2, 1.6]}, facecolor=SURFACE)
-    gain_span = max(abs(100 * (pk[(db, s, "speculative")]["tps"] / pk[(db, s, "nonspeculative")]["tps"] - 1))
-                    for db in dbs for s in skews if (db, s, "speculative") in pk and (db, s, "nonspeculative") in pk)
+    # a gain is undefined where the non-speculative shim committed nothing
+    gain_span = max([abs(100 * (pk[(db, s, "speculative")]["tps"] / pk[(db, s, "nonspeculative")]["tps"] - 1))
+                     for db in dbs for s in skews if (db, s, "speculative") in pk and (db, s, "nonspeculative") in pk
+                     and pk[(db, s, "nonspeculative")]["tps"] > 0], default=1) or 1
     for j, db in enumerate(dbs):
         tps_ax, gain_ax, thr_ax = axes[0][j], axes[1][j], axes[2][j]
         for ax in (tps_ax, gain_ax, thr_ax):
@@ -87,7 +89,8 @@ def main(out):
                 edge = p["threads"] in edges
                 thr_ax.plot([s + off], [p["threads"]], marker=marker, markersize=7, linestyle="none",
                             color=SURFACE if edge else color, markeredgecolor=color, markeredgewidth=1.5, zorder=3)
-        gs = [s for s in skews if (db, s, "speculative") in pk and (db, s, "nonspeculative") in pk]
+        gs = [s for s in skews if (db, s, "speculative") in pk and (db, s, "nonspeculative") in pk
+              and pk[(db, s, "nonspeculative")]["tps"] > 0]
         gains = [100 * (pk[(db, s, "speculative")]["tps"] / pk[(db, s, "nonspeculative")]["tps"] - 1) for s in gs]
         gain_ax.bar(gs, gains, width=0.0065, color=[GAIN_COLORS[g < 0] for g in gains], edgecolor=SURFACE,
                     linewidth=1, zorder=3)

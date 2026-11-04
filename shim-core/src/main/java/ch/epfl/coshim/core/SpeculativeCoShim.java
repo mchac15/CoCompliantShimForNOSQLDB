@@ -16,6 +16,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * The speculative CO-compliant shim of pseudo.txt (S2PL + speculation at {@code executed}). The
@@ -49,6 +51,10 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
   /** Hands out txn ages at start(): a later start() is younger. */
   private final AtomicLong timestampGenerator = new AtomicLong();
+  /** Ages from the global transaction id (see {@link #globalAge}), for prepare()'s wait-die. */
+  private final boolean globalAges;
+  /** A Seata branch's txn id, formatId:ip:port:transactionId:branchId: the transaction id. */
+  private static final Pattern SEATA_TRANSACTION_ID = Pattern.compile(":(\\d+):[^:]*$");
 
   public SpeculativeCoShim(KvStore<K, V> store, Duration lockTimeout) {
     this(store, lockTimeout, DEFAULT_TOMBSTONE_TTL);
@@ -81,13 +87,32 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       Duration tombstoneTtl,
       boolean speculative,
       DeadlockPolicy deadlockPolicy) {
+    this(store, lockTimeout, tombstoneTtl, speculative, deadlockPolicy, false);
+  }
+
+  /**
+   * @param prepareWaitDie prepare() votes NO instead of waiting for a younger txn, so that two shims
+   *     ordering the same two txns oppositely cannot deadlock in prepare() (see {@link
+   *     LocksMap#awaitPredecessorsCommitted}). The ages then come from the global transaction id,
+   *     the same on every shim (lock()'s deadlock prevention uses them too); a retry is a new
+   *     global transaction, hence younger
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      boolean prepareWaitDie) {
+    this.globalAges = prepareWaitDie;
     // a wound-wait victim is already must_abort: abort_transaction releases its locks, on the
     // wounder's thread, outside any latch
     this.locksMap =
         new LocksMap<>(
             speculative,
             Objects.requireNonNull(deadlockPolicy),
-            victim -> abortTransaction(victim, AbortCause.WOUNDED));
+            victim -> abortTransaction(victim, AbortCause.WOUNDED),
+            prepareWaitDie);
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
     this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);
@@ -118,10 +143,29 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     gcThread.start();
   }
 
+  /**
+   * A txn's age (smaller = older): with globalAges, the transaction id of a Seata branch's txn id,
+   * which the TC hands out at begin in increasing order and which every branch of the global
+   * transaction carries, so every shim agrees on it; else (or for a txn id of another form) the
+   * order of start() on this shim.
+   */
+  long globalAge(String txnId) {
+    if (globalAges) {
+      Matcher m = SEATA_TRANSACTION_ID.matcher(txnId);
+      if (m.find()) {
+        try {
+          return Long.parseLong(m.group(1));
+        } catch (NumberFormatException e) {
+          // longer than a long: not a Seata transaction id
+        }
+      }
+    }
+    return timestampGenerator.incrementAndGet();
+  }
+
   @Override
   public Outcome start(String txnId) {
-    Transaction<K, V> txn =
-        new Transaction<>(txnId, Status.STARTED, null, timestampGenerator.incrementAndGet());
+    Transaction<K, V> txn = new Transaction<>(txnId, Status.STARTED, null, globalAge(txnId));
     if (transactionsMap.putIfAbsent(txnId, txn) != null) {
       return Outcome.FAILED; // already registered or tombstone
     }
@@ -209,9 +253,11 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       return Vote.NO;
     }
     long waitStart = System.nanoTime();
-    if (!locksMap.awaitPredecessorsResolved(txn)) {
+    LocksMap.PrepareWait waitResult = locksMap.awaitPredecessorsCommitted(txn);
+    if (waitResult != LocksMap.PrepareWait.READY) {
       txn.setPrepareWaitNanos(System.nanoTime() - waitStart);
-      abortTransaction(txn, AbortCause.CASCADE); // doomed while waiting; a no-op if already aborted
+      // DIE: would have waited for a younger txn; else doomed while waiting (a no-op if already aborted)
+      abortTransaction(txn, waitResult == LocksMap.PrepareWait.DIE ? AbortCause.PREPARE_WAIT_DIE : AbortCause.CASCADE);
       return Vote.NO;
     }
     if (!PREPARABLE.contains(txn.compareAndSwapStatus(PREPARABLE, Status.PREPARED))) {

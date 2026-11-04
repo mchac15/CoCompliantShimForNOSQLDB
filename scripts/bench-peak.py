@@ -75,6 +75,11 @@ WORKLOAD = ["--ops-mean", "3", "--think-mean-us", "2000", "--think-sd-us", "1000
 SECONDS_PER_RUN_OVERHEAD = 50   # node start, drain, audit, JVM: about 90 s per run in all on diascld21
 
 
+def fmt_gain(spec_tps, nonspec_tps):
+    """The speculative vs non-speculative gain, or "-" when the baseline committed nothing (gain undefined)."""
+    return f"{100 * (spec_tps / nonspec_tps - 1):+.1f}%" if nonspec_tps > 0 else "-"
+
+
 def variant(db, system):
     return f"{system}-{db}@wound-wait"
 
@@ -117,7 +122,7 @@ def measure(args, out, db, skew, system, threads):
         print(f"=== {db} skew {skew:g} {system}: {threads} threads x {args.reps}", flush=True)
         env = dict(os.environ, CSV=str(d / f"t{threads}.csv"), VARIANTS=variant(db, system),
                    LOCK_TIMEOUT_MS=str(args.lock_timeout_ms), SHIMS="2",
-                   STATS_INTERVAL_S=str(args.stats_interval_s), GC_LOGS="1")
+                   STATS_INTERVAL_S=str(args.stats_interval_s), GC_LOGS="1", PREPARE_DEADLOCK=args.prepare_deadlock)
         cmd = [str(ROOT / "scripts" / "bench-compare.sh"), "--reps", str(args.reps), "--tc", args.tc,
                "--threads", str(threads),
                "--skew", f"{skew:g}", "--warmup-s", f"{args.warmup_s:g}", "--measure-s", f"{args.measure_s:g}",
@@ -264,7 +269,8 @@ def run(args):
             f"{args.txn_timeout_ms} {' '.join(WORKLOAD)} --sample-ms {args.sample_ms} "
             f"{' '.join(args.microbench)}\n"
             f"timeouts:  lock waits {args.lock_timeout_ms} ms (nodes and servers), TC {args.txn_timeout_ms} ms; "
-            f"node stats every {args.stats_interval_s} s\n")
+            f"node stats every {args.stats_interval_s} s\n"
+            f"prepare:   cross-shim deadlock prevention {args.prepare_deadlock}\n")
     print(setup.read_text())
 
     started = start_servers(args)
@@ -446,7 +452,7 @@ def summarize(out):
             continue
         lines.append(
             f"| {db} | {skew:g} | {s['tps']:.1f} ({s['threads']}) | {n['tps']:.1f} ({n['threads']}) "
-            f"| {100 * (s['tps'] / n['tps'] - 1):+.1f}% | {100 * s['abort_rate']:.1f}% / {100 * n['abort_rate']:.1f}% "
+            f"| {fmt_gain(s['tps'], n['tps'])} | {100 * s['abort_rate']:.1f}% / {100 * n['abort_rate']:.1f}% "
             f"| {s['op_p99_us']} / {n['op_p99_us']} | {s['saved_net_us']} | {s['cascade_lost_us']} "
             f"| {s['cascades_per_100']} | {s['wounded_per_100']} / {n['wounded_per_100']} |")
     both = sorted({(p["db"], p["skew"], p["threads"]) for p in points if p["active_us"] != ""})
@@ -465,7 +471,7 @@ def summarize(out):
             for system, p in (("spec", s), ("non-spec", n)):
                 if not p or p["active_us"] == "":
                     continue
-                gain = f"{100 * (s['tps'] / n['tps'] - 1):+.1f}%" if s and n and system == "spec" else ""
+                gain = fmt_gain(s['tps'], n['tps']) if s and n and system == "spec" else ""
                 thread = f"{p['thread_us'] / 1000:.1f}" if p["thread_us"] != "" else ""
                 lines.append(f"| {db} | {skew:g} | {t} | {system} | {p['tps']:.0f} | {gain} | {thread} | "
                              + " | ".join(f"{p[k] / 1000:.1f}" for k, _ in BUDGET) + " |")
@@ -790,6 +796,8 @@ def main():
     p.add_argument("--sample-ms", type=int, default=1000)
     p.add_argument("--stats-interval-s", type=int, default=1)
     p.add_argument("--tc", default="127.0.0.1:8091")
+    p.add_argument("--prepare-deadlock", default="none", choices=["none", "wait-die"],
+                   help="the nodes' cross-shim deadlock prevention in prepare()")
     p.add_argument("--reuse-dbs", action="store_true", help="use servers already running, whatever their timeouts")
     p.add_argument("--keep-dbs", action="store_true", help="leave the servers running at the end")
     args = p.parse_args(argv)
