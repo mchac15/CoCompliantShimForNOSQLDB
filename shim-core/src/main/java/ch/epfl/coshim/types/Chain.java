@@ -25,6 +25,12 @@ class Chain<K, V> {
   private static final Set<Status> MARKABLE = EnumSet.of(Status.STARTED, Status.EXECUTED);
   /** Holders already on their way out of the chain: they never stop a wound from unblocking. */
   private static final Set<Status> LEAVING = EnumSet.of(Status.MUST_ABORT, Status.ABORTED);
+  /**
+   * The predecessor holders prepare()'s wait-die never dies for: committed (the wait is over), committing
+   * (decided, it commits without waiting for anyone), or leaving (it is released without waiting).
+   */
+  private static final Set<Status> PREPARE_NO_CYCLE =
+      EnumSet.of(Status.COMMITTED, Status.COMMITTING, Status.MUST_ABORT, Status.ABORTED);
 
   static enum UpgradeResult {
     /** txn is no longer started, or read-modify-write against read-modify-write: txn aborts. */
@@ -189,7 +195,37 @@ class Chain<K, V> {
    * Returns READY or DOOMED (TIMED_OUT only if the thread is interrupted).
    */
   synchronized WaitResult awaitResolved(Transaction<K, V> txn, Set<Status> ready) {
-    return awaitPredecessor(txn, ready, false, 0, null, null);
+    return awaitResolved(txn, ready, false);
+  }
+
+  /**
+   * prepare()'s wait, with wait-die if {@code waitDie}: DIE as soon as a predecessor holder txn would
+   * wait for is younger than txn (it may be executed or prepared, which nobody can wound, and its
+   * commit may wait for txn's vote on another shim: the cross-shim cycle). Every wait of prepare()
+   * then goes from a younger txn to an older one, on every shim alike since the ages are global, so
+   * no cycle of prepare waits can form. Holders that commit or leave without waiting for anyone
+   * (PREPARE_NO_CYCLE) are waited for. Re-checked on every wake-up: the predecessor changes as nodes
+   * are spliced out, but nothing is ever put in front of a txn in prepare.
+   */
+  synchronized WaitResult awaitResolved(Transaction<K, V> txn, Set<Status> ready, boolean waitDie) {
+    while (true) {
+      if (txn.isDoomed()) {
+        return WaitResult.DOOMED;
+      }
+      LockNode<K, V> pred = txn.getLock(key).node().getPrev();
+      if (pred == null || pred.allHoldersIn(ready)) {
+        return WaitResult.READY;
+      }
+      if (waitDie && pred.hasYoungerHolderNotIn(txn, PREPARE_NO_CYCLE)) {
+        return WaitResult.DIE;
+      }
+      try {
+        wait();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return WaitResult.TIMED_OUT;
+      }
+    }
   }
 
   private WaitResult awaitPredecessor(

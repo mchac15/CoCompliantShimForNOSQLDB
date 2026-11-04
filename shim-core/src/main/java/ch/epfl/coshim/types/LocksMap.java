@@ -89,6 +89,18 @@ public class LocksMap<K, V> {
   private final DeadlockPolicy deadlockPolicy;
   /** abort_transaction of a wound-wait victim (already must_abort), run outside any latch. */
   private final Consumer<Transaction<K, V>> woundHandler;
+  /** prepare() dies instead of waiting for a younger txn (cross-shim deadlock prevention). */
+  private final boolean prepareWaitDie;
+
+  /** Outcome of prepare()'s wait for the predecessors to commit. */
+  public static enum PrepareWait {
+    /** Every predecessor committed: txn may vote YES. */
+    READY,
+    /** txn was aborted or doomed meanwhile (or its locks are gone): vote NO. */
+    MUST_ABORT,
+    /** Wait-die: txn would have waited for a younger txn: vote NO. */
+    DIE
+  }
 
   /** The speculative lock table of pseudo.txt. */
   public LocksMap() {
@@ -111,6 +123,19 @@ public class LocksMap<K, V> {
    */
   public LocksMap(
       boolean speculative, DeadlockPolicy deadlockPolicy, Consumer<Transaction<K, V>> woundHandler) {
+    this(speculative, deadlockPolicy, woundHandler, false);
+  }
+
+  /**
+   * @param prepareWaitDie prepare() votes NO instead of waiting for a younger txn (see {@link
+   *     #awaitPredecessorsCommitted}); needs ages that are the same on every shim
+   */
+  public LocksMap(
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      Consumer<Transaction<K, V>> woundHandler,
+      boolean prepareWaitDie) {
+    this.prepareWaitDie = prepareWaitDie;
     this.speculative = speculative;
     this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
     this.deadlockPolicy = deadlockPolicy;
@@ -164,14 +189,35 @@ public class LocksMap<K, V> {
    * @return true if every predecessor resolved, false if txn got aborted / doomed meanwhile
    */
   public boolean awaitPredecessorsResolved(Transaction<K, V> txn) {
+    return awaitPredecessorsCommitted(txn) == PrepareWait.READY;
+  }
+
+  /**
+   * prepare()'s wait, key by key, until every predecessor holder committed. With prepareWaitDie,
+   * DIE instead of waiting for a younger txn: with speculation, two shims can order the same two
+   * txns oppositely (when their branches run at the same time), and each one's prepare then waits
+   * for the other's commit, which needs the other's vote: a cycle nothing else breaks. Waits that
+   * only go from younger to older txns, by ages every shim agrees on, cannot form one.
+   */
+  public PrepareWait awaitPredecessorsCommitted(Transaction<K, V> txn) {
     for (K key : txn.frozenLocks().keySet()) {
       Chain<K, V> chain = locksMap.get(key);
       // no chain: txn's locks were released by a foreign abort_transaction, as in lock()
-      if (chain == null || chain.awaitResolved(txn, RESOLVED) != Chain.WaitResult.READY) {
-        return false;
+      if (chain == null) {
+        return PrepareWait.MUST_ABORT;
+      }
+      switch (chain.awaitResolved(txn, RESOLVED, prepareWaitDie)) {
+        case READY -> {
+        }
+        case DIE -> {
+          return PrepareWait.DIE;
+        }
+        default -> {
+          return PrepareWait.MUST_ABORT;
+        }
       }
     }
-    return true;
+    return PrepareWait.READY;
   }
 
   /**

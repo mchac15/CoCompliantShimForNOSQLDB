@@ -117,7 +117,7 @@ def measure(args, out, db, skew, system, threads):
         print(f"=== {db} skew {skew:g} {system}: {threads} threads x {args.reps}", flush=True)
         env = dict(os.environ, CSV=str(d / f"t{threads}.csv"), VARIANTS=variant(db, system),
                    LOCK_TIMEOUT_MS=str(args.lock_timeout_ms), SHIMS="2",
-                   STATS_INTERVAL_S=str(args.stats_interval_s), GC_LOGS="1")
+                   STATS_INTERVAL_S=str(args.stats_interval_s), GC_LOGS="1", PREPARE_DEADLOCK=args.prepare_deadlock)
         cmd = [str(ROOT / "scripts" / "bench-compare.sh"), "--reps", str(args.reps), "--tc", args.tc,
                "--threads", str(threads),
                "--skew", f"{skew:g}", "--warmup-s", f"{args.warmup_s:g}", "--measure-s", f"{args.measure_s:g}",
@@ -264,7 +264,8 @@ def run(args):
             f"{args.txn_timeout_ms} {' '.join(WORKLOAD)} --sample-ms {args.sample_ms} "
             f"{' '.join(args.microbench)}\n"
             f"timeouts:  lock waits {args.lock_timeout_ms} ms (nodes and servers), TC {args.txn_timeout_ms} ms; "
-            f"node stats every {args.stats_interval_s} s\n")
+            f"node stats every {args.stats_interval_s} s\n"
+            f"prepare:   cross-shim deadlock prevention {args.prepare_deadlock}\n")
     print(setup.read_text())
 
     started = start_servers(args)
@@ -790,6 +791,8 @@ def main():
     p.add_argument("--sample-ms", type=int, default=1000)
     p.add_argument("--stats-interval-s", type=int, default=1)
     p.add_argument("--tc", default="127.0.0.1:8091")
+    p.add_argument("--prepare-deadlock", default="none", choices=["none", "wait-die"],
+                   help="the nodes' cross-shim deadlock prevention in prepare()")
     p.add_argument("--reuse-dbs", action="store_true", help="use servers already running, whatever their timeouts")
     p.add_argument("--keep-dbs", action="store_true", help="leave the servers running at the end")
     args = p.parse_args(argv)

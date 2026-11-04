@@ -28,7 +28,9 @@ public final class ShimStats {
     /** prepare() on a txn that was not executed (end never succeeded). */
     PREPARE_NO,
     /** abort() from the 2PC coordinator on a live txn (e.g. another branch failed). */
-    COORDINATOR
+    COORDINATOR,
+    /** prepare() would have waited for a younger txn: voted NO (cross-shim deadlock prevention). */
+    PREPARE_WAIT_DIE
   }
 
   /**
