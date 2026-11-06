@@ -378,6 +378,14 @@ run reports the realized share in the `hot_share` column. Larger tables (`--tabl
 cheap to set up: the shim's SQL store and Sonata's tables are reset in place, and the audit reads only
 the keys the run wrote.
 
+### Op-order randomness
+
+`--randomness r` (default 1) sets the order a branch issues its operations in, its keys unchanged: the
+first round((1 - r) x ops) of them, a random subset of its keys, go in ascending key order, the rest after
+them in a random order. r = 0: every branch locks its keys in ascending order; r = 1: a fully random order.
+Recorded in the `randomness` column. `scripts/bench-randomness-compare.py OUT.png R=DIR ...` compares the
+peaks of one `bench-peak.py` sweep per value of r.
+
 ### Peak throughput and time budget
 
 `scripts/bench-peak.py` searches, for each server kind, skew and shim (speculative, non-speculative;

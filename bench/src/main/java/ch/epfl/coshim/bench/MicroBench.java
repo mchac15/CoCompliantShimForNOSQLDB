@@ -12,6 +12,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -383,6 +384,9 @@ public final class MicroBench implements AutoCloseable {
             reads.forEach(k -> ops.add(new Op(k, false)));
             writes.forEach(k -> ops.add(new Op(k, true)));
             Collections.shuffle(ops, random);
+            // --randomness: the first part of the shuffled ops (a random subset of the keys) in ascending key order
+            int ordered = (int) Math.round((1 - config.randomness()) * ops.size());
+            ops.subList(0, ordered).sort(Comparator.comparingInt(Op::key));
             plan.add(new Branch(random.nextInt(shims), table(b), reads, writes, List.copyOf(ops)));
         }
         return plan;
