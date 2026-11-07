@@ -80,8 +80,12 @@ def fmt_gain(spec_tps, nonspec_tps):
     return f"{100 * (spec_tps / nonspec_tps - 1):+.1f}%" if nonspec_tps > 0 else "-"
 
 
+# the shims' deadlock prevention in lock() (CoShimNode --deadlock); --deadlock sets it
+DEADLOCK = "wound-wait"
+
+
 def variant(db, system):
-    return f"{system}-{db}@wound-wait"
+    return f"{system}-{db}@{DEADLOCK}"
 
 
 def config_dir(out, db, skew, system):
@@ -262,7 +266,7 @@ def run(args):
         setup.write_text(
             f"date:      {datetime.now():%Y-%m-%d %H:%M}   commit: {commit}\n"
             f"configs:   dbs {' '.join(args.dbs)}, skews {' '.join(f'{s:g}' for s in args.skews)}, "
-            f"systems {' '.join(args.systems)} (wound-wait)\n"
+            f"systems {' '.join(args.systems)} ({args.deadlock})\n"
             f"search:    seeds {' '.join(map(str, args.seeds))}, threads in [{args.min_threads}, "
             f"{args.max_threads}], tol {args.tol:g}, {args.reps} reps per point\n"
             f"runs:      --warmup-s {args.warmup_s:g} --measure-s {args.measure_s:g} --txn-timeout-ms "
@@ -311,7 +315,8 @@ def node_counters(nodes_dir, var):
     up to 2/3 of the final commits at skew 0.99.
     """
     total = {}
-    for log in glob.glob(str(nodes_dir / f"rep*-{var}-s*.log")):
+    # any deadlock policy: a sweep's folder holds one, and summarize does not know which
+    for log in glob.glob(str(nodes_dir / f"rep*-{var.split('@')[0]}@*-s*.log")):
         stats, spec = [], []
         for line in open(log, errors="replace"):
             if line.startswith("stats"):
@@ -423,7 +428,7 @@ def summarize(out):
         w.writeheader()
         w.writerows(rows)
 
-    lines = ["# Peak throughput: speculative vs non-speculative shim (wound-wait)", ""]
+    lines = ["# Peak throughput: speculative vs non-speculative shim", ""]
     setup = out / "setup.txt"
     if setup.exists():
         lines += ["    " + l for l in setup.read_text().splitlines()] + [""]
@@ -735,7 +740,7 @@ def stalls(out):
                 if float(r["tps"]) >= 0.6 * med:
                     continue
                 if pauses is None:   # parsed once per run, only for the runs with a dip
-                    pauses = {re.sub(r"^.*@wound-wait-|\.gc$", "", p): jvm_pauses(p)
+                    pauses = {re.sub(r"^.*@[a-z-]+?-(?=s\d|client)|\.gc$", "", p): jvm_pauses(p)
                               for p in glob.glob(str(nodes / f"{label}-*.gc"))}
                 end = int(r["wall_ms"]) / 1000
                 start = end - int(r["interval_ms"]) / 1000
@@ -796,12 +801,17 @@ def main():
     p.add_argument("--sample-ms", type=int, default=1000)
     p.add_argument("--stats-interval-s", type=int, default=1)
     p.add_argument("--tc", default="127.0.0.1:8091")
+    p.add_argument("--deadlock", default="wound-wait", choices=["wound-wait", "wait-die", "none"],
+                   help="the shims' deadlock prevention in lock(); none only for workloads that cannot deadlock "
+                        "(e.g. -- --randomness 0 with sequential branches)")
     p.add_argument("--prepare-deadlock", default="none", choices=["none", "wait-die"],
                    help="the nodes' cross-shim deadlock prevention in prepare()")
     p.add_argument("--reuse-dbs", action="store_true", help="use servers already running, whatever their timeouts")
     p.add_argument("--keep-dbs", action="store_true", help="leave the servers running at the end")
     args = p.parse_args(argv)
     args.microbench = microbench
+    global DEADLOCK
+    DEADLOCK = args.deadlock
     run(args)
 
 

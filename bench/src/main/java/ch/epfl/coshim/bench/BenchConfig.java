@@ -50,11 +50,15 @@ import java.util.concurrent.ThreadLocalRandom;
  * @param thinkSdUs        standard deviation of that pause (µs)
  * @param sampleMs         > 0: every that many ms, the commits and aborts of the whole run (warm-up and drain
  *                         included) are sampled into {@code timeseries-<csv name>}; 0: no samples
+ * @param randomness       share of a branch's operations issued in a random order, in [0, 1]: the first
+ *                         round((1 - randomness) x ops) of them (a random subset of its keys) go in ascending
+ *                         key order, the rest after them in a random order. 1 (default): every op in a random
+ *                         order; 0: the whole branch locks its keys in ascending order. The keys are the same
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
         boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
-        double thinkSdUs, int sampleMs, KeyDist dist) {
+        double thinkSdUs, int sampleMs, KeyDist dist, double randomness) {
 
     /** How the keys of a branch are drawn; see {@code dist}. */
     public enum KeyDist {
@@ -78,7 +82,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT);
+                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0);
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -145,6 +149,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         require(opsMean <= 0 || (opsSd > 0 && opsMax >= 1), "--ops-sd must be > 0 and --ops-max >= 1");
         require(thinkMeanUs <= 0 || thinkSdUs >= 0, "--think-sd-us must be >= 0");
         require(sampleMs >= 0, "--sample-ms must be >= 0");
+        require(randomness >= 0 && randomness <= 1, "--randomness must be in [0, 1]");
         // a txn's keys are distinct: the ranges must hold the most a txn can draw from each of them
         long hotPerBranch = dist == KeyDist.ACTA
                 ? (long) Math.ceil(maxReads() * skewness) + (long) Math.ceil(maxWrites() * skewness)
@@ -187,6 +192,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         double thinkSdUs = c.thinkSdUs;
         int sampleMs = c.sampleMs;
         KeyDist dist = c.dist;
+        double randomness = c.randomness;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -221,12 +227,13 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--think-sd-us" -> thinkSdUs = Double.parseDouble(v);
                 case "--sample-ms" -> sampleMs = Integer.parseInt(v);
                 case "--dist" -> dist = KeyDist.parse(v);
+                case "--randomness" -> randomness = Double.parseDouble(v);
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
                 measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs,
-                dist)
+                dist, randomness)
                 .validate();
     }
 
