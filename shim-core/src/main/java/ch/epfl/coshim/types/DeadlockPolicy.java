@@ -15,9 +15,9 @@ public enum DeadlockPolicy {
   WOUND_WAIT,
   /**
    * No deadlock prevention: lock()/upgrade() just wait, bounded by lock_timeout. Only for workloads that
-   * cannot deadlock, e.g. every txn taking its locks in one global order (MicroBench --randomness 0 with
-   * sequential branches): there wound-wait and wait-die abort txns for cycles that never form. With any
-   * other workload a deadlock lasts until lock_timeout.
+   * cannot deadlock, e.g. every txn taking its locks in one global order: there wound-wait and
+   * wait-die abort txns for cycles that never form. With any other workload a deadlock lasts until
+   * lock_timeout.
    */
   NONE
 }

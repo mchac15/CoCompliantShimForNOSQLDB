@@ -167,7 +167,8 @@ public class LocksMap<K, V> {
     for (K key : txn.frozenLocks().keySet()) {
       Chain<K, V> chain = locksMap.get(key);
       // no chain: txn's locks were released by a foreign abort_transaction, as in lock()
-      if (chain == null || chain.awaitResolved(txn, RESOLVED) != Chain.WaitResult.READY) {
+      if (chain == null
+          || chain.awaitPredecessor(txn, RESOLVED, false, 0, deadlockPolicy, null) != Chain.WaitResult.READY) {
         return false;
       }
     }
@@ -202,7 +203,6 @@ public class LocksMap<K, V> {
           e.getKey(),
           (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished) ? null : c);
     }
-    txn.setCascadeFanout(marked.size());
     for (Transaction<K, V> t : marked) {
       statusChanged(t);
     }
@@ -250,7 +250,7 @@ public class LocksMap<K, V> {
   private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline) {
     while (true) {
       List<Transaction<K, V>> victims = new ArrayList<>();
-      switch (chain.awaitLockReady(txn, lockReady, deadline, deadlockPolicy, victims)) {
+      switch (chain.awaitPredecessor(txn, lockReady, true, deadline, deadlockPolicy, victims)) {
         case READY -> {
           return LockResult.ACQUIRED;
         }

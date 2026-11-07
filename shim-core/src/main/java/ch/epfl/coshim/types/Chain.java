@@ -2,7 +2,6 @@ package ch.epfl.coshim.types;
 
 import ch.epfl.coshim.types.LockType.LockMode;
 import ch.epfl.coshim.types.Transaction.Status;
-import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
@@ -16,10 +15,9 @@ import java.util.concurrent.TimeUnit;
  * <p>Latching: {@link LocksMap} calls the methods that modify the chain ({@link #acquire}, {@link
  * #upgrade}, {@link #release}, {@link #abortAndRelease}) only inside {@code locksMap.compute(key,
  * ...)}, so they run under the key's map entry, and each of them is also {@code synchronized} on the
- * chain. Readers ({@link #awaitLockReady}, {@link #awaitResolved}, {@link #read}) only take the
- * chain's monitor, which is enough to see a consistent chain, and waiters {@code wait()} on it:
- * every change that can satisfy a wait predicate ends with {@code notifyAll()}. Lock order: map
- * entry, then chain, then txn.
+ * chain. Readers ({@link #awaitPredecessor}, {@link #read}) only take the chain's monitor, which is
+ * enough to see a consistent chain, and waiters {@code wait()} on it: every change that can satisfy
+ * a wait predicate ends with {@code notifyAll()}. Lock order: map entry, then chain, then txn.
  */
 class Chain<K, V> {
   private static final Set<Status> MARKABLE = EnumSet.of(Status.STARTED, Status.EXECUTED);
@@ -144,14 +142,16 @@ class Chain<K, V> {
   }
 
   /**
-   * The wait loop of lock()/upgrade() (ready = at least executed): waits, at most until {@code
-   * deadlineNanos}, until every holder of the predecessor of txn's node on this key is in {@code
-   * ready}. The predecessor is re-read on every wake-up, since it is spliced out or replaced while
-   * waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn waits until it is
-   * spliced out (the cascade marks the dependents before that).
+   * The wait loop of lock()/upgrade() (ready = at least executed, bounded) and of prepare() (ready =
+   * committed, unbounded): waits until every holder of the predecessor of txn's node on this key is
+   * in {@code ready}. The predecessor is re-read on every wake-up, since it is spliced out or
+   * replaced while waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn
+   * waits until it is spliced out (the cascade marks the dependents before that).
    *
-   * <p>Deadlock prevention, so that every wait-for edge goes from a younger txn to an older one and
-   * no cycle can form. Chains are FIFO, so the common case (younger behind older) just waits.
+   * <p>Deadlock prevention, in the bounded (execution phase) wait only, so that every wait-for edge
+   * goes from a younger txn to an older one and no cycle can form. Chains are FIFO, so the common
+   * case (younger behind older) just waits. prepare() is unbounded and never dies nor wounds: its
+   * waits are left to the coordinator.
    *
    * <ul>
    *   <li>wait-die: a txn that would wait for a younger one returns DIE instead.
@@ -169,30 +169,13 @@ class Chain<K, V> {
    *       ones may execute meanwhile and then need not die. Still no cycle: txn only stays blocked
    *       on older txns or on txns past started (which wait on no lock), and as soon as those are
    *       gone it wounds the younger ones it would otherwise wait for.
+   *   <li>none: just wait, until the deadline.
    * </ul>
    *
-   * @param deadlineNanos a {@link System#nanoTime()} deadline
+   * @param deadlineNanos a {@link System#nanoTime()} deadline, used only if {@code bounded}
    * @param victims receives the txns marked on WOUND (only with WOUND_WAIT)
    */
-  synchronized WaitResult awaitLockReady(
-      Transaction<K, V> txn,
-      Set<Status> ready,
-      long deadlineNanos,
-      DeadlockPolicy policy,
-      List<Transaction<K, V>> victims) {
-    return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
-  }
-
-  /**
-   * The wait loop of prepare() (ready = committed): as {@link #awaitLockReady}, but unbounded and
-   * with no deadlock prevention (it never dies nor wounds): its waits are left to the coordinator.
-   * Returns READY or DOOMED (TIMED_OUT only if the thread is interrupted).
-   */
-  synchronized WaitResult awaitResolved(Transaction<K, V> txn, Set<Status> ready) {
-    return awaitPredecessor(txn, ready, false, 0, null, null);
-  }
-
-  private WaitResult awaitPredecessor(
+  synchronized WaitResult awaitPredecessor(
       Transaction<K, V> txn,
       Set<Status> ready,
       boolean bounded,
@@ -205,9 +188,6 @@ class Chain<K, V> {
       }
       LockNode<K, V> pred = txn.getLock(key).node().getPrev();
       if (pred == null || pred.allHoldersIn(ready)) {
-        if (bounded) {
-          recordGrant(txn, pred);
-        }
         return WaitResult.READY;
       }
       if (bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, ready)) {
@@ -265,23 +245,6 @@ class Chain<K, V> {
       }
     }
     return !victims.isEmpty();
-  }
-
-  /** Statistics only: the uncommitted txns ahead of txn's node, and on how many nodes. */
-  private void recordGrant(Transaction<K, V> txn, LockNode<K, V> pred) {
-    int depth = 0;
-    List<Transaction<K, V>> pending = new ArrayList<>();
-    for (LockNode<K, V> n = pred; n != null; n = n.getPrev()) {
-      boolean any = false;
-      for (Transaction<K, V> t : n.getHolders()) {
-        if (t.getStatus() != Status.COMMITTED) {
-          pending.add(t);
-          any = true;
-        }
-      }
-      depth += any ? 1 : 0;
-    }
-    txn.recordGrant(depth, pending);
   }
 
   /**

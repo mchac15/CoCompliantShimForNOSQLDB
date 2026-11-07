@@ -148,18 +148,10 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     return Outcome.SUCCEEDED;
   }
 
-  /** lock(), its duration added to txn's time budget (statistics only). */
-  private LockResult timedLock(K key, Transaction<K, V> txn, LockType.LockMode mode) {
-    long t0 = System.nanoTime();
-    LockResult res = locksMap.lock(key, txn, mode, lockTimeout);
-    txn.addLockWaitNanos(System.nanoTime() - t0);
-    return res;
-  }
-
   @Override
   public V get(String txnId, K key) {
     Transaction<K, V> txn = running(txnId);
-    LockResult res = timedLock(key, txn, LockType.LockMode.SHARED);
+    LockResult res = locksMap.lock(key, txn, LockType.LockMode.SHARED, lockTimeout);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("get: lock failed, must abort");
@@ -187,7 +179,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   public void put(String txnId, K key, V value) {
     Objects.requireNonNull(value, "values are non-null");
     Transaction<K, V> txn = running(txnId);
-    LockResult res = timedLock(key, txn, LockType.LockMode.EXCLUSIVE);
+    LockResult res = locksMap.lock(key, txn, LockType.LockMode.EXCLUSIVE, lockTimeout);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("put: lock failed, must abort");
@@ -208,9 +200,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       abortTransaction(txn, AbortCause.PREPARE_NO); // started, aborted (incl. tombstone) or must_abort
       return Vote.NO;
     }
-    long waitStart = System.nanoTime();
     if (!locksMap.awaitPredecessorsResolved(txn)) {
-      txn.setPrepareWaitNanos(System.nanoTime() - waitStart);
       abortTransaction(txn, AbortCause.CASCADE); // doomed while waiting; a no-op if already aborted
       return Vote.NO;
     }
@@ -218,14 +208,9 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       if (VOTED_YES.contains(txn.getStatus())) {
         return Vote.YES; // a concurrent duplicate prepare already voted YES
       }
-      txn.setPrepareWaitNanos(System.nanoTime() - waitStart);
       abortTransaction(txn, AbortCause.CASCADE); // a late cascade landed after the wait
       return Vote.NO;
     }
-    long waited = System.nanoTime() - waitStart;
-    txn.setPrepareWaitNanos(waited);
-    txn.setVotedAtNanos(System.nanoTime());
-    stats.prepared(waited);
     return Vote.YES;
   }
 
@@ -239,19 +224,11 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (!txn.compareAndSwapStatus(Status.PREPARED, Status.COMMITTING)) {
       return;
     }
-    // statistics only: every predecessor resolved (prepare passed); stamp this txn before any
-    // successor can see it committed
-    int grants = txn.speculativeGrants();
-    long saved = txn.savedNanos();
     store.storeAll(txn.getWriteSet());
-    txn.markResolved();
     locksMap.release(txn);
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
-    stats.committed(txn.maxDepth(), grants, saved, txn.prepareWaitNanos());
-    long now = System.nanoTime();
-    stats.committedBudget(now - txn.createdAtNanos(), txn.lockWaitNanos(), txn.prepareWaitNanos(),
-        now - txn.votedAtNanos());
+    stats.committed();
   }
 
   @Override
@@ -309,12 +286,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (!ABORTABLE.contains(before)) {
       return; // already aborted or committing/committed
     }
-    txn.markResolved();
+    stats.aborted(before == Status.MUST_ABORT ? doomedBy(txn) : cause);
     List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
-    AbortCause finalCause = before == Status.MUST_ABORT ? doomedBy(txn) : cause;
-    long lifetime = System.nanoTime() - txn.createdAtNanos();
-    stats.aborted(finalCause, txn.maxDepth(), txn.cascadeFanout(), lifetime);
-    stats.abortedBudget(finalCause, lifetime, txn.lockWaitNanos(), txn.prepareWaitNanos());
     transactionsMap.remove(txn.getTransactionId(), txn);
     for (Transaction<K, V> t : doomed) {
       abortTransaction(t, AbortCause.CASCADE);

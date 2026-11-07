@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.InMemoryKvStore;
@@ -91,125 +90,6 @@ class SpeculativeCoShimTest {
         assertEquals(1, shim.stats().aborts(AbortCause.CASCADE));
         assertEquals(2, shim.stats().aborts());
         assertEquals(0, shim.stats().commits());
-    }
-
-    @Test
-    void speculativeGrantIsCountedWithTheWaitItSaved() throws Exception {
-        shim.start("w");
-        shim.put("w", "x", "1");
-        shim.end("w");
-        shim.start("r");
-        shim.get("r", "x");   // granted on w, executed but not committed: depth 1
-        shim.end("r");
-        Thread.sleep(50);
-        assertEquals(Vote.YES, shim.prepare("w"));
-        shim.commit("w");
-        assertEquals(Vote.YES, shim.prepare("r"));
-        shim.commit("r");
-        assertEquals(1, shim.stats().commitsAtDepth(0), "w speculated on nothing");
-        assertEquals(1, shim.stats().commitsAtDepth(1));
-        assertTrue(shim.stats().savedUsAtDepth(1) >= 50_000, shim.stats().speculationSummary());
-        assertEquals(0, shim.stats().savedUsAtDepth(0));
-    }
-
-    @Test
-    void theNetSavingSubtractsTheWaitMovedToPrepare() throws Exception {
-        shim.start("w");
-        shim.put("w", "x", "1");
-        shim.end("w");
-        shim.start("r");
-        shim.get("r", "x");
-        shim.end("r");
-        // r has nothing left to do: its whole wait for w moves into prepare, nothing is saved
-        CompletableFuture<Vote> r = CompletableFuture.supplyAsync(() -> shim.prepare("r"));
-        Thread.sleep(50);
-        assertEquals(Vote.YES, shim.prepare("w"));
-        shim.commit("w");
-        assertEquals(Vote.YES, r.get(2, TimeUnit.SECONDS));
-        shim.commit("r");
-        assertTrue(shim.stats().savedUsAtDepth(1) >= 50_000, "gross: " + shim.stats().speculationSummary());
-        assertTrue(shim.stats().savedNetUs() < 20_000, "net: " + shim.stats().speculationSummary());
-    }
-
-    @Test
-    void theNetSavingIsTheGrossOneWhenPrepareDoesNotWait() throws Exception {
-        speculativeGrantIsCountedWithTheWaitItSaved();   // r prepares after w committed
-        assertTrue(shim.stats().savedNetUs() >= 50_000, shim.stats().speculationSummary());
-    }
-
-    @Test
-    void aCascadeAbortCountsTheWorkItLost() throws Exception {
-        shim.start("w");
-        shim.put("w", "x", "1");
-        shim.end("w");
-        shim.start("r");
-        shim.get("r", "x");
-        Thread.sleep(30);
-        shim.end("r");   // executed on w's value
-        shim.abort("w");   // r is doomed and, already executed, aborted at once
-        assertEquals(1, shim.stats().aborts(AbortCause.CASCADE));
-        assertTrue(shim.stats().cascadeLostUs() >= 30_000, shim.stats().speculationSummary());
-        assertTrue(shim.stats().speculationSummary().contains("cascade_lost_us_total="));
-    }
-
-    @Test
-    void theTimeBudgetSplitsACommittedBranch() throws Exception {
-        shim.start("w");
-        shim.put("w", "x", "1");
-        shim.end("w");
-        shim.start("r");
-        shim.get("r", "x");
-        shim.end("r");
-        CompletableFuture<Vote> r = CompletableFuture.supplyAsync(() -> shim.prepare("r"));   // waits for w
-        assertEquals(Vote.YES, shim.prepare("w"));
-        Thread.sleep(50);   // w voted YES, waiting for the global decision
-        shim.commit("w");
-        assertEquals(Vote.YES, r.get(2, TimeUnit.SECONDS));
-        shim.commit("r");
-        assertTrue(shim.stats().committedPostVoteUs() >= 50_000, shim.stats().speculationSummary());
-        assertTrue(shim.stats().committedPrepareWaitUs() >= 40_000, "r's wait: " + shim.stats().speculationSummary());
-        assertTrue(shim.stats().committedLifetimeUs() >= shim.stats().committedPostVoteUs());
-    }
-
-    @Test
-    void theTimeBudgetCountsLockWaitsWithoutSpeculation() throws Exception {
-        s2pl.start("w");
-        s2pl.put("w", "x", "1");
-        s2pl.end("w");
-        s2pl.start("r");
-        CompletableFuture<String> read = CompletableFuture.supplyAsync(() -> s2pl.get("r", "x"));   // blocks on w
-        Thread.sleep(50);
-        assertEquals(Vote.YES, s2pl.prepare("w"));
-        s2pl.commit("w");
-        assertEquals("1", read.get(2, TimeUnit.SECONDS));
-        s2pl.end("r");
-        assertEquals(Vote.YES, s2pl.prepare("r"));
-        s2pl.commit("r");
-        assertTrue(s2pl.stats().committedLockWaitUs() >= 40_000, s2pl.stats().speculationSummary());
-    }
-
-    @Test
-    void aWastedBranchCountsUnderItsAbortCause() throws Exception {
-        shim.start("t");
-        shim.put("t", "x", "1");
-        Thread.sleep(30);
-        shim.abort("t");
-        assertTrue(shim.stats().lostUs(AbortCause.COORDINATOR) >= 30_000, shim.stats().speculationSummary());
-        assertEquals(0, shim.stats().lostUs(AbortCause.CASCADE));
-        assertTrue(shim.stats().speculationSummary().contains("lost_coordinator_us_total="));
-    }
-
-    @Test
-    void cascadeFanoutIsCounted() {
-        shim.start("w");
-        shim.put("w", "x", "1");
-        shim.end("w");
-        shim.start("r1");
-        shim.get("r1", "x");
-        shim.start("r2");
-        shim.get("r2", "x");
-        shim.abort("w");
-        assertEquals(1, shim.stats().abortsWithFanout(2), shim.stats().speculationSummary());
     }
 
     // ---- non-speculative baseline: same shim, lock() waits for the predecessors to commit ----
