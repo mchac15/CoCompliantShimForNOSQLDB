@@ -32,6 +32,19 @@ public class Transaction<K, V> {
   private boolean reachedExecuted;
   /** Doomed by wound-wait ({@link #wound()}), not by a cascade: statistics only. */
   private boolean wounded;
+  /**
+   * Statistics only (a {@code ShimStats.AbortCause}; this package does not depend on core): why the
+   * txn aborted, and the cause of the abort at the root of its cascade tree (its own cause unless a
+   * cascade doomed it). The root is copied into every txn this one's abort marks, so a cascade victim
+   * knows what started its tree however deep it is.
+   */
+  private Enum<?> abortCause;
+  private Enum<?> rootCause;
+  /**
+   * Statistics only: the chain this txn is blocked on inside lock()/upgrade(), null otherwise. Set and
+   * read only under that chain's monitor: a cascade marking it there knows it has not read that key.
+   */
+  private Object waitingOn;
 
   /** A lock granted while the txns ahead on its chain were not all committed yet (speculation). */
   private record Grant(long atNanos, List<? extends Transaction<?, ?>> pending) {}
@@ -42,6 +55,7 @@ public class Transaction<K, V> {
   private final List<Grant> grants = new ArrayList<>();
   private int maxDepth;
   private int cascadeFanout;
+  private int waitingMarks;
   /** When this txn was created, in {@link System#nanoTime()}. */
   private final long createdAtNanos = System.nanoTime();
   /** How long prepare() waited for its predecessors to commit. */
@@ -177,6 +191,45 @@ public class Transaction<K, V> {
     return wounded;
   }
 
+  /**
+   * A cascade's mark: as {@link #compareAndSwapStatus(Set, Status)} to must_abort, and on success
+   * records {@code root} (the doomer's root cause) in the same step, so whoever later aborts this txn
+   * finds it.
+   */
+  synchronized Status markMustAbort(Set<Status> from, Enum<?> root) {
+    Status before = compareAndSwapStatus(from, Status.MUST_ABORT);
+    if (from.contains(before)) {
+      rootCause = root;
+    }
+    return before;
+  }
+
+  /** Statistics only: set by abort_transaction before it releases (and cascades). */
+  public synchronized void setAbortCauses(Enum<?> cause, Enum<?> root) {
+    abortCause = cause;
+    rootCause = root;
+  }
+
+  /** Why the txn aborted; null while it has not. */
+  public synchronized Enum<?> abortCause() {
+    return abortCause;
+  }
+
+  /** The root cause of its cascade tree: set by the mark of a cascade, or by its own abort. */
+  public synchronized Enum<?> rootCause() {
+    return rootCause;
+  }
+
+  /** Callers hold the monitor of {@code chain} (or of the chain this txn waited on, to clear it). */
+  void setWaitingOn(Object chain) {
+    waitingOn = chain;
+  }
+
+  /** Callers hold the monitor of {@code chain}. */
+  boolean isWaitingOn(Object chain) {
+    return waitingOn == chain;
+  }
+
   /** Was ever executed: only then can a successor have read its write buffer. */
   public synchronized boolean hasReachedExecuted() {
     return reachedExecuted;
@@ -266,6 +319,19 @@ public class Transaction<K, V> {
 
   synchronized void setCascadeFanout(int n) {
     cascadeFanout = n;
+  }
+
+  /**
+   * Of the txns counted in {@link #cascadeFanout()}, those this abort reached only on keys where they
+   * were still blocked in lock(), never through a node they had been granted: they had read nothing
+   * this txn (nor a txn behind it on that key) wrote, so the cascade did not need them.
+   */
+  public synchronized int waitingMarks() {
+    return waitingMarks;
+  }
+
+  synchronized void setWaitingMarks(int n) {
+    waitingMarks = n;
   }
 
   public static enum Status {

@@ -46,6 +46,21 @@ public final class ShimStats {
   private final LongAdder[] abortsByDepth = adders();
   private final LongAdder[] savedUsByDepth = adders();
   private final LongAdder[] cascadeFanout = adders();
+  // cascade attribution: each victim by the cause of the abort at the root of its tree
+  private final Map<AbortCause, LongAdder> cascadeVictimsByRoot = new EnumMap<>(AbortCause.class);
+  private final Map<AbortCause, LongAdder> cascadeLostUsByRoot = new EnumMap<>(AbortCause.class);
+  /** Root aborts (not themselves cascade victims) that doomed at least one txn, and how many in all. */
+  private final Map<AbortCause, LongAdder> cascadeTreesByRoot = new EnumMap<>(AbortCause.class);
+  private final Map<AbortCause, LongAdder> cascadeTreeVictimsByRoot = new EnumMap<>(AbortCause.class);
+  /** Tree sizes (txns doomed transitively by one root abort), in power-of-two buckets. */
+  private final LongAdder[] cascadeTreeSize = adders();
+  /** Txns marked must_abort by a cascade: all, those already executed, those reached only while blocked. */
+  private final LongAdder cascadeMarked = new LongAdder();
+  private final LongAdder cascadeMarkedExecuted = new LongAdder();
+  private final LongAdder cascadeMarkedWaiting = new LongAdder();
+  /** Per depth bucket: lifetime of the aborted txns (µs), and how many of them were cascade victims. */
+  private final LongAdder[] lostUsByDepth = adders();
+  private final LongAdder[] cascadesByDepth = adders();
   private final LongAdder speculativeGrants = new LongAdder();
   private final LongAdder prepareWaitUs = new LongAdder();
   private final LongAdder prepares = new LongAdder();
@@ -68,6 +83,10 @@ public final class ShimStats {
     for (AbortCause cause : AbortCause.values()) {
       aborts.put(cause, new LongAdder());
       lostUs.put(cause, new LongAdder());
+      cascadeVictimsByRoot.put(cause, new LongAdder());
+      cascadeLostUsByRoot.put(cause, new LongAdder());
+      cascadeTreesByRoot.put(cause, new LongAdder());
+      cascadeTreeVictimsByRoot.put(cause, new LongAdder());
     }
   }
 
@@ -79,6 +98,16 @@ public final class ShimStats {
 
   private static int bucket(int v) {
     return Math.min(v, BUCKETS - 1);
+  }
+
+  /** Power-of-two bucket of v ≥ 1: 1, 2-3, 4-7, ..., the last one "or more". */
+  private static int log2Bucket(int v) {
+    return Math.min(31 - Integer.numberOfLeadingZeros(v), BUCKETS - 1);
+  }
+
+  private static String log2Label(int b) {
+    int lo = 1 << b;
+    return b == BUCKETS - 1 ? lo + "+" : b == 0 ? "1" : lo + "-" + (2 * lo - 1);
   }
 
   /**
@@ -117,9 +146,71 @@ public final class ShimStats {
       cascadeLostUs.add(TimeUnit.NANOSECONDS.toMicros(lifetimeNanos));
     }
     abortsByDepth[bucket(depth)].increment();
+    lostUsByDepth[bucket(depth)].add(TimeUnit.NANOSECONDS.toMicros(lifetimeNanos));
+    if (cause == AbortCause.CASCADE) {
+      cascadesByDepth[bucket(depth)].increment();
+    }
     if (fanout > 0) {
       cascadeFanout[bucket(fanout)].increment();
     }
+  }
+
+  /**
+   * A cascade victim aborted (once, with {@link #aborted}).
+   *
+   * @param root the cause of the abort at the root of its cascade tree
+   */
+  void cascadeVictim(AbortCause root, long lifetimeNanos) {
+    cascadeVictimsByRoot.get(root).increment();
+    cascadeLostUsByRoot.get(root).add(TimeUnit.NANOSECONDS.toMicros(lifetimeNanos));
+  }
+
+  /**
+   * One abort's marks.
+   *
+   * @param marked txns it moved to must_abort
+   * @param executed those of them already executed (aborted right away, and cascading in turn)
+   * @param waiting those it reached only on keys where they were still blocked in lock()
+   */
+  void cascadeMarks(int marked, int executed, int waiting) {
+    cascadeMarked.add(marked);
+    cascadeMarkedExecuted.add(executed);
+    cascadeMarkedWaiting.add(waiting);
+  }
+
+  /** A root abort (not a cascade victim) doomed {@code victims > 0} txns transitively. */
+  void cascadeTree(AbortCause root, int victims) {
+    cascadeTreesByRoot.get(root).increment();
+    cascadeTreeVictimsByRoot.get(root).add(victims);
+    cascadeTreeSize[log2Bucket(victims)].increment();
+  }
+
+  /** Cascade victims whose tree started with an abort of that cause. */
+  public long cascadeVictimsWithRoot(AbortCause root) {
+    return cascadeVictimsByRoot.get(root).sum();
+  }
+
+  /** Root aborts of that cause that doomed at least one txn. */
+  public long cascadeTreesWithRoot(AbortCause root) {
+    return cascadeTreesByRoot.get(root).sum();
+  }
+
+  /** Txns doomed transitively by the root aborts of that cause (counted at the root). */
+  public long cascadeTreeVictimsWithRoot(AbortCause root) {
+    return cascadeTreeVictimsByRoot.get(root).sum();
+  }
+
+  /** Txns some abort marked must_abort while they were blocked on every key it reached them on. */
+  public long cascadeMarkedWaiting() {
+    return cascadeMarkedWaiting.sum();
+  }
+
+  public long cascadeMarked() {
+    return cascadeMarked.sum();
+  }
+
+  public long cascadeMarkedExecuted() {
+    return cascadeMarkedExecuted.sum();
   }
 
   /** prepare() waited this long for its predecessors to commit (the cost of ordering). */
@@ -264,7 +355,49 @@ public final class ShimStats {
     for (AbortCause cause : AbortCause.values()) {
       sb.append(" lost_").append(cause.name().toLowerCase()).append("_us_total=").append(lostUs(cause));
     }
+    sb.append(' ').append(cascadeSummary());
     return sb.toString().trim();
+  }
+
+  /**
+   * The cascade attribution, appended to {@link #speculationSummary}: per depth bucket {@code
+   * d:aborts/cascade aborts/mean lifetime µs of the aborts}, tree sizes {@code size range:roots}, then
+   * totals (named *_total, never lost_*_us_total, which the bench sums as lost time): the marks (all,
+   * executed, only while blocked), and per root cause the victims, their lost µs, the trees and the
+   * victims counted at their roots (the two victim counts differ by the victims of trees whose
+   * executed txns another thread aborted first, e.g. the coordinator).
+   */
+  String cascadeSummary() {
+    StringBuilder sb = new StringBuilder("depth_lost=");
+    for (int d = 0; d < BUCKETS; d++) {
+      long da = abortsByDepth[d].sum();
+      if (da > 0) {
+        sb.append(d).append(d == BUCKETS - 1 ? "+" : "").append(':').append(da).append('/')
+            .append(cascadesByDepth[d].sum()).append('/').append(lostUsByDepth[d].sum() / da).append(' ');
+      }
+    }
+    sb.append("cascade_tree=");
+    for (int b = 0; b < BUCKETS; b++) {
+      long f = cascadeTreeSize[b].sum();
+      if (f > 0) {
+        sb.append(log2Label(b)).append(':').append(f).append(' ');
+      }
+    }
+    sb.append(String.format(Locale.ROOT,
+        "cascade_marked_total=%d cascade_marked_executed_total=%d cascade_marked_waiting_total=%d",
+        cascadeMarked.sum(), cascadeMarkedExecuted.sum(), cascadeMarkedWaiting.sum()));
+    for (AbortCause root : AbortCause.values()) {
+      if (root == AbortCause.CASCADE) {
+        continue;   // never a root
+      }
+      String r = root.name().toLowerCase();
+      sb.append(" cascade_root_").append(r).append("_victims_total=").append(cascadeVictimsByRoot.get(root).sum())
+          .append(" cascade_root_").append(r).append("_victim_us_total=").append(cascadeLostUsByRoot.get(root).sum())
+          .append(" cascade_root_").append(r).append("_trees_total=").append(cascadeTreesByRoot.get(root).sum())
+          .append(" cascade_root_").append(r).append("_tree_victims_total=")
+          .append(cascadeTreeVictimsByRoot.get(root).sum());
+    }
+    return sb.toString();
   }
 
   @Override

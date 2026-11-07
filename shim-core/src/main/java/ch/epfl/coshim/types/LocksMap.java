@@ -5,6 +5,7 @@ import ch.epfl.coshim.types.Transaction.Status;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -242,13 +243,16 @@ public class LocksMap<K, V> {
   public List<Transaction<K, V>> abortAndRelease(Transaction<K, V> txn) {
     List<Transaction<K, V>> marked = new ArrayList<>();
     List<Transaction<K, V>> doomedFinished = new ArrayList<>();
+    Map<Transaction<K, V>, Boolean> granted = new HashMap<>();
     for (Map.Entry<K, LockType<K, V>> e : txn.frozenLocks().entrySet()) {
       LockType<K, V> held = e.getValue();
       locksMap.computeIfPresent(
           e.getKey(),
-          (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished) ? null : c);
+          (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished, granted) ? null : c);
     }
     txn.setCascadeFanout(marked.size());
+    // statistics only: marked txns met on no key behind txn but where they were still blocked
+    txn.setWaitingMarks((int) marked.stream().filter(t -> !granted.get(t)).count());
     for (Transaction<K, V> t : marked) {
       statusChanged(t);
     }
