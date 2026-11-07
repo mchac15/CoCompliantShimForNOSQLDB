@@ -4,8 +4,8 @@
     scripts/bench-lock-timeout-sweep.py [run] [options] [-- MicroBench options...]
     scripts/bench-lock-timeout-sweep.py plot DIR            # re-plots an existing sweep
 
-For each lock timeout (default 1 5 10 20 50 100 ms) it runs scripts/bench-sql-compare.sh with
-LOCK_TIMEOUT_MS set, the shim variants only, over the skews (default 0.5 0.99), once each, at a fixed
+For each lock timeout (default 1 10 100 ms) it runs scripts/bench-sql-compare.sh with
+LOCK_TIMEOUT_MS set, the shim variants only, over the skews (default 0.9 0.99), once each, at a fixed
 thread count (50) and table size (10000). The lock timeout is an option of the shim nodes only:
 Sonata's lock waits are the servers' (innodb_lock_wait_timeout / lock_timeout, scripts/bench-dbs.sh),
 so Sonata runs once per skew and is drawn as a flat reference line (--sonata-each-timeout reruns it
@@ -303,8 +303,8 @@ def main():
 
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                 epilog="Arguments after -- go to MicroBench (through bench-sql-compare.sh).")
-    p.add_argument("--lock-timeouts", type=int, nargs="+", default=[1, 5, 10, 20, 50, 100], metavar="MS")
-    p.add_argument("--skews", nargs="+", default=["0.5", "0.99"])
+    p.add_argument("--lock-timeouts", type=int, nargs="+", default=[1, 10, 100], metavar="MS")
+    p.add_argument("--skews", nargs="+", default=["0.9", "0.99"])
     p.add_argument("--threads", type=int, default=50)
     p.add_argument("--table-size", type=int, default=10000)
     p.add_argument("--reps", type=int, default=1)

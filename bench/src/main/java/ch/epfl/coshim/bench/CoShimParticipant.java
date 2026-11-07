@@ -10,6 +10,8 @@ import ch.epfl.coshim.store.TableKey;
 import java.net.InetSocketAddress;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.Map;
+import java.util.Set;
 import javax.sql.DataSource;
 
 /** A shim database ({@code host:port/database}) in a shim node, reached over TCP. */
@@ -56,13 +58,15 @@ final class CoShimParticipant implements Participant {
         KvSession.<String, String>from(branch).put(table, String.valueOf(key), String.valueOf(value));
     }
 
+    /** Reads only the written keys, one by one through the shim: the others are still 0. */
     @Override
-    public long sum(int tables, int tableSize) throws SQLException {
+    public long sum(int tables, int tableSize, Map<String, Set<Integer>> written) throws SQLException {
         long sum = 0;
         try (Connection c = dataSource.getConnection()) {
             for (int t = 0; t < tables; t++) {
-                for (int k = 0; k < tableSize; k++) {
-                    sum += get(c, MicroBench.table(t), k);
+                String table = MicroBench.table(t);
+                for (int k : written.getOrDefault(table, Set.of())) {
+                    sum += get(c, table, k);
                 }
             }
         }

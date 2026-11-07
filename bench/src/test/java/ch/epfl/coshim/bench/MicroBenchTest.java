@@ -44,9 +44,36 @@ class MicroBenchTest {
     }
 
     @Test
+    void hotspotPutsTheSkewnessShareOfTheAccessesInTheHotRange() {
+        for (double skew : new double[] {0.8, 0.9, 0.95, 0.99}) {
+            // 2 reads + 3 writes per branch: few ops, where acta rounds every key into the hot range
+            BenchConfig c = config("--table-size", "10000", "--reads", "2", "--writes", "3", "--skew", String.valueOf(skew));
+            assertEquals(BenchConfig.KeyDist.HOTSPOT, c.dist(), "hotspot is the default");
+            long hot = 0;
+            long all = 0;
+            for (int i = 0; i < 20_000; i++) {
+                Set<Integer> keys = new HashSet<>();
+                for (MicroBench.Branch b : MicroBench.randomPlan(c, 2)) {
+                    for (MicroBench.Op op : b.ops()) {
+                        assertTrue(keys.add(op.key()), "keys are distinct in a txn");
+                        assertTrue(op.key() >= 0 && op.key() < 10_000);
+                        hot += op.key() < c.hotRangeSize() ? 1 : 0;
+                        all++;
+                    }
+                }
+            }
+            assertEquals(skew, (double) hot / all, 0.005, "share of hot accesses at skew " + skew);
+        }
+        // 1M keys: the hot range is 1 % of them at 0.99, and the share holds
+        BenchConfig big = config("--table-size", "1000000", "--skew", "0.99");
+        assertEquals(10_000, big.hotRangeSize());
+        assertThrows(IllegalArgumentException.class, () -> config("--dist", "zipfish"));
+    }
+
+    @Test
     void plansFollowActasRules() {
         BenchConfig c = config("--table-size", "1000", "--branches", "3", "--reads", "2", "--writes", "3",
-                "--skew", "0.9");
+                "--skew", "0.9", "--dist", "acta");
         for (int i = 0; i < 1000; i++) {
             List<MicroBench.Branch> plan = MicroBench.randomPlan(c, 4);
             assertEquals(3, plan.size());
@@ -63,6 +90,85 @@ class MicroBenchTest {
             // ceil(2 * 0.9) + ceil(3 * 0.9) = 5 hot keys per branch, i.e. in [0, 100)
             assertEquals(15, keys.stream().filter(k -> k < 100).count());
         }
+    }
+
+    @Test
+    void opCountsFollowTheTruncatedNormal() {
+        BenchConfig c = config("--ops-mean", "3", "--ops-sd", "1.5", "--ops-max", "10", "--branches", "2");
+        long ops = 0;
+        long branches = 0;
+        for (int i = 0; i < 20_000; i++) {
+            for (MicroBench.Branch b : MicroBench.randomPlan(c, 2)) {
+                int r = b.readKeys().size();
+                int w = b.writeKeys().size();
+                assertTrue(r >= 0 && r <= 10 && w >= 0 && w <= 10);
+                assertTrue(r + w > 0, "a branch has at least one op");
+                ops += r + w;
+                branches++;
+            }
+        }
+        double mean = (double) ops / branches / 2;
+        assertTrue(Math.abs(mean - 3) < 0.15, "mean ops per kind " + mean);
+        assertEquals(0, config().drawThinkNanos(), "no think time by default");
+        BenchConfig think = config("--think-mean-us", "2000", "--think-sd-us", "1000");
+        for (int i = 0; i < 1000; i++) {
+            assertTrue(think.drawThinkNanos() >= 0);
+        }
+        // the hot/cold capacity check uses the largest draw: 2 branches x 20 ops do not fit 30 keys
+        assertThrows(IllegalArgumentException.class, () -> config("--ops-mean", "3", "--table-size", "30"));
+    }
+
+    @Test
+    void branchesRunTheirReadsAndWritesInARandomOrder() {
+        // 10 ops at skew 0.9: about 9 hot keys and 1 cold one per list
+        BenchConfig c = config("--table-size", "1000", "--reads", "10", "--writes", "10", "--skew", "0.9");
+        boolean writeBeforeRead = false;
+        boolean coldBeforeHot = false;
+        for (int i = 0; i < 1000; i++) {
+            for (MicroBench.Branch b : MicroBench.randomPlan(c, 2)) {
+                List<MicroBench.Op> ops = b.ops();
+                assertEquals(b.readKeys().stream().sorted().toList(),
+                        ops.stream().filter(o -> !o.write()).map(MicroBench.Op::key).sorted().toList());
+                assertEquals(b.writeKeys().stream().sorted().toList(),
+                        ops.stream().filter(MicroBench.Op::write).map(MicroBench.Op::key).sorted().toList());
+                writeBeforeRead |= ops.get(0).write();
+                coldBeforeHot |= ops.get(0).key() >= c.hotRangeSize();
+            }
+        }
+        assertTrue(writeBeforeRead, "writes are not always after the reads");
+        assertTrue(coldBeforeHot, "cold keys are not always after the hot ones");
+    }
+
+    @Test
+    void samplesBecomeThroughputRows() {
+        BenchConfig c = config("--variant", "speculative-pg@wound-wait", "--threads", "50", "--sample-ms", "500");
+        assertEquals(500, c.sampleMs());
+        List<String> rows = MicroBench.sampleRows(c, "rep1", List.of(
+                new MicroBench.Sample(500, "warmup", 500, 100, 25, 1000500),
+                new MicroBench.Sample(1000, "measure", 500, 0, 0, 1001000)));
+        assertEquals("rep1,speculative-pg@wound-wait,50,0.9,0.500,warmup,500,100,25,200.0,0.2000,1000500", rows.get(0));
+        assertEquals("rep1,speculative-pg@wound-wait,50,0.9,1.000,measure,500,0,0,0.0,0.0000,1001000", rows.get(1));
+        assertEquals(MicroBench.sampleCsvHeader().split(",").length, rows.get(0).split(",").length);
+        assertThrows(IllegalArgumentException.class, () -> config("--sample-ms", "-1"));
+    }
+
+    @Test
+    void latencyExcludesThinkTimeAndCountsRetries() {
+        // 4 ops each: two first tries (400 us active each), 3 tries with 1200 us of pauses, one still retrying
+        List<BenchResult.Txn> txns = List.of(
+                new BenchResult.Txn(1, 2, 2, 2, "COMMITTED", List.of(), 800, 400),
+                new BenchResult.Txn(1, 2, 2, 2, "COMMITTED", List.of(), 1000, 600),
+                new BenchResult.Txn(3, 2, 2, 2, "COMMITTED", List.of("shim_abort", "shim_abort"), 2400, 1200),
+                new BenchResult.Txn(5, 2, 2, 2, "UNFINISHED", List.of(), 9000, 1000));
+        BenchResult r = new BenchResult(config(), 2, 2, 0, 0, List.of(500L, 600L), -1, -1, -1, Map.of(), txns, null,
+                0.9);
+
+        assertEquals(100, r.opLatencyPercentileUs(50), "(800 - 400) / 4; unfinished txns have no latency");
+        assertEquals(300, r.opLatencyPercentileUs(99), "(2400 - 1200) / 4: the retries' work counts");
+        assertEquals(1200, r.activeLatencyPercentileUs(99));
+        assertEquals(2, r.retriesPercentile(50));
+        assertEquals(4, r.retriesPercentile(99), "a txn still retrying counts with its retries so far");
+        assertEquals(BenchResult.csvHeader().split(",").length, r.csvRow("x").split(",").length);
     }
 
     @Test

@@ -2,6 +2,7 @@ package ch.epfl.coshim.core;
 
 import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.KvStore;
+import ch.epfl.coshim.types.DeadlockPolicy;
 import ch.epfl.coshim.types.LockType;
 import ch.epfl.coshim.types.LocksMap;
 import ch.epfl.coshim.types.LocksMap.LockResult;
@@ -14,6 +15,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * The speculative CO-compliant shim of pseudo.txt (S2PL + speculation at {@code executed}). The
@@ -45,6 +49,12 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   private final LocksMap<K, V> locksMap;
   private final ShimStats stats = new ShimStats();
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
+  /** Hands out txn ages at start(): a later start() is younger. */
+  private final AtomicLong timestampGenerator = new AtomicLong();
+  /** Ages from the global transaction id (see {@link #globalAge}), for prepare()'s wait-die. */
+  private final boolean globalAges;
+  /** A Seata branch's txn id, formatId:ip:port:transactionId:branchId: the transaction id. */
+  private static final Pattern SEATA_TRANSACTION_ID = Pattern.compile(":(\\d+):[^:]*$");
 
   public SpeculativeCoShim(KvStore<K, V> store, Duration lockTimeout) {
     this(store, lockTimeout, DEFAULT_TOMBSTONE_TTL);
@@ -64,7 +74,45 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
    */
   public SpeculativeCoShim(
       KvStore<K, V> store, Duration lockTimeout, Duration tombstoneTtl, boolean speculative) {
-    this.locksMap = new LocksMap<>(speculative);
+    this(store, lockTimeout, tombstoneTtl, speculative, DeadlockPolicy.WAIT_DIE);
+  }
+
+  /**
+   * @param deadlockPolicy how lock()/upgrade() avoid waiting in a cycle (lock_timeout stays the
+   *     backstop either way)
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy) {
+    this(store, lockTimeout, tombstoneTtl, speculative, deadlockPolicy, false);
+  }
+
+  /**
+   * @param prepareWaitDie prepare() votes NO instead of waiting for a younger txn, so that two shims
+   *     ordering the same two txns oppositely cannot deadlock in prepare() (see {@link
+   *     LocksMap#awaitPredecessorsCommitted}). The ages then come from the global transaction id,
+   *     the same on every shim (lock()'s deadlock prevention uses them too); a retry is a new
+   *     global transaction, hence younger
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      boolean prepareWaitDie) {
+    this.globalAges = prepareWaitDie;
+    // a wound-wait victim is already must_abort: abort_transaction releases its locks, on the
+    // wounder's thread, outside any latch
+    this.locksMap =
+        new LocksMap<>(
+            speculative,
+            Objects.requireNonNull(deadlockPolicy),
+            victim -> abortTransaction(victim, AbortCause.WOUNDED),
+            prepareWaitDie);
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
     this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);
@@ -95,9 +143,29 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     gcThread.start();
   }
 
+  /**
+   * A txn's age (smaller = older): with globalAges, the transaction id of a Seata branch's txn id,
+   * which the TC hands out at begin in increasing order and which every branch of the global
+   * transaction carries, so every shim agrees on it; else (or for a txn id of another form) the
+   * order of start() on this shim.
+   */
+  long globalAge(String txnId) {
+    if (globalAges) {
+      Matcher m = SEATA_TRANSACTION_ID.matcher(txnId);
+      if (m.find()) {
+        try {
+          return Long.parseLong(m.group(1));
+        } catch (NumberFormatException e) {
+          // longer than a long: not a Seata transaction id
+        }
+      }
+    }
+    return timestampGenerator.incrementAndGet();
+  }
+
   @Override
   public Outcome start(String txnId) {
-    Transaction<K, V> txn = new Transaction<>(txnId, Status.STARTED, null);
+    Transaction<K, V> txn = new Transaction<>(txnId, Status.STARTED, null, globalAge(txnId));
     if (transactionsMap.putIfAbsent(txnId, txn) != null) {
       return Outcome.FAILED; // already registered or tombstone
     }
@@ -124,11 +192,19 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     return Outcome.SUCCEEDED;
   }
 
+  /** lock(), its duration added to txn's time budget (statistics only). */
+  private LockResult timedLock(K key, Transaction<K, V> txn, LockType.LockMode mode) {
+    long t0 = System.nanoTime();
+    LockResult res = locksMap.lock(key, txn, mode, lockTimeout);
+    txn.addLockWaitNanos(System.nanoTime() - t0);
+    return res;
+  }
+
   @Override
   public V get(String txnId, K key) {
     Transaction<K, V> txn = running(txnId);
-    LockResult res = locksMap.lock(key, txn, LockType.LockMode.SHARED, lockTimeout);
-    if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT) {
+    LockResult res = timedLock(key, txn, LockType.LockMode.SHARED);
+    if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("get: lock failed, must abort");
     }
@@ -155,8 +231,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   public void put(String txnId, K key, V value) {
     Objects.requireNonNull(value, "values are non-null");
     Transaction<K, V> txn = running(txnId);
-    LockResult res = locksMap.lock(key, txn, LockType.LockMode.EXCLUSIVE, lockTimeout);
-    if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT) {
+    LockResult res = timedLock(key, txn, LockType.LockMode.EXCLUSIVE);
+    if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("put: lock failed, must abort");
     }
@@ -176,17 +252,26 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       abortTransaction(txn, AbortCause.PREPARE_NO); // started, aborted (incl. tombstone) or must_abort
       return Vote.NO;
     }
-    if (!locksMap.awaitPredecessorsResolved(txn)) {
-      abortTransaction(txn, AbortCause.CASCADE); // doomed while waiting; a no-op if already aborted
+    long waitStart = System.nanoTime();
+    LocksMap.PrepareWait waitResult = locksMap.awaitPredecessorsCommitted(txn);
+    if (waitResult != LocksMap.PrepareWait.READY) {
+      txn.setPrepareWaitNanos(System.nanoTime() - waitStart);
+      // DIE: would have waited for a younger txn; else doomed while waiting (a no-op if already aborted)
+      abortTransaction(txn, waitResult == LocksMap.PrepareWait.DIE ? AbortCause.PREPARE_WAIT_DIE : AbortCause.CASCADE);
       return Vote.NO;
     }
     if (!PREPARABLE.contains(txn.compareAndSwapStatus(PREPARABLE, Status.PREPARED))) {
       if (VOTED_YES.contains(txn.getStatus())) {
         return Vote.YES; // a concurrent duplicate prepare already voted YES
       }
+      txn.setPrepareWaitNanos(System.nanoTime() - waitStart);
       abortTransaction(txn, AbortCause.CASCADE); // a late cascade landed after the wait
       return Vote.NO;
     }
+    long waited = System.nanoTime() - waitStart;
+    txn.setPrepareWaitNanos(waited);
+    txn.setVotedAtNanos(System.nanoTime());
+    stats.prepared(waited);
     return Vote.YES;
   }
 
@@ -200,11 +285,19 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (!txn.compareAndSwapStatus(Status.PREPARED, Status.COMMITTING)) {
       return;
     }
+    // statistics only: every predecessor resolved (prepare passed); stamp this txn before any
+    // successor can see it committed
+    int grants = txn.speculativeGrants();
+    long saved = txn.savedNanos();
     store.storeAll(txn.getWriteSet());
+    txn.markResolved();
     locksMap.release(txn);
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
-    stats.committed();
+    stats.committed(txn.maxDepth(), grants, saved, txn.prepareWaitNanos());
+    long now = System.nanoTime();
+    stats.committedBudget(now - txn.createdAtNanos(), txn.lockWaitNanos(), txn.prepareWaitNanos(),
+        now - txn.votedAtNanos());
   }
 
   @Override
@@ -241,20 +334,33 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
 
   private static AbortCause lockFailure(LockResult res) {
     // MUST_ABORT of a txn that was not marked: it lost an upgrade race (a marked one counts as cascade)
-    return res == LockResult.TIMED_OUT ? AbortCause.LOCK_TIMEOUT : AbortCause.UPGRADE_CONFLICT;
+    return switch (res) {
+      case TIMED_OUT -> AbortCause.LOCK_TIMEOUT;
+      case DIE -> AbortCause.DEADLOCK_PREVENTION;
+      default -> AbortCause.UPGRADE_CONFLICT;
+    };
+  }
+
+  /** Why a must_abort txn was doomed, whichever site finally aborts it. */
+  private static AbortCause doomedBy(Transaction<?, ?> txn) {
+    return txn.isWounded() ? AbortCause.WOUNDED : AbortCause.CASCADE;
   }
 
   /**
-   * @param cause why the caller aborts txn; a txn that was must_abort counts as a cascade whatever
-   *     the site that finally aborts it
+   * @param cause why the caller aborts txn; a txn that was must_abort counts as a cascade (or a
+   *     wound) whatever the site that finally aborts it
    */
   private void abortTransaction(Transaction<K, V> txn, AbortCause cause) {
     Status before = txn.compareAndSwapStatus(ABORTABLE, Status.ABORTED);
     if (!ABORTABLE.contains(before)) {
       return; // already aborted or committing/committed
     }
-    stats.aborted(before == Status.MUST_ABORT ? AbortCause.CASCADE : cause);
+    txn.markResolved();
     List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
+    AbortCause finalCause = before == Status.MUST_ABORT ? doomedBy(txn) : cause;
+    long lifetime = System.nanoTime() - txn.createdAtNanos();
+    stats.aborted(finalCause, txn.maxDepth(), txn.cascadeFanout(), lifetime);
+    stats.abortedBudget(finalCause, lifetime, txn.lockWaitNanos(), txn.prepareWaitNanos());
     transactionsMap.remove(txn.getTransactionId(), txn);
     for (Transaction<K, V> t : doomed) {
       abortTransaction(t, AbortCause.CASCADE);

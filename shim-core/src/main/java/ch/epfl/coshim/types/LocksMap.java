@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * locks_map of pseudo.txt, and the shim's only entry point to the lock table: the shim never sees a
@@ -62,7 +63,9 @@ public class LocksMap<K, V> {
     /** txn is doomed or no longer running, or lost an RMW-vs-RMW upgrade: abort it. */
     MUST_ABORT,
     /** lock_timeout expired while waiting (assumed deadlock): abort it. */
-    TIMED_OUT
+    TIMED_OUT,
+    /** Deadlock prevention: it would have waited for a younger txn: abort it. */
+    DIE
   }
 
   /**
@@ -83,6 +86,21 @@ public class LocksMap<K, V> {
   /** What lock()/upgrade() wait for: every predecessor holder in this set. */
   private final Set<Status> lockReady;
   private final boolean speculative;
+  private final DeadlockPolicy deadlockPolicy;
+  /** abort_transaction of a wound-wait victim (already must_abort), run outside any latch. */
+  private final Consumer<Transaction<K, V>> woundHandler;
+  /** prepare() dies instead of waiting for a younger txn (cross-shim deadlock prevention). */
+  private final boolean prepareWaitDie;
+
+  /** Outcome of prepare()'s wait for the predecessors to commit. */
+  public static enum PrepareWait {
+    /** Every predecessor committed: txn may vote YES. */
+    READY,
+    /** txn was aborted or doomed meanwhile (or its locks are gone): vote NO. */
+    MUST_ABORT,
+    /** Wait-die: txn would have waited for a younger txn: vote NO. */
+    DIE
+  }
 
   /** The speculative lock table of pseudo.txt. */
   public LocksMap() {
@@ -95,8 +113,33 @@ public class LocksMap<K, V> {
    *     an uncommitted value and an abort never cascades
    */
   public LocksMap(boolean speculative) {
+    this(speculative, DeadlockPolicy.WAIT_DIE, null);
+  }
+
+  /**
+   * @param woundHandler aborts a wound-wait victim (a txn this table moved to must_abort): the
+   *     shim's abort_transaction. Null: abort it here, which is enough when nobody else keeps txn
+   *     state (the lock table alone)
+   */
+  public LocksMap(
+      boolean speculative, DeadlockPolicy deadlockPolicy, Consumer<Transaction<K, V>> woundHandler) {
+    this(speculative, deadlockPolicy, woundHandler, false);
+  }
+
+  /**
+   * @param prepareWaitDie prepare() votes NO instead of waiting for a younger txn (see {@link
+   *     #awaitPredecessorsCommitted}); needs ages that are the same on every shim
+   */
+  public LocksMap(
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      Consumer<Transaction<K, V>> woundHandler,
+      boolean prepareWaitDie) {
+    this.prepareWaitDie = prepareWaitDie;
     this.speculative = speculative;
     this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
+    this.deadlockPolicy = deadlockPolicy;
+    this.woundHandler = woundHandler != null ? woundHandler : this::abortVictim;
   }
 
   /**
@@ -146,14 +189,35 @@ public class LocksMap<K, V> {
    * @return true if every predecessor resolved, false if txn got aborted / doomed meanwhile
    */
   public boolean awaitPredecessorsResolved(Transaction<K, V> txn) {
+    return awaitPredecessorsCommitted(txn) == PrepareWait.READY;
+  }
+
+  /**
+   * prepare()'s wait, key by key, until every predecessor holder committed. With prepareWaitDie,
+   * DIE instead of waiting for a younger txn: with speculation, two shims can order the same two
+   * txns oppositely (when their branches run at the same time), and each one's prepare then waits
+   * for the other's commit, which needs the other's vote: a cycle nothing else breaks. Waits that
+   * only go from younger to older txns, by ages every shim agrees on, cannot form one.
+   */
+  public PrepareWait awaitPredecessorsCommitted(Transaction<K, V> txn) {
     for (K key : txn.frozenLocks().keySet()) {
       Chain<K, V> chain = locksMap.get(key);
       // no chain: txn's locks were released by a foreign abort_transaction, as in lock()
-      if (chain == null || chain.awaitPredecessor(txn, RESOLVED, false, 0) != Chain.WaitResult.READY) {
-        return false;
+      if (chain == null) {
+        return PrepareWait.MUST_ABORT;
+      }
+      switch (chain.awaitResolved(txn, RESOLVED, prepareWaitDie)) {
+        case READY -> {
+        }
+        case DIE -> {
+          return PrepareWait.DIE;
+        }
+        default -> {
+          return PrepareWait.MUST_ABORT;
+        }
       }
     }
-    return true;
+    return PrepareWait.READY;
   }
 
   /**
@@ -184,6 +248,7 @@ public class LocksMap<K, V> {
           e.getKey(),
           (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished) ? null : c);
     }
+    txn.setCascadeFanout(marked.size());
     for (Transaction<K, V> t : marked) {
       statusChanged(t);
     }
@@ -222,11 +287,40 @@ public class LocksMap<K, V> {
     return locksMap.get(key);
   }
 
+  /**
+   * The bounded wait of lock()/upgrade(). On WOUND the victims are already must_abort; they are
+   * aborted here, outside every latch (their release takes the map entry of each of their keys,
+   * txn's own key included), and txn waits again with the same deadline until their nodes empty.
+   * chain stays txn's chain meanwhile: txn's own node keeps it from being emptied and removed.
+   */
   private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline) {
-    return switch (chain.awaitPredecessor(txn, lockReady, true, deadline)) {
-      case READY -> LockResult.ACQUIRED;
-      case DOOMED -> LockResult.MUST_ABORT;
-      case TIMED_OUT -> LockResult.TIMED_OUT;
-    };
+    while (true) {
+      List<Transaction<K, V>> victims = new ArrayList<>();
+      switch (chain.awaitLockReady(txn, lockReady, deadline, deadlockPolicy, victims)) {
+        case READY -> {
+          return LockResult.ACQUIRED;
+        }
+        case DOOMED -> {
+          return LockResult.MUST_ABORT;
+        }
+        case TIMED_OUT -> {
+          return LockResult.TIMED_OUT;
+        }
+        case DIE -> {
+          return LockResult.DIE;
+        }
+        case WOUND -> victims.forEach(woundHandler);
+      }
+    }
+  }
+
+  /**
+   * The default wound handler: abort_transaction's part on the chains for a victim. It never
+   * reached executed, so its release cascades to nobody.
+   */
+  private void abortVictim(Transaction<K, V> victim) {
+    if (victim.compareAndSwapStatus(Status.MUST_ABORT, Status.ABORTED)) {
+      abortAndRelease(victim);
+    }
   }
 }

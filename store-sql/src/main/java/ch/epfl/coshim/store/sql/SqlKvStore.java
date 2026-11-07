@@ -124,13 +124,26 @@ public final class SqlKvStore implements KvStore<TableKey<String>, String>, Auto
         }
     }
 
-    /** {@code table} holds exactly keys 0 .. entries - 1, all at 0 (SqlParticipant.fill). */
+    /**
+     * {@code table} holds exactly keys 0 .. entries - 1, all at 0 (SqlParticipant.fill): a table that already
+     * holds those keys only has its values reset, one scan, instead of being emptied and filled again (at 1M
+     * keys a refill per node start is slow, and its writes reach the disk ~30 s later, mid-run).
+     */
     private void init(String table, int entries) throws SQLException {
         String t = dialect.quote(table);
         String key = dialect.quote("key");
         try (Connection c = pool.getConnection()) {
             try (Statement s = c.createStatement()) {
                 s.execute("create table if not exists " + t + " (" + key + " int not null primary key, value bigint not null)");
+                try (ResultSet rs = s.executeQuery("select count(*), coalesce(min(" + key + "), -1), coalesce(max("
+                        + key + "), -1) from " + t)) {
+                    rs.next();
+                    if (rs.getLong(1) == entries && rs.getLong(2) == 0 && rs.getLong(3) == entries - 1L) {
+                        rs.close();
+                        s.executeUpdate("update " + t + " set value = 0 where value <> 0");
+                        return;
+                    }
+                }
                 s.execute((dialect == Dialect.MYSQL ? "truncate table " : "truncate ") + t);
             }
             try (PreparedStatement insert = c.prepareStatement("insert into " + t + " (" + key + ", value) values (?, 0)")) {
