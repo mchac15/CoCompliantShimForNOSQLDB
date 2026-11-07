@@ -12,5 +12,12 @@ public enum DeadlockPolicy {
    * A txn that would wait for a younger running (started) one wounds it: the younger is aborted and
    * its locks released, and the older waits for its node to empty. A younger txn waits for an older.
    */
-  WOUND_WAIT
+  WOUND_WAIT,
+  /**
+   * No deadlock prevention: lock()/upgrade() just wait, bounded by lock_timeout. Only for workloads that
+   * cannot deadlock, e.g. every txn taking its locks in one global order (MicroBench --randomness 0 with
+   * sequential branches): there wound-wait and wait-die abort txns for cycles that never form. With any
+   * other workload a deadlock lasts until lock_timeout.
+   */
+  NONE
 }
