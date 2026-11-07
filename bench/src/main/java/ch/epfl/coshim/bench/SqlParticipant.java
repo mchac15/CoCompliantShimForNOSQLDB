@@ -10,6 +10,8 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import javax.sql.DataSource;
 import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.DefaultValues;
@@ -234,7 +236,8 @@ final class SqlParticipant implements Participant {
     }
 
     @Override
-    public long sum(int tables, int tableSize) throws SQLException {
+    public long sum(int tables, int tableSize, Map<String, Set<Integer>> written) throws SQLException {
+        // one SQL sum per table: as cheap at 1M keys as reading only the written ones
         long sum = 0;
         try (Connection c = pool.getConnection(); Statement s = c.createStatement()) {
             c.setAutoCommit(true);

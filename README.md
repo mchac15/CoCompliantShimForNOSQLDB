@@ -330,6 +330,81 @@ Sonata's switch is read once per JVM, so a run is all-Sonata or not. A mixed glo
 (a shim branch and a MySQL branch in the same `--shims`) works with `--sonata true`, since the hook
 only applies to MySQL/PG data sources.
 
+### Final micro benchmark
+
+`scripts/bench-final.sh` runs every combination of threads (20, 50, 100, 200) and skew (0.8, 0.9,
+0.95, 0.99) for the speculative and the non-speculative shim (wound-wait) and Sonata, on MySQL and
+PostgreSQL, 3 reps each (288 runs, about 7 h). The workload is `--ops-mean 3 --think-mean-us 2000
+--think-sd-us 1000`. Keep the think time: without it the servers saturate, txns queue for the CPU
+rather than for locks, and speculation has nothing to overlap (50 threads, skew 0.9: speculation
++1-2 % tps without think time, +10-11 % with it). A branch runs its reads and writes in a random
+order (always, in `MicroBench`), so hot accesses are not all at the end of a branch. Wait-die is left
+out by default: a retried txn gets a fresh age, so it starves (add `<variant>@wait-die` through
+`VARIANTS`; `bench-compare.sh` understands the `@wait-die` / `@wound-wait` suffix).
+
+Timeouts only break cross-database deadlocks (local ones are prevented or detected), so every lock
+wait is 30 s (shim nodes and servers) and the TC's global timeout 60 s. About 4 h; rerun with
+`OUT=<dir>` to resume. `summary.md` / `summary.csv` report throughput, per-op and per-txn latency
+p50 / p99 (a committed txn's whole execution, retries included, minus any think time) and retries
+per txn p50 / p99, and, from the shim nodes' `speculation` log lines, per branch commit:
+
+- **saved**: the lock wait speculation avoided (each speculative grant replayed as if it had waited
+  for its predecessors to resolve);
+- **net**: minus the wait it moved into `prepare()` (a speculative txn still waits there for its
+  predecessors to commit, so only the overlap with its own remaining work is saved);
+- **lost**: the work of the txns a cascade aborted (creation to abort);
+- **net saved** = net - lost.
+
+`scripts/bench-final-plot.py DIR` draws `DIR/final.png` from `summary.csv`: per server kind and
+skew, throughput, per-op latency p50 / p99, retries p50 / p99 and net saved against the thread count.
+
+```bash
+scripts/bench-final.sh                                         # the full sweep
+THREADS_LIST="20" SKEWS="0.9" REPS=1 scripts/bench-final.sh    # a quick check
+scripts/bench-final.sh --summarize bench-results/final-<ts>
+python -m venv .venv && .venv/bin/pip install matplotlib
+.venv/bin/python scripts/bench-final-plot.py bench-results/final-<ts>
+```
+
+### Key distribution
+
+`--skew s` sends a share s of the accesses to the hot range, the first (1 - s) x `--table-size` keys
+(0.9: 90 % of the accesses on 10 % of the keys). With `--dist hotspot`, the default, each key of a branch
+is drawn independently: hot with probability s, uniformly within the hot or the cold range. `--dist acta`
+keeps Acta's makeWorkingSet, which takes the first ceil(ops x s) keys of each list from the hot range:
+with a few ops per list every key is then hot from s = 0.67 on, so s only sets the size of a uniformly
+accessed hot range. Results up to commit `fe98006` (final-v2, peak, skews) were measured that way. Each
+run reports the realized share in the `hot_share` column. Larger tables (`--table-size 1000000`) are
+cheap to set up: the shim's SQL store and Sonata's tables are reset in place, and the audit reads only
+the keys the run wrote.
+
+### Op-order randomness
+
+`--randomness r` (default 1) sets the order a branch issues its operations in, its keys unchanged: the
+first round((1 - r) x ops) of them, a random subset of its keys, go in ascending key order, the rest after
+them in a random order. r = 0: every branch locks its keys in ascending order; r = 1: a fully random order.
+Recorded in the `randomness` column. `scripts/bench-randomness-compare.py OUT.png R=DIR ...` compares the
+peaks of one `bench-peak.py` sweep per value of r.
+
+### Peak throughput and time budget
+
+`scripts/bench-peak.py` searches, for each server kind, skew and shim (speculative, non-speculative;
+same workload as `bench-final.sh`, no Sonata), the thread count with the highest throughput, 3 reps
+per point (`--threads T...` measures fixed thread counts instead, for both shims at equal load). A
+run's throughput is the median of its per-second samples, so a global stall does not decide a peak,
+and per-commit figures stop at the end of the workload, before the audit's read commits. Finished
+points are kept: rerun with `--out DIR` to resume. Besides `peak.md`, `peak-curves.png` and
+`timeseries-<db>.png`, it reports where the time of a branch commit goes in both shims (`budget-<db>.png`:
+active, lock wait, prepare wait, and the lifetime of aborted branches by cause), and `stalls.csv` lines
+up every throughput dip with the GC and safepoint pauses of the client and the nodes, `vmstat` and the
+TC's GC counters.
+
+```bash
+.venv/bin/python scripts/bench-peak.py --out bench-results/peak                    # the search
+.venv/bin/python scripts/bench-peak.py --out bench-results/budget --skews 0.95 0.99 --threads 50 75 100 125 150
+.venv/bin/python scripts/bench-peak.py summarize DIR    # also: plot DIR, stalls DIR
+```
+
 ## Next steps
 
 - Add a real key-value backend behind `KvStore`.
