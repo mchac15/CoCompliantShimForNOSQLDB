@@ -59,11 +59,16 @@ import java.util.concurrent.ThreadLocalRandom;
  *                         write of its key) becomes a get-for-update: the shims lock the key EXCLUSIVE right away
  *                         instead of SHARED, then upgrading at the write. Other reads stay plain gets; SQL
  *                         participants still run a plain select. false (default): every read is a plain get
+ * @param branchSkews      empty (default): every branch uses {@code skewness}; else one skewness per branch (branch i,
+ *                         table micro-i, draws its keys with the i-th one, each in [0.5, 1)), e.g. 0.99,0.5 for
+ *                         contention on the first branch's table only (0.5: uniform over the table). {@code
+ *                         skewness} stays the run's label (result folders, CSVs)
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
         boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
-        double thinkSdUs, int sampleMs, KeyDist dist, double randomness, boolean getForUpdate) {
+        double thinkSdUs, int sampleMs, KeyDist dist, double randomness, boolean getForUpdate,
+        List<Double> branchSkews) {
 
     /** How the keys of a branch are drawn; see {@code dist}. */
     public enum KeyDist {
@@ -87,7 +92,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false);
+                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false, List.of());
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -128,7 +133,17 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         return opsMean > 0 ? opsMax : writes;
     }
 
-    /** Keys per table in the hot range. */
+    /** The skewness branch {@code branch} draws its keys with: its {@code branchSkews} entry, else {@code skewness}. */
+    public double skewness(int branch) {
+        return branchSkews.isEmpty() ? skewness : branchSkews.get(branch);
+    }
+
+    /** Keys in the hot range of branch {@code branch}'s table. */
+    public int hotRangeSize(int branch) {
+        return (int) (tableSize * (1 - skewness(branch)));
+    }
+
+    /** Keys per table in the hot range (of {@code skewness}, the run's label). */
     public int hotRangeSize() {
         return (int) (tableSize * (1 - skewness));
     }
@@ -161,8 +176,17 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 : (long) maxReads() + maxWrites();   // hotspot: every key of a branch may be drawn hot
         long coldPerBranch = dist == KeyDist.ACTA ? (long) maxReads() + maxWrites() - hotPerBranch
                 : (long) maxReads() + maxWrites();   // ... or cold
-        require(hotPerBranch * branches <= hotRangeSize(), "requested hot keys exceed the hot range");
-        require(coldPerBranch * branches <= tableSize - hotRangeSize(), "requested cold keys exceed the cold range");
+        require(branchSkews.isEmpty() || branchSkews.size() == branches,
+                "--branch-skews needs one skewness per branch (--branches " + branches + ")");
+        for (double s : branchSkews) {
+            require(s >= 0.5 && s < 1.0, "--branch-skews entries must be in [0.5, 1)");
+        }
+        // a txn's keys are distinct across its branches (they share one key space): every branch's ranges must
+        // hold the most the whole txn can draw from them
+        for (int b = 0; b < branches; b++) {
+            require(hotPerBranch * branches <= hotRangeSize(b), "requested hot keys exceed the hot range");
+            require(coldPerBranch * branches <= tableSize - hotRangeSize(b), "requested cold keys exceed the cold range");
+        }
         return this;
     }
 
@@ -199,6 +223,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         KeyDist dist = c.dist;
         double randomness = c.randomness;
         boolean getForUpdate = c.getForUpdate;
+        List<Double> branchSkews = c.branchSkews;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -235,12 +260,14 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--dist" -> dist = KeyDist.parse(v);
                 case "--randomness" -> randomness = Double.parseDouble(v);
                 case "--get-for-update" -> getForUpdate = Boolean.parseBoolean(v);
+                case "--branch-skews" -> branchSkews = Arrays.stream(v.split(",")).map(String::trim)
+                        .filter(x -> !x.isEmpty()).map(Double::parseDouble).toList();
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
                 measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs,
-                dist, randomness, getForUpdate)
+                dist, randomness, getForUpdate, branchSkews)
                 .validate();
     }
 
