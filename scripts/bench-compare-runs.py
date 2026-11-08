@@ -23,8 +23,11 @@ bench_peak = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bench_peak)
 
 SYSTEMS = {"speculative": ("#2a78d6", "o", "Speculative"), "nonspeculative": ("#eb6834", "s", "Non-speculative")}
-CAUSES = [("upgrade_conflict", "#2a78d6", "Upgrade conflict"), ("coordinator", "#eb6834", "Coordinator abort"),
-          ("cascade", "#1baf7a", "Cascade"), (None, "#eda100", "Other")]
+CAUSES = [("upgrade_conflict", "#2a78d6", "Upgrade conflict"), ("lock_timeout", "#6250d6", "Lock timeout"),
+          ("prepare_wait_die", "#e87ba4", "Prepare wait-die (vote NO)"),
+          ("coordinator", "#eb6834", "Coordinator abort"), ("cascade", "#1baf7a", "Cascade"),
+          (None, "#eda100", "Other")]
+NAMED = tuple(c for c, _, _ in CAUSES if c)
 BUDGET = [("active_us", "#1baf7a", "Active (work + think)"), ("lock_wait_us", "#6250d6", "Lock wait"),
           ("prepare_wait_us", "#2a78d6", "Prepare wait"), ("post_vote_us", "#eda100", "Post-vote wait"),
           ("lost_us", "#e34948", "Lost to aborts")]
@@ -117,12 +120,24 @@ def paired_stacks(ax, runs, labels, threads, system, parts, scale=1.0, totals=Tr
                    hatch="///" if k == 0 else None, alpha=0.55 if k == 0 else 1.0,
                    label=name if k == 1 else None)
             bottom += vals
+        tag = label if len(label) <= 6 else label[:3] + "."   # under a bar: the long labels overlap
         for p, b in zip(pos, bottom):
-            ax.text(p, -0.02, label, transform=ax.get_xaxis_transform(), ha="center", va="top", fontsize=7,
+            ax.text(p, -0.02, tag, transform=ax.get_xaxis_transform(), ha="center", va="top", fontsize=7,
                     color=INK_MUTED)
             if totals:
                 ax.text(p, b, f"{b:.0f}", ha="center", va="bottom", fontsize=7.5, color=INK_MUTED)
     ax.set_xticks(x, [f"\n{t}" for t in threads])
+
+
+def share_scale(a1, a2):
+    """One y scale for both panels, so they compare at a glance, unless one would flatten the other (> 4x)."""
+    t1, t2 = a1.get_ylim()[1], a2.get_ylim()[1]
+    if max(t1, t2) <= 4 * max(1e-9, min(t1, t2)):
+        a1.set_ylim(0, max(t1, t2))
+        a2.set_ylim(0, max(t1, t2))
+    else:
+        for ax in (a1, a2):
+            ax.set_ylabel(ax.get_ylabel() + " (own scale)")
 
 
 def plot(runs, labels, threads, out, skew, db):
@@ -137,10 +152,15 @@ def plot(runs, labels, threads, out, skew, db):
     lines(a1, runs, labels, threads, lambda p: p["tps"])
     style(a1, "Committed transactions per second", "Throughput (txn/s)")
     a1.set_ylim(bottom=0)
-    a1.legend(frameon=False, fontsize=8.5, loc="lower right", ncol=2)
+    a1.legend(frameon=False, fontsize=8.5, loc="center right", ncol=2)
     lines(a2, runs, labels, threads, lambda p: p["p50_ms"])
     style(a2, "Median transaction latency (retries included)", "Latency p50 (ms)")
-    a2.set_ylim(bottom=0)
+    p50s = [p["p50_ms"] for run in runs for sys_ in run.values() for p in sys_.values() if p["p50_ms"] > 0]
+    if p50s and max(p50s) > 20 * min(p50s):
+        a2.set_yscale("log")   # e.g. a run stuck on the lock timeout next to ones in the 100 ms
+        a2.set_ylabel("Latency p50 (ms, log scale)")
+    else:
+        a2.set_ylim(bottom=0)
     fig.savefig(f"{out}-throughput.png", dpi=150, facecolor=SURFACE)
 
     # aborts by cause, same scale for both systems
@@ -150,21 +170,19 @@ def plot(runs, labels, threads, out, skew, db):
             c = max(1, p["commits"])
             if cause is None:
                 return 100 * sum(v for k, v in p["aborts"].items()
-                                 if k not in ("upgrade_conflict", "coordinator", "cascade")) / c
+                                 if k not in NAMED) / c
             return 100 * p["aborts"][cause] / c
         return f
     parts = [(color, name, per100(cause)) for cause, color, name in CAUSES]
     for ax, system in ((a1, "speculative"), (a2, "nonspeculative")):
         paired_stacks(ax, runs, labels, threads, system, parts)
         style(ax, f"{SYSTEMS[system][2]} shim: aborts per 100 branch commits", "Aborts per 100 commits", "")
-    top = max(a1.get_ylim()[1], a2.get_ylim()[1])
-    a1.set_ylim(0, top)
-    a2.set_ylim(0, top)
+    share_scale(a1, a2)
     a1.legend(frameon=False, fontsize=8.5, loc="upper left")
     lines(a3, runs, labels, threads, lambda p: 100 * p["client_abort"])
     style(a3, "Client: failed attempts", "Attempts that aborted (%)")
     a3.set_ylim(bottom=0)
-    a3.legend(frameon=False, fontsize=8, loc="upper left")
+    a3.legend(frameon=False, fontsize=8, loc="center right")
     fig.text(0.06, 0.03, "Shim counters of both nodes, cut at the last second before the audit. Hatched: "
              f"{labels[0]}; solid: {labels[1]}.", fontsize=8, color=INK_MUTED)
     fig.savefig(f"{out}-aborts.png", dpi=150, facecolor=SURFACE)
@@ -175,9 +193,7 @@ def plot(runs, labels, threads, out, skew, db):
     for ax, system in ((a1, "speculative"), (a2, "nonspeculative")):
         paired_stacks(ax, runs, labels, threads, system, parts)
         style(ax, f"{SYSTEMS[system][2]} shim: ms per branch commit", "ms per committed branch", "")
-    top = max(a1.get_ylim()[1], a2.get_ylim()[1])
-    a1.set_ylim(0, top)
-    a2.set_ylim(0, top)
+    share_scale(a1, a2)
     a2.legend(frameon=False, fontsize=8.5, loc="upper left")
     fig.text(0.06, 0.03, "Committed branches' lifetime split in active, lock wait, prepare wait and post-vote wait; "
              "plus the lifetime of the aborted branches, all divided by the branch commits.", fontsize=8,
@@ -187,8 +203,8 @@ def plot(runs, labels, threads, out, skew, db):
 
 def table(runs, labels, threads, out):
     lines_ = [f"# {labels[0]} vs {labels[1]}", "",
-              "| system | threads | tps | p50 ms | client abort % | shim aborts / 100 commits (upgrade, coordinator, "
-              "cascade) | lock wait ms | prepare wait ms | lost ms |", "|---|---|---|---|---|---|---|---|---|"]
+              "| system | threads | tps | p50 ms | client abort % | shim aborts / 100 commits (upgrade, lock timeout, "
+              "prepare wait-die, coordinator, cascade) | lock wait ms | prepare wait ms | lost ms |", "|---|---|---|---|---|---|---|---|---|"]
     for system in SYSTEMS:
         for t in threads:
             for run, label in zip(runs, labels):
@@ -200,8 +216,8 @@ def table(runs, labels, threads, out):
                 b = p["budget"]
                 lines_.append(
                     f"| {system} ({label}) | {t} | {p['tps']:.0f} | {p['p50_ms']:.0f} | {100 * p['client_abort']:.1f} | "
-                    f"{100 * sum(a.values()) / c:.1f} ({100 * a['upgrade_conflict'] / c:.1f}, "
-                    f"{100 * a['coordinator'] / c:.1f}, {100 * a['cascade'] / c:.1f}) | {b['lock_wait_us'] / 1000:.0f} | "
+                    f"{100 * sum(a.values()) / c:.1f} ({', '.join(f'{100 * a[k] / c:.1f}' for k in NAMED)}) | "
+                    f"{b['lock_wait_us'] / 1000:.0f} | "
                     f"{b['prepare_wait_us'] / 1000:.0f} | {b['lost_us'] / 1000:.0f} |")
     Path(f"{out}.md").write_text("\n".join(lines_) + "\n")
 
