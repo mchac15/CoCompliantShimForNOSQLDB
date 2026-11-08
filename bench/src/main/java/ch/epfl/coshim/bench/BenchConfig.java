@@ -54,9 +54,11 @@ import java.util.concurrent.ThreadLocalRandom;
  *                         round((1 - randomness) x ops) of them (a random subset of its keys) go in ascending
  *                         key order, the rest after them in a random order. 1 (default): every op in a random
  *                         order; 0: the whole branch locks its keys in ascending order. The keys are the same
- * @param getForUpdate     rmw only: the read of a read-modify-write is a get-for-update (the shims lock the key
- *                         EXCLUSIVE right away instead of SHARED, then upgrading at the write); SQL participants
- *                         still run a plain select. false (default): a plain get
+ * @param getForUpdate     before a branch runs, its planned ops are scanned and every read of a key the branch
+ *                         writes at that op or later (a read-modify-write's own read, or a pure read followed by a
+ *                         write of its key) becomes a get-for-update: the shims lock the key EXCLUSIVE right away
+ *                         instead of SHARED, then upgrading at the write. Other reads stay plain gets; SQL
+ *                         participants still run a plain select. false (default): every read is a plain get
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
@@ -153,7 +155,6 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         require(thinkMeanUs <= 0 || thinkSdUs >= 0, "--think-sd-us must be >= 0");
         require(sampleMs >= 0, "--sample-ms must be >= 0");
         require(randomness >= 0 && randomness <= 1, "--randomness must be in [0, 1]");
-        require(!getForUpdate || rmw, "--get-for-update needs --rmw true: only a read-modify-write reads before writing");
         // a txn's keys are distinct: the ranges must hold the most a txn can draw from each of them
         long hotPerBranch = dist == KeyDist.ACTA
                 ? (long) Math.ceil(maxReads() * skewness) + (long) Math.ceil(maxWrites() * skewness)

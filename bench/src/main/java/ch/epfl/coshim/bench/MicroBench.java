@@ -555,13 +555,16 @@ public final class MicroBench implements AutoCloseable {
             c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
             try {
                 boolean first = true;
-                for (Op op : b.ops()) {
+                boolean[] forUpdate = config.getForUpdate() ? readsForUpdate(b.ops(), config.rmw())
+                        : new boolean[b.ops().size()];
+                for (int i = 0; i < b.ops().size(); i++) {
+                    Op op = b.ops().get(i);
                     first = think(first, thinkNanos);
                     if (!op.write()) {
-                        p.get(c, b.table(), op.key());
+                        read(p, c, b.table(), op.key(), forUpdate[i]);
                         continue;
                     }
-                    long value = config.rmw() ? read(p, c, b.table(), op.key()) + 1
+                    long value = config.rmw() ? read(p, c, b.table(), op.key(), forUpdate[i]) + 1
                             : ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
                     p.put(c, b.table(), op.key(), value);
                 }
@@ -587,9 +590,32 @@ public final class MicroBench implements AutoCloseable {
         }
     }
 
-    /** The read of a read-modify-write: a get-for-update with {@code --get-for-update true}, else a get. */
-    private long read(Participant p, Connection c, String table, int key) throws SQLException {
-        return config.getForUpdate() ? p.getForUpdate(c, table, key) : p.get(c, table, key);
+    /** A read of the branch: a get-for-update if the plan marked it so, else a get. */
+    private static long read(Participant p, Connection c, String table, int key, boolean forUpdate)
+            throws SQLException {
+        return forUpdate ? p.getForUpdate(c, table, key) : p.get(c, table, key);
+    }
+
+    /**
+     * The planning pass of {@code --get-for-update}, before a branch runs: for every op, whether its read
+     * (if it reads) must be a get-for-update, i.e. whether the branch writes that key at this op or later.
+     * A read-modify-write's own read is one (its put follows); a pure read is one only if a later op writes
+     * its key; a read after the branch's last write of a key is a plain get (the key is already locked
+     * EXCLUSIVE then). A blind write (without {@code rmw}) reads nothing.
+     */
+    static boolean[] readsForUpdate(List<Op> ops, boolean rmw) {
+        boolean[] forUpdate = new boolean[ops.size()];
+        Set<Integer> writtenLater = new HashSet<>();
+        for (int i = ops.size() - 1; i >= 0; i--) {
+            Op op = ops.get(i);
+            if (op.write()) {
+                writtenLater.add(op.key());
+                forUpdate[i] = rmw;   // the read before its own put
+            } else {
+                forUpdate[i] = writtenLater.contains(op.key());
+            }
+        }
+        return forUpdate;
     }
 
     /**
