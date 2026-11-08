@@ -148,6 +148,12 @@ public class CoShimConnection<K, V> extends AbstractUnsupportedConnection implem
     }
 
     @Override
+    public V getForUpdate(String table, K key) throws SQLException {
+        TableKey<K> tableKey = new TableKey<>(table, key);
+        return request(id -> shim().getForUpdate(id, tableKey));
+    }
+
+    @Override
     public void put(String table, K key, V value) throws SQLException {
         TableKey<K> tableKey = new TableKey<>(table, key);
         request(id -> {

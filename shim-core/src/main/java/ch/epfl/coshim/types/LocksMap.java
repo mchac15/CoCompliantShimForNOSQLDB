@@ -148,10 +148,23 @@ public class LocksMap<K, V> {
    * MUST_ABORT / TIMED_OUT the caller runs abort_transaction(txn).
    */
   public LockResult lock(K key, Transaction<K, V> txn, LockMode mode, Duration timeout) {
+    return lock(key, txn, mode, timeout, false);
+  }
+
+  /**
+   * get-for-update's lock(): EXCLUSIVE, its new node marked as one whose holder read the key (see
+   * {@link Chain#acquire}). A txn that already holds k SHARED upgrades as usual; one that already
+   * holds it EXCLUSIVE gets ALREADY_HELD (it reads its own write, or what it read before).
+   */
+  public LockResult lockForUpdate(K key, Transaction<K, V> txn, Duration timeout) {
+    return lock(key, txn, LockMode.EXCLUSIVE, timeout, true);
+  }
+
+  private LockResult lock(K key, Transaction<K, V> txn, LockMode mode, Duration timeout, boolean readsKey) {
     long deadline = System.nanoTime() + timeout.toNanos();
     LockType<K, V> held = txn.getLock(key);
     if (held == null) {
-      Chain<K, V> chain = enqueue(key, txn, mode);
+      Chain<K, V> chain = enqueue(key, txn, mode, readsKey);
       return chain == null ? LockResult.MUST_ABORT : await(chain, txn, deadline);
     }
     if (held.mode() == LockMode.EXCLUSIVE || mode == LockMode.SHARED) {
@@ -274,10 +287,15 @@ public class LocksMap<K, V> {
 
   /** lock()'s critical section without the wait: the chain txn was appended to, or null. */
   Chain<K, V> enqueue(K key, Transaction<K, V> txn, LockMode mode) {
+    return enqueue(key, txn, mode, false);
+  }
+
+  /** @param readsKey get-for-update: see {@link Chain#acquire} */
+  Chain<K, V> enqueue(K key, Transaction<K, V> txn, LockMode mode, boolean readsKey) {
     boolean[] acquired = {false};
     Chain<K, V> chain = locksMap.compute(key, (k, c) -> {
       Chain<K, V> target = c != null ? c : new Chain<>(k);
-      acquired[0] = target.acquire(txn, mode);
+      acquired[0] = target.acquire(txn, mode, readsKey);
       return acquired[0] ? target : c;   // not running: leave the map as it was
     });
     return acquired[0] ? chain : null;

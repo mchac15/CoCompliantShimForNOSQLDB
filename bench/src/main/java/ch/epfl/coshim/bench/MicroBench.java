@@ -561,7 +561,7 @@ public final class MicroBench implements AutoCloseable {
                         p.get(c, b.table(), op.key());
                         continue;
                     }
-                    long value = config.rmw() ? p.get(c, b.table(), op.key()) + 1
+                    long value = config.rmw() ? read(p, c, b.table(), op.key()) + 1
                             : ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
                     p.put(c, b.table(), op.key(), value);
                 }
@@ -585,6 +585,11 @@ public final class MicroBench implements AutoCloseable {
                 RootContext.unbind();
             }
         }
+    }
+
+    /** The read of a read-modify-write: a get-for-update with {@code --get-for-update true}, else a get. */
+    private long read(Participant p, Connection c, String table, int key) throws SQLException {
+        return config.getForUpdate() ? p.getForUpdate(c, table, key) : p.get(c, table, key);
     }
 
     /**
@@ -756,7 +761,7 @@ public final class MicroBench implements AutoCloseable {
     /**
      * {@code COSHIM_TOKEN=... java ... MicroBench [--variant LABEL] [--shims PARTICIPANT,...]
      * [--tc host:port] [--threads N] [--table-size N] [--branches N] [--reads N] [--writes N] [--skew X]
-     * [--rmw true|false] [--warmup-s S] [--measure-s S] [--txn-timeout-ms MS]
+     * [--rmw true|false] [--get-for-update true|false] [--warmup-s S] [--measure-s S] [--txn-timeout-ms MS]
      * [--parallel-branches true|false] [--sonata true|false] [--csv FILE] [--label TEXT]}, where a
      * participant is a shim database {@code host:port/db} or {@code jdbc:mysql://...} /
      * {@code jdbc:postgresql://...}. Needs a running Seata TC and the shim nodes ({@code CoShimNode})
