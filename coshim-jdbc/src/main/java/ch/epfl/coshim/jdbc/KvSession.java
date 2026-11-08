@@ -28,6 +28,11 @@ public interface KvSession<K, V> {
         return get(null, key);
     }
 
+    /** Plain key-value access, for stores without tables. See {@link #getForUpdate(String, Object)}. */
+    default V getForUpdate(K key) throws SQLException {
+        return getForUpdate(null, key);
+    }
+
     /** Plain key-value access, for stores without tables. See {@link #get(Object)}. */
     default void put(K key, V value) throws SQLException {
         put(null, key, value);
@@ -41,6 +46,21 @@ public interface KvSession<K, V> {
      *     inside a global transaction)
      */
     V get(String table, K key) throws SQLException;
+
+    /**
+     * {@link #get(String, Object)} for a key the transaction writes afterwards ({@code SELECT ... FOR
+     * UPDATE}): the shim locks it EXCLUSIVE right away instead of SHARED and upgrading at the put. The
+     * write is still a separate {@link #put(String, Object, Object)}. Defaults to {@link #get(String,
+     * Object)}.
+     *
+     * @param table the table, or null for a plain key
+     * @return the value of {@code key} in {@code table}, or {@code null} if it has none
+     * @throws SQLTransactionRollbackException if the transaction must abort
+     * @throws SQLException as {@link #get(String, Object)}
+     */
+    default V getForUpdate(String table, K key) throws SQLException {
+        return get(table, key);
+    }
 
     /**
      * @param table the table, or null for a plain key

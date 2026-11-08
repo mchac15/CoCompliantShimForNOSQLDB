@@ -54,11 +54,16 @@ import java.util.concurrent.ThreadLocalRandom;
  *                         round((1 - randomness) x ops) of them (a random subset of its keys) go in ascending
  *                         key order, the rest after them in a random order. 1 (default): every op in a random
  *                         order; 0: the whole branch locks its keys in ascending order. The keys are the same
+ * @param getForUpdate     before a branch runs, its planned ops are scanned and every read of a key the branch
+ *                         writes at that op or later (a read-modify-write's own read, or a pure read followed by a
+ *                         write of its key) becomes a get-for-update: the shims lock the key EXCLUSIVE right away
+ *                         instead of SHARED, then upgrading at the write. Other reads stay plain gets; SQL
+ *                         participants still run a plain select. false (default): every read is a plain get
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
         boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
-        double thinkSdUs, int sampleMs, KeyDist dist, double randomness) {
+        double thinkSdUs, int sampleMs, KeyDist dist, double randomness, boolean getForUpdate) {
 
     /** How the keys of a branch are drawn; see {@code dist}. */
     public enum KeyDist {
@@ -82,7 +87,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0);
+                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false);
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -193,6 +198,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         int sampleMs = c.sampleMs;
         KeyDist dist = c.dist;
         double randomness = c.randomness;
+        boolean getForUpdate = c.getForUpdate;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -228,12 +234,13 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--sample-ms" -> sampleMs = Integer.parseInt(v);
                 case "--dist" -> dist = KeyDist.parse(v);
                 case "--randomness" -> randomness = Double.parseDouble(v);
+                case "--get-for-update" -> getForUpdate = Boolean.parseBoolean(v);
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
                 measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs,
-                dist, randomness)
+                dist, randomness, getForUpdate)
                 .validate();
     }
 

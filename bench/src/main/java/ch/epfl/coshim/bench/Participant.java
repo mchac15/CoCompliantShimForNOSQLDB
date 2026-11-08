@@ -51,6 +51,14 @@ sealed interface Participant extends AutoCloseable permits CoShimParticipant, Sq
     /** Reads a key inside a branch; a missing key is 0. */
     long get(Connection branch, String table, int key) throws SQLException;
 
+    /**
+     * Reads a key the branch writes next (read-modify-write); a missing key is 0. The CoShim participants
+     * lock it EXCLUSIVE right away (KvSession.getForUpdate); the default is a plain {@link #get}.
+     */
+    default long getForUpdate(Connection branch, String table, int key) throws SQLException {
+        return get(branch, table, key);
+    }
+
     /** Writes a key inside a branch. */
     void put(Connection branch, String table, int key, long value) throws SQLException;
 

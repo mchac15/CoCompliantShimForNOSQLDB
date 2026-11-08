@@ -195,9 +195,9 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
     public String summary() {
         StringBuilder sb = new StringBuilder();
         sb.append(String.format(Locale.ROOT, "[%s] shims=%s tc=%s threads=%d tableSize=%d branches=%d reads=%d "
-                        + "writes=%d skew=%.2f rmw=%b txnTimeout=%dms branches %s measure=%ds%n",
+                        + "writes=%d skew=%.2f rmw=%b getForUpdate=%b txnTimeout=%dms branches %s measure=%ds%n",
                 config.variant(), String.join(",", config.shims()), config.tc(), config.threads(), config.tableSize(),
-                config.branches(), config.reads(), config.writes(), config.skewness(), config.rmw(),
+                config.branches(), config.reads(), config.writes(), config.skewness(), config.rmw(), config.getForUpdate(),
                 config.txnTimeout().toMillis(), config.parallelBranches() ? "in parallel" : "in order",
                 config.measure().toSeconds()));
         sb.append(String.format(Locale.ROOT, "  keys: %s, %.1f %% of the accesses in the hot range (%d keys); "

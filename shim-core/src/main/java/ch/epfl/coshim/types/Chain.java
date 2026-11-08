@@ -5,6 +5,7 @@ import ch.epfl.coshim.types.Transaction.Status;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -86,9 +87,12 @@ class Chain<K, V> {
    * abort_transaction may have released its locks meanwhile, or end() ran), joins the last node if
    * both are SHARED or appends a new node, and records it in txn.locks_acquired.
    *
+   * @param readsKey txn takes an EXCLUSIVE lock to read k before writing it (get-for-update). Its node is marked upgraded, as one upgrade() made: its
+   *     holder read k, so it is not a blind write (the cascade must not stop at it, and an upgrade
+   *     must not move another txn in front of it)
    * @return false if txn is no longer started (nothing was changed): it must abort
    */
-  synchronized boolean acquire(Transaction<K, V> txn, LockMode mode) {
+  synchronized boolean acquire(Transaction<K, V> txn, LockMode mode, boolean readsKey) {
     synchronized (txn) {
       if (!txn.isRunning()) {
         return false;
@@ -99,6 +103,7 @@ class Chain<K, V> {
         target = lastNode;
       } else {
         target = new LockNode<>(key, mode, txn);
+        target.setUpgraded(readsKey && mode == LockMode.EXCLUSIVE);
         append(target);
       }
       txn.putLock(key, new LockType<>(mode, target));
@@ -323,8 +328,10 @@ class Chain<K, V> {
   /**
    * get()'s critical section, for a txn that holds key: DOOMED if txn is aborted / must_abort (a
    * foreign abort_transaction may have spliced its node out since lock() returned); else the value
-   * txn already read (read_buffer); else the write of the nearest EXCLUSIVE node at or before txn's
-   * own node; else a null value (no predecessor version: read the store, a committed writer applied
+   * txn already read (read_buffer); else the write of the nearest EXCLUSIVE node before txn's own
+   * node whose holder wrote key (txn's own node is never a predecessor version: if it is EXCLUSIVE,
+   * txn holds it and its own write was already looked up by get(), e.g. a get-for-update before the
+   * put; and a get-for-update holder that did not write key is skipped); else a null value (no predecessor version: read the store, a committed writer applied
    * its buffer before being spliced out). Reading that holder's buffer is safe: lock() only returned
    * once it was executed, so its buffer is final.
    */
@@ -335,12 +342,18 @@ class Chain<K, V> {
     if (txn.getReadSet().containsKey(key)) {
       return LocksMap.ReadResult.of(txn.getReadSet().get(key));
     }
-    LockNode<K, V> n = txn.getLock(key).node();
-    while (n != null && n.getMode() != LockMode.EXCLUSIVE) {
-      n = n.getPrev();
+    // the nearest EXCLUSIVE node before txn's own one whose holder wrote key: an EXCLUSIVE node has
+    // exactly one holder, and a get-for-update holder that never wrote key holds no version of it
+    // (its successors read what it read). Holders ahead are executed: their buffers are final
+    for (LockNode<K, V> n = txn.getLock(key).node().getPrev(); n != null; n = n.getPrev()) {
+      if (n.getMode() == LockMode.EXCLUSIVE) {
+        Map<K, V> writes = n.getHolders().iterator().next().getWriteSet();
+        if (writes.containsKey(key)) {
+          return LocksMap.ReadResult.of(writes.get(key));
+        }
+      }
     }
-    // an EXCLUSIVE node has exactly one holder
-    return LocksMap.ReadResult.of(n == null ? null : n.getHolders().iterator().next().getWriteSet().get(key));
+    return LocksMap.ReadResult.of(null);
   }
 
   /**
