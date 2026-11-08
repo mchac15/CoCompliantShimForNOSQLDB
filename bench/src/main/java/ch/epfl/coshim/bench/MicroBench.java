@@ -377,7 +377,7 @@ public final class MicroBench implements AutoCloseable {
             int w;
             do {
                 r = config.drawReads();
-                w = config.drawWrites();
+                w = config.readOnly(b) ? 0 : config.drawWrites();
             } while (r + w == 0);
             List<Integer> reads = workingSet(config, b, r, used);
             List<Integer> writes = workingSet(config, b, w, used);

@@ -3,7 +3,9 @@ package ch.epfl.coshim.bench;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 
 /**
  * Parameters of one {@link MicroBench} run. The defaults are the "simple test": Acta's Micro workload
@@ -63,12 +65,15 @@ import java.util.concurrent.ThreadLocalRandom;
  *                         table micro-i, draws its keys with the i-th one, each in [0.5, 1)), e.g. 0.99,0.5 for
  *                         contention on the first branch's table only (0.5: uniform over the table). {@code
  *                         skewness} stays the run's label (result folders, CSVs)
+ * @param readOnlyBranches branch indices (0-based: branch i uses table micro-i) that only read: no writes, at least
+ *                         one read. Readers never wait for each other, so no transaction ever waits on those tables:
+ *                         with parallel branches, no cross-branch deadlock can form through them. Empty (default): none
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
         boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
         double thinkSdUs, int sampleMs, KeyDist dist, double randomness, boolean getForUpdate,
-        List<Double> branchSkews) {
+        List<Double> branchSkews, Set<Integer> readOnlyBranches) {
 
     /** How the keys of a branch are drawn; see {@code dist}. */
     public enum KeyDist {
@@ -92,7 +97,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false, List.of());
+                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false, List.of(), Set.of());
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -103,6 +108,11 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     /** Writes of one branch: {@code writes}, or a draw from the distribution. */
     public int drawWrites() {
         return opsMean > 0 ? drawOps() : writes;
+    }
+
+    /** Branch {@code branch} only reads (see {@code readOnlyBranches}). */
+    public boolean readOnly(int branch) {
+        return readOnlyBranches.contains(branch);
     }
 
     /** round(N(opsMean, opsSd)), drawn again until it is in [0, opsMax] (a truncated normal). */
@@ -178,6 +188,10 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 : (long) maxReads() + maxWrites();   // ... or cold
         require(branchSkews.isEmpty() || branchSkews.size() == branches,
                 "--branch-skews needs one skewness per branch (--branches " + branches + ")");
+        for (int b : readOnlyBranches) {
+            require(b >= 0 && b < branches, "--read-only-branches are 0-based indices below --branches " + branches);
+        }
+        require(readOnlyBranches.isEmpty() || maxReads() > 0, "--read-only-branches needs reads (--reads or --ops-mean)");
         for (double s : branchSkews) {
             require(s >= 0.5 && s < 1.0, "--branch-skews entries must be in [0.5, 1)");
         }
@@ -224,6 +238,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         double randomness = c.randomness;
         boolean getForUpdate = c.getForUpdate;
         List<Double> branchSkews = c.branchSkews;
+        Set<Integer> readOnlyBranches = c.readOnlyBranches;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -260,6 +275,8 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--dist" -> dist = KeyDist.parse(v);
                 case "--randomness" -> randomness = Double.parseDouble(v);
                 case "--get-for-update" -> getForUpdate = Boolean.parseBoolean(v);
+                case "--read-only-branches" -> readOnlyBranches = Arrays.stream(v.split(",")).map(String::trim)
+                        .filter(x -> !x.isEmpty()).map(Integer::parseInt).collect(Collectors.toUnmodifiableSet());
                 case "--branch-skews" -> branchSkews = Arrays.stream(v.split(",")).map(String::trim)
                         .filter(x -> !x.isEmpty()).map(Double::parseDouble).toList();
                 default -> throw new IllegalArgumentException("unknown option " + flag);
@@ -267,7 +284,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
                 measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs,
-                dist, randomness, getForUpdate, branchSkews)
+                dist, randomness, getForUpdate, branchSkews, readOnlyBranches)
                 .validate();
     }
 
