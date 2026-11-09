@@ -24,6 +24,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -349,8 +350,9 @@ public final class MicroBench implements AutoCloseable {
 
     private List<Branch> nextPlan() {
         List<Branch> plan = randomPlan(config, participants.size());
-        int hot = config.hotRangeSize();
-        for (Branch b : plan) {
+        for (int i = 0; i < plan.size(); i++) {
+            Branch b = plan.get(i);
+            int hot = config.hotRangeSize(i);
             writtenKeys.computeIfAbsent(b.shim(), p -> new ConcurrentHashMap<>())
                     .computeIfAbsent(b.table(), t -> ConcurrentHashMap.newKeySet()).addAll(b.writeKeys());
             for (Op op : b.ops()) {
@@ -376,10 +378,10 @@ public final class MicroBench implements AutoCloseable {
             int w;
             do {
                 r = config.drawReads();
-                w = config.drawWrites();
+                w = config.readOnly(b) ? 0 : config.drawWrites();
             } while (r + w == 0);
-            List<Integer> reads = workingSet(config, r, used);
-            List<Integer> writes = workingSet(config, w, used);
+            List<Integer> reads = workingSet(config, b, r, used);
+            List<Integer> writes = workingSet(config, b, w, used);
             List<Op> ops = new ArrayList<>();
             reads.forEach(k -> ops.add(new Op(k, false)));
             writes.forEach(k -> ops.add(new Op(k, true)));
@@ -397,14 +399,15 @@ public final class MicroBench implements AutoCloseable {
      * with probability skewness, else from the cold range; acta, Acta's makeWorkingSet, ops × skewness keys
      * from the hot range, the rest from the cold range.
      */
-    private static List<Integer> workingSet(BenchConfig config, int ops, Set<Integer> used) {
+    private static List<Integer> workingSet(BenchConfig config, int branch, int ops, Set<Integer> used) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
-        int hot = config.hotRangeSize();
+        int hot = config.hotRangeSize(branch);
+        double skewness = config.skewness(branch);
         List<Integer> keys = new ArrayList<>();
         if (config.dist() == BenchConfig.KeyDist.HOTSPOT) {
             while (keys.size() < ops) {
                 // validate() made both ranges large enough for a whole txn: the redraws end
-                boolean isHot = random.nextDouble() < config.skewness();
+                boolean isHot = random.nextDouble() < skewness;
                 int candidate = isHot ? random.nextInt(0, hot) : random.nextInt(hot, config.tableSize());
                 if (used.add(candidate)) {
                     keys.add(candidate);
@@ -412,7 +415,7 @@ public final class MicroBench implements AutoCloseable {
             }
             return keys;
         }
-        while (keys.size() < ops * config.skewness()) {
+        while (keys.size() < ops * skewness) {
             int candidate = random.nextInt(0, hot);
             if (used.add(candidate)) {
                 keys.add(candidate);
@@ -449,6 +452,7 @@ public final class MicroBench implements AutoCloseable {
         }
         try {
             boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan, causes, thinkNanos)
+                    : config.pipelinedBranches() ? phaseOnePipelined(tx, plan, causes, thinkNanos)
                     : phaseOneInOrder(tx, plan, causes, thinkNanos);
             if (!allYes) {
                 return rollback(tx);
@@ -535,6 +539,83 @@ public final class MicroBench implements AutoCloseable {
     }
 
     /**
+     * Phase 1 with the branches pipelined: one after the other on this thread, but a branch's end + prepare
+     * (Seata's close() of its XA connection; its commit() only checks the state) runs on a pool thread, so the
+     * next branch starts as soon as this one finished its operations instead of after its vote. Starts no
+     * further branch once one failed or a vote already came back NO; returns when every started branch voted.
+     */
+    private boolean phaseOnePipelined(GlobalTransaction tx, List<Branch> plan, Collection<String> causes,
+            AtomicLong thinkNanos) {
+        String xid = tx.getXid();
+        Collection<String> shared = Collections.synchronizedCollection(causes);
+        List<Future<Boolean>> votes = new ArrayList<>();
+        boolean executed = true;
+        for (Branch b : plan) {
+            if (votes.stream().anyMatch(v -> v.isDone() && !voteOf(v))) {
+                executed = false;   // a vote came back NO: the txn rolls back anyway
+                break;
+            }
+            Participant p = participants.get(b.shim());
+            Connection c;
+            try {
+                c = p.dataSource().getConnection();
+            } catch (SQLException e) {
+                countFailure(e, shared);
+                executed = false;
+                break;
+            }
+            try {
+                c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
+                executeBranch(p, c, b, thinkNanos);
+                c.commit();   // only checks the XA state: end + prepare happen in close()
+            } catch (SQLException e) {
+                countFailure(e, shared);
+                try {
+                    c.rollback();
+                } catch (SQLException ignored) {
+                    // the global rollback that follows aborts the branch anyway
+                }
+                try {
+                    c.close();
+                } catch (SQLException ignored) {
+                    // already counted
+                }
+                executed = false;
+                break;
+            }
+            votes.add(branchPool.submit(() -> {
+                RootContext.bind(xid);
+                try {
+                    c.close();   // xa end + xa prepare: the participant votes
+                    return true;
+                } catch (SQLException e) {
+                    countFailure(e, shared);
+                    return false;
+                } finally {
+                    RootContext.unbind();
+                }
+            }));
+        }
+        boolean allYes = executed;
+        for (Future<Boolean> v : votes) {
+            allYes &= voteOf(v);
+        }
+        return allYes;
+    }
+
+    /** A pipelined branch's vote, waiting for it: false if its prepare failed or the wait was interrupted. */
+    private static boolean voteOf(Future<Boolean> vote) {
+        try {
+            return vote.get();
+        } catch (ExecutionException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /**
      * Phase 1 of one branch over an XA connection to its participant: register + start, the
      * reads/writes, end + prepare (with Sonata, its dummy write comes right before prepare). With
      * {@code thinkMeanUs}, the application pauses before every operation but the first and before
@@ -554,22 +635,8 @@ public final class MicroBench implements AutoCloseable {
         try (Connection c = p.dataSource().getConnection()) {
             c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
             try {
-                boolean first = true;
-                boolean[] forUpdate = config.getForUpdate() ? readsForUpdate(b.ops(), config.rmw())
-                        : new boolean[b.ops().size()];
-                for (int i = 0; i < b.ops().size(); i++) {
-                    Op op = b.ops().get(i);
-                    first = think(first, thinkNanos);
-                    if (!op.write()) {
-                        read(p, c, b.table(), op.key(), forUpdate[i]);
-                        continue;
-                    }
-                    long value = config.rmw() ? read(p, c, b.table(), op.key(), forUpdate[i]) + 1
-                            : ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
-                    p.put(c, b.table(), op.key(), value);
-                }
-                think(false, thinkNanos);
-                c.commit();   // xa end + xa prepare: the participant votes
+                executeBranch(p, c, b, thinkNanos);
+                c.commit();   // only checks the XA state: end + prepare (the vote) happen in close()
                 return true;
             } catch (SQLException e) {
                 countFailure(e, causes);
@@ -588,6 +655,29 @@ public final class MicroBench implements AutoCloseable {
                 RootContext.unbind();
             }
         }
+    }
+
+    /**
+     * A branch's operations on its started XA connection, then the think time before its prepare.
+     *
+     * @param thinkNanos receives the time this branch paused for
+     */
+    private void executeBranch(Participant p, Connection c, Branch b, AtomicLong thinkNanos) throws SQLException {
+        boolean first = true;
+        boolean[] forUpdate = config.getForUpdate() ? readsForUpdate(b.ops(), config.rmw())
+                : new boolean[b.ops().size()];
+        for (int i = 0; i < b.ops().size(); i++) {
+            Op op = b.ops().get(i);
+            first = think(first, thinkNanos);
+            if (!op.write()) {
+                read(p, c, b.table(), op.key(), forUpdate[i]);
+                continue;
+            }
+            long value = config.rmw() ? read(p, c, b.table(), op.key(), forUpdate[i]) + 1
+                    : ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+            p.put(c, b.table(), op.key(), value);
+        }
+        think(false, thinkNanos);
     }
 
     /** A read of the branch: a get-for-update if the plan marked it so, else a get. */

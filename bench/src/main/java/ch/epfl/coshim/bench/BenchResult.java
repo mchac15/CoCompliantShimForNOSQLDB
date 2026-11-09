@@ -198,11 +198,20 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         + "writes=%d skew=%.2f rmw=%b getForUpdate=%b txnTimeout=%dms branches %s measure=%ds%n",
                 config.variant(), String.join(",", config.shims()), config.tc(), config.threads(), config.tableSize(),
                 config.branches(), config.reads(), config.writes(), config.skewness(), config.rmw(), config.getForUpdate(),
-                config.txnTimeout().toMillis(), config.parallelBranches() ? "in parallel" : "in order",
+                config.txnTimeout().toMillis(),
+                config.parallelBranches() ? "in parallel" : config.pipelinedBranches() ? "pipelined" : "in order",
                 config.measure().toSeconds()));
         sb.append(String.format(Locale.ROOT, "  keys: %s, %.1f %% of the accesses in the hot range (%d keys); "
                         + "op order randomness %.2f%n", config.dist(), 100 * hotShare, config.hotRangeSize(),
                 config.randomness()));
+        if (!config.readOnlyBranches().isEmpty()) {
+            sb.append(String.format(Locale.ROOT, "  read-only branches: %s (0-based)%n",
+                    new java.util.TreeSet<>(config.readOnlyBranches())));
+        }
+        if (!config.branchSkews().isEmpty()) {
+            sb.append(String.format(Locale.ROOT, "  branch skews: %s (the hot share above is over every branch)%n",
+                    config.branchSkews()));
+        }
         if (config.opsMean() > 0 || config.thinkMeanUs() > 0) {
             sb.append(String.format(Locale.ROOT, "  ops per branch: %s   think time: %s%n",
                     config.opsMean() > 0 ? String.format(Locale.ROOT, "N(%.1f, %.1f) in [0, %d]", config.opsMean(),
@@ -244,7 +253,8 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         "timed_out", "unknown", "abort_rate", "mean_us", "p50_us", "p99_us", "audit_ok",
                         "branch_failures", "ops_mean", "ops_sd", "ops_max", "think_mean_us", "think_sd_us",
                         "mean_attempts", "retried_share", "op_p50_us", "op_p99_us", "txn_active_p50_us",
-                        "txn_active_p99_us", "retries_p50", "retries_p99", "dist", "hot_share", "randomness")
+                        "txn_active_p99_us", "retries_p50", "retries_p99", "dist", "hot_share", "randomness",
+                        "pipelined_branches")
                 .collect(Collectors.joining(","));
     }
 
@@ -260,7 +270,7 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         String.format(Locale.ROOT, "%.4f", retriedShare()), opLatencyPercentileUs(50),
                         opLatencyPercentileUs(99), activeLatencyPercentileUs(50), activeLatencyPercentileUs(99),
                         retriesPercentile(50), retriesPercentile(99), config.dist(),
-                        String.format(Locale.ROOT, "%.4f", hotShare), config.randomness())
+                        String.format(Locale.ROOT, "%.4f", hotShare), config.randomness(), config.pipelinedBranches())
                 .map(String::valueOf)
                 .collect(Collectors.joining(","));
     }
