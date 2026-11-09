@@ -174,7 +174,7 @@ def plot(runs, labels, threads, out, skew, db):
     fig.savefig(f"{out}-throughput.png", dpi=150, facecolor=SURFACE)
 
     # aborts by cause, same scale for both systems
-    fig, (a1, a2, a3) = figure(plt, 3, f"Aborts: {vs}", what, width=20)
+    fig, (a1, a2, a3) = figure(plt, 3, f"Aborts: {vs}", what, width=20, height=6, bottom=0.3)
     def per100(cause):
         def f(p):
             c = max(1, p["commits"])
@@ -188,7 +188,7 @@ def plot(runs, labels, threads, out, skew, db):
         paired_stacks(ax, runs, labels, threads, system, parts)
         style(ax, f"{SYSTEMS[system][2]} shim: aborts per 100 branch commits", "Aborts per 100 commits", "")
     share_scale(a1, a2)
-    a1.legend(frameon=False, fontsize=8.5, loc="upper left")
+    a1.legend(frameon=False, fontsize=8.5, loc="upper left", bbox_to_anchor=(0, -0.16), ncol=3)
     lines(a3, runs, labels, threads, lambda p: 100 * p["client_abort"])
     style(a3, "Client: failed attempts", "Attempts that aborted (%)")
     a3.set_ylim(bottom=0)
@@ -199,13 +199,14 @@ def plot(runs, labels, threads, out, skew, db):
     fig.savefig(f"{out}-aborts.png", dpi=150, facecolor=SURFACE)
 
     # time budget per branch commit
-    fig, (a1, a2) = figure(plt, 2, f"Where the time goes: {vs}", what, width=15)
+    fig, (a1, a2) = figure(plt, 2, f"Where the time goes: {vs}", what, width=15, height=6, bottom=0.27)
     parts = [(color, name, (lambda key: lambda p: p["budget"][key] / 1000)(key)) for key, color, name in BUDGET]
     for ax, system in ((a1, "speculative"), (a2, "nonspeculative")):
         paired_stacks(ax, runs, labels, threads, system, parts)
         style(ax, f"{SYSTEMS[system][2]} shim: ms per branch commit", "ms per committed branch", "")
     share_scale(a1, a2)
-    a2.legend(frameon=False, fontsize=8.5, loc="upper left")
+    a1.legend(*a2.get_legend_handles_labels(), frameon=False, fontsize=8.5, loc="upper left",
+              bbox_to_anchor=(0, -0.16), ncol=len(BUDGET))
     fig.text(0.06, 0.03, "Committed branches' lifetime split in active, lock wait, prepare wait and post-vote wait; "
              "plus the lifetime of the aborted branches, all divided by the branch commits.", fontsize=8,
              color=INK_MUTED)
