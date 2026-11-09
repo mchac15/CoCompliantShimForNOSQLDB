@@ -11,6 +11,8 @@ Writes into --out (default RESULTS_DIR):
   speclim-aborts.png      cascades / wounds / coordinator aborts per 100 commits vs threads
   speclim-limiter.png     what the caps did (node logs): lock calls refused per commit by each cap, and the
                           share of cascade marks that hit txns still blocked in lock()
+  speclim-budget.png      where a committed branch's time goes (bench-peak's budget, plus the post-vote wait),
+                          each config at its peak-throughput thread count; speclim-budget.md the same as a table
   speclim.md              every point as a table
 
 A point is "stalled" when its throughput was 0 for at least 5 consecutive seconds of the measurement window
@@ -33,6 +35,13 @@ DEPTH_MARKERS = {"1": "o", "2": "s", "4": "^"}
 INK, MUTED, SURFACE, GRID = "#1f1f1e", "#52514e", "#fcfcfb", "#e1e0d9"
 DIVERGING = LinearSegmentedColormap.from_list("gain", ["#e34948", "#f0efec", "#2a78d6"])
 STALL_S = 5
+# bench-peak.py's time budget per branch commit (µs), its colors, plus the post-vote wait it leaves out;
+# hatched: lost time (aborted branches' lifetime per commit), dotted: post-vote (secondary cue for its neighbor)
+BUDGET = [("active_us", "active (work + think)", "#2a78d6", ""), ("lock_wait_us", "lock wait", "#eb6834", ""),
+          ("prepare_wait_us", "prepare wait", "#1baf7a", ""),
+          ("post_vote_us", "post-vote wait (2PC decision)", "#e34948", ".."),
+          ("lost_wounded_us", "lost: wounded", "#eda100", "//"), ("lost_cascade_us", "lost: cascade", "#e87ba4", "//"),
+          ("lost_coordinator_us", "lost: coordinator", "#008300", "//"), ("lost_other_us", "lost: other", "#6250d6", "//")]
 
 plt.rcParams.update({
     "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
@@ -92,6 +101,7 @@ def load(results):
             t = int(r["threads"])
             p = {k: float(r[k]) for k in ("tps", "tps_raw", "abort_rate", "cascades_per_100", "wounded_per_100",
                                            "coordinator_per_100", "op_p50_us")}
+            p.update({k: float(r[k] or 0) for k, *_ in BUDGET})
             p["threads"] = t
             p["stalled"] = stalled(point_dir, t)
             p["tps_plot"] = p["tps_raw"] if p["stalled"] else p["tps"]
@@ -250,6 +260,66 @@ def limiter(configs, out):
     plt.close(fig)
 
 
+def peak(pts):
+    """The point of highest throughput among those that did not stall."""
+    return max((p for p in pts if not p["stalled"]), key=lambda p: p["tps_plot"])
+
+
+def config_label(k):
+    if k[0] == "nonspec":
+        return "non-speculative"
+    return "speculative, uncapped" if k[1] == "none" else f"depth ≤ {k[1]}, fanout ≤ {k[2]}"
+
+
+def config_order(k):
+    return (k[0] != "nonspec", k[1] != "none", int(k[1]) if k[1] not in (None, "none") else 0,
+            int(k[2]) if k[2] not in (None, "none") else 0)
+
+
+def budget(configs, out):
+    """Where the time goes per committed branch, at each config's peak throughput."""
+    keys = sorted(configs, key=config_order)
+    peaks = {k: peak(configs[k]) for k in keys}
+    totals = {k: sum(peaks[k][c] for c, *_ in BUDGET) / 1000 for k in keys}
+    span = max(totals.values())
+    fig, ax = plt.subplots(figsize=(11, 0.5 * len(keys) + 1.6))
+    ax.grid(False)
+    ax.grid(True, axis="x")
+    for y, k in enumerate(keys):
+        left = 0
+        for c, name, color, hatch in BUDGET:
+            w = peaks[k][c] / 1000
+            ax.barh(y, w, left=left, height=0.62, color=color, hatch=hatch, edgecolor=SURFACE, linewidth=2,
+                    label=name if y == 0 else None, zorder=3)
+            if w >= 0.045 * span:
+                ax.text(left + w / 2, y, f"{w:.0f}", ha="center", va="center", fontsize=7.5, color=INK, zorder=4,
+                        bbox=dict(boxstyle="round,pad=0.15", facecolor=SURFACE, edgecolor="none", alpha=0.85))
+            left += w
+        ax.text(left + 0.01 * span, y, f"{left:.0f} ms · {peaks[k]['tps_plot']:.0f} tps @ {peaks[k]['threads']} thr",
+                va="center", fontsize=8, color=MUTED)
+    ax.set_yticks(range(len(keys)), [config_label(k) for k in keys])
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.3 * span)
+    ax.set_xlabel("ms per committed branch (lost = lifetime of the aborted branches, per commit)")
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False, bbox_to_anchor=(0.55, 1.0), fontsize=8)
+    fig.text(0.55, -0.01, "each config at its peak-throughput thread count (stalled points excluded); "
+             "values in ms, segments under ~4% of the widest bar unlabeled (see speclim-budget.md)",
+             ha="center", color=MUTED, fontsize=8)
+    fig.tight_layout(rect=(0, 0, 1, 0.88))
+    fig.savefig(out / "speclim-budget.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    lines = ["| config | peak threads | tps | " + " | ".join(name for _, name, *_ in BUDGET) + " | total |",
+             "|" + "---|" * (len(BUDGET) + 4)]
+    for k in keys:
+        p = peaks[k]
+        lines.append(f"| {config_label(k)} | {p['threads']} | {p['tps_plot']:.0f} | "
+                     + " | ".join(f"{p[c] / 1000:.1f}" for c, *_ in BUDGET) + f" | {totals[k]:.1f} |")
+    (out / "speclim-budget.md").write_text(
+        "# Time budget at peak throughput\n\nms per committed branch, each config at its peak-throughput thread count "
+        "(stalled points excluded); lost = lifetime of the aborted branches, per commit.\n\n" + "\n".join(lines) + "\n")
+
+
 def table(configs, out):
     def name(k):
         return "non-speculative" if k[0] == "nonspec" else f"spec d≤{k[1]} f≤{k[2]}".replace("≤none", " none")
@@ -283,8 +353,9 @@ def main():
     gain(configs, out)
     aborts(configs, out)
     limiter(configs, out)
+    budget(configs, out)
     table(configs, out)
-    print(f"wrote speclim-{{throughput,gain,aborts,limiter}}.png and speclim.md to {out}")
+    print(f"wrote speclim-{{throughput,gain,aborts,limiter,budget}}.png and speclim{{,-budget}}.md to {out}")
 
 
 if __name__ == "__main__":
