@@ -308,6 +308,28 @@ def counters_of(line):
     return {k: int(v) for k, v in (kv.split("=", 1) for kv in line.split() if "=" in kv) if re.fullmatch(r"-?\d+", v)}
 
 
+def last_active_second(stats):
+    """
+    Index of a node's last stats line (one per second) before the audit: the last one whose abort count
+    changed. A run without a single abort (e.g. get-for-update) has none: then the second before the last
+    burst of commits, the audit's reads arriving on top of the drain (over 1.6x the median rate).
+    """
+    i = len(stats) - 1
+    while i > 0 and stats[i].get("aborts") == stats[i - 1].get("aborts"):
+        i -= 1
+    if i > 0:
+        return i
+    commits = [s.get("commits", 0) for s in stats]
+    rates = [b - a for a, b in zip(commits, commits[1:])]
+    busy = sorted(r for r in rates if r > 0)
+    if not busy:
+        return len(stats) - 1
+    median = busy[len(busy) // 2]
+    bursts = [k for k, r in enumerate(rates) if r > 1.6 * median]
+    # rates[k] is the step from line k to line k + 1: line k is the last one before that burst
+    return bursts[-1] if bursts else max(k + 1 for k, r in enumerate(rates) if r > 0)
+
+
 def node_counters(nodes_dir, var):
     """
     The shim nodes' counters at the last logged second the workload was active, summed over nodes and reps.
@@ -325,9 +347,7 @@ def node_counters(nodes_dir, var):
                 spec.append(counters_of(line))
         if not stats:
             continue
-        i = len(stats) - 1
-        while i > 0 and stats[i].get("aborts") == stats[i - 1].get("aborts"):
-            i -= 1
+        i = last_active_second(stats)
         snapshot = dict(stats[i])
         if i < len(spec):
             # from the speculation line only its totals (it repeats commits=)

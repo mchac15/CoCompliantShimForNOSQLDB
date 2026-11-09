@@ -194,16 +194,35 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
 
   /** lock(), its duration added to txn's time budget (statistics only). */
   private LockResult timedLock(K key, Transaction<K, V> txn, LockType.LockMode mode) {
+    return timedLock(key, txn, mode, false);
+  }
+
+  /** @param forUpdate get-for-update: EXCLUSIVE, the node marked as read (mode must be EXCLUSIVE) */
+  private LockResult timedLock(K key, Transaction<K, V> txn, LockType.LockMode mode, boolean forUpdate) {
     long t0 = System.nanoTime();
-    LockResult res = locksMap.lock(key, txn, mode, lockTimeout);
+    LockResult res = forUpdate
+        ? locksMap.lockForUpdate(key, txn, lockTimeout)
+        : locksMap.lock(key, txn, mode, lockTimeout);
     txn.addLockWaitNanos(System.nanoTime() - t0);
     return res;
   }
 
   @Override
   public V get(String txnId, K key) {
+    return read(txnId, key, false);
+  }
+
+  /** get() under an EXCLUSIVE lock: the later put(k) of this txn needs no upgrade. */
+  @Override
+  public V getForUpdate(String txnId, K key) {
+    return read(txnId, key, true);
+  }
+
+  private V read(String txnId, K key, boolean forUpdate) {
     Transaction<K, V> txn = running(txnId);
-    LockResult res = timedLock(key, txn, LockType.LockMode.SHARED);
+    LockResult res = forUpdate
+        ? timedLock(key, txn, LockType.LockMode.EXCLUSIVE, true)
+        : timedLock(key, txn, LockType.LockMode.SHARED);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
       throw new TxnAbortedException("get: lock failed, must abort" + causeTag(txn));

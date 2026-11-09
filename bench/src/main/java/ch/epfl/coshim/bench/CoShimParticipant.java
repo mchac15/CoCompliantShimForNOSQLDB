@@ -54,6 +54,12 @@ final class CoShimParticipant implements Participant {
     }
 
     @Override
+    public long getForUpdate(Connection branch, String table, int key) throws SQLException {
+        String v = KvSession.<String, String>from(branch).getForUpdate(table, String.valueOf(key));
+        return v == null ? 0 : Long.parseLong(v);
+    }
+
+    @Override
     public void put(Connection branch, String table, int key, long value) throws SQLException {
         KvSession.<String, String>from(branch).put(table, String.valueOf(key), String.valueOf(value));
     }

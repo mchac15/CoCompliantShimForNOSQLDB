@@ -7,3 +7,4 @@ target/
 .settings/
 bench-results/
 .venv/
+__pycache__/
