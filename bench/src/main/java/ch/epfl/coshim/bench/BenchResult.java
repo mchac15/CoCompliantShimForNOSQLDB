@@ -204,6 +204,14 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
         sb.append(String.format(Locale.ROOT, "  keys: %s, %.1f %% of the accesses in the hot range (%d keys); "
                         + "op order randomness %.2f%n", config.dist(), 100 * hotShare, config.hotRangeSize(),
                 config.randomness()));
+        if (!config.readOnlyBranches().isEmpty()) {
+            sb.append(String.format(Locale.ROOT, "  read-only branches: %s (0-based)%n",
+                    new java.util.TreeSet<>(config.readOnlyBranches())));
+        }
+        if (!config.branchSkews().isEmpty()) {
+            sb.append(String.format(Locale.ROOT, "  branch skews: %s (the hot share above is over every branch)%n",
+                    config.branchSkews()));
+        }
         if (config.opsMean() > 0 || config.thinkMeanUs() > 0) {
             sb.append(String.format(Locale.ROOT, "  ops per branch: %s   think time: %s%n",
                     config.opsMean() > 0 ? String.format(Locale.ROOT, "N(%.1f, %.1f) in [0, %d]", config.opsMean(),
