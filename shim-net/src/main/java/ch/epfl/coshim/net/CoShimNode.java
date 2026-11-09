@@ -7,6 +7,7 @@ import ch.epfl.coshim.store.KvStore;
 import ch.epfl.coshim.store.TableKey;
 import ch.epfl.coshim.store.sql.KvStores;
 import ch.epfl.coshim.types.DeadlockPolicy;
+import ch.epfl.coshim.types.SpeculationLimits;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
@@ -24,8 +25,8 @@ import java.util.concurrent.TimeUnit;
  *
  * <pre>
  *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
- *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--stats-interval-s I] [--allow HOST ...]
- *       [--store memory|URL]
+ *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--spec-max-depth D] [--spec-max-fanout F]
+ *       [--stats-interval-s I] [--allow HOST ...] [--store memory|URL]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | nocc (no concurrency
@@ -39,6 +40,11 @@ import java.util.concurrent.TimeUnit;
  *     --prepare-deadlock  cross-shim deadlock prevention in prepare(): none | wait-die (prepare() votes
  *                         NO instead of waiting for a younger txn; the ages then come from the Seata
  *                         global transaction id, the same on every shim); default none
+ *     --spec-max-depth    speculative only: at most D uncommitted txns ahead whose abort would doom a
+ *                         lock grant on its key, or the grant waits for them to commit (0: no
+ *                         speculation); default none (no cap)
+ *     --spec-max-fanout   speculative only: at most F running txns depending speculatively on one
+ *                         txn, or the grant waits; default none (no cap)
  *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
  *     --allow             a client address allowed to connect (e.g. an RM host), repeatable; default:
  *                         any authenticated client
@@ -59,7 +65,8 @@ public final class CoShimNode {
 
     /** The parsed command line. */
     record Options(int port, String shim, String[] databases, Duration lockTimeout, DeadlockPolicy deadlock,
-            boolean prepareWaitDie, long statsIntervalSeconds, Set<InetAddress> allowed, String store) {
+            boolean prepareWaitDie, SpeculationLimits limits, long statsIntervalSeconds, Set<InetAddress> allowed,
+            String store) {
 
         static Options parse(String[] args) throws Exception {
             int port = 7000;
@@ -70,6 +77,8 @@ public final class CoShimNode {
             long lockTimeoutMs = 200;
             DeadlockPolicy deadlock = DeadlockPolicy.WAIT_DIE;
             boolean prepareWaitDie = false;
+            int maxDepth = SpeculationLimits.NO_LIMIT;
+            int maxFanout = SpeculationLimits.NO_LIMIT;
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
             String store = "memory";
@@ -87,6 +96,8 @@ public final class CoShimNode {
                         case "--lock-timeout-ms" -> lockTimeoutMs = Long.parseLong(value);
                         case "--deadlock" -> deadlock = parseDeadlock(value);
                         case "--prepare-deadlock" -> prepareWaitDie = parsePrepareDeadlock(value);
+                        case "--spec-max-depth" -> maxDepth = parseLimit(value);
+                        case "--spec-max-fanout" -> maxFanout = parseLimit(value);
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
                         case "--store" -> store = value;
@@ -102,7 +113,12 @@ public final class CoShimNode {
                 }
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
-                    prepareWaitDie, statsIntervalSeconds, allowed, store);
+                    prepareWaitDie, new SpeculationLimits(maxDepth, maxFanout), statsIntervalSeconds, allowed, store);
+        }
+
+        /** A speculation limit: a non-negative count, or none. */
+        private static int parseLimit(String value) {
+            return value.equals("none") ? SpeculationLimits.NO_LIMIT : Integer.parseInt(value);
         }
 
         private static boolean parsePrepareDeadlock(String value) {
@@ -136,7 +152,7 @@ public final class CoShimNode {
         CoShim<TableKey<String>, String> newShim(KvStore<TableKey<String>, String> store) {
             return switch (shim) {
                 case "speculative" -> new SpeculativeCoShim<>(store, lockTimeout,
-                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie);
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie, limits);
                 case "nonspeculative" -> new SpeculativeCoShim<>(store, lockTimeout,
                         SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, deadlock, prepareWaitDie);
                 case "nocc" -> new NoCcShim<>(store);
@@ -172,7 +188,9 @@ public final class CoShimNode {
                 options.allowed());
         System.out.println("coshim node (" + options.shim() + ", lock timeout " + options.lockTimeout().toMillis()
                 + " ms, " + options.deadlock().name().toLowerCase().replace('_', '-')
-                + (options.prepareWaitDie() ? ", prepare wait-die" : "") + ") on port " + server.getPort() + ", databases " + databases.keySet()
+                + (options.prepareWaitDie() ? ", prepare wait-die" : "")
+                + (options.limits().isUnlimited() ? "" : ", speculation limits " + options.limits())
+                + ") on port " + server.getPort() + ", databases " + databases.keySet()
                 + ", store " + options.store()
                 + (options.allowed().isEmpty() ? "" : ", allowed clients " + options.allowed()));
 

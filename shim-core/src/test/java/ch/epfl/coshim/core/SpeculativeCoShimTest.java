@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.InMemoryKvStore;
 import ch.epfl.coshim.types.DeadlockPolicy;
+import ch.epfl.coshim.types.SpeculationLimits;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -286,6 +287,32 @@ class SpeculativeCoShimTest {
         assertEquals(1, st.aborts(AbortCause.UPGRADE_CONFLICT));
         assertEquals(0, st.cascadeMarked(), "a txn that never executed has no reader");
         assertEquals(0, st.cascadeTreesWithRoot(AbortCause.UPGRADE_CONFLICT));
+    }
+
+    // ---- speculation limits ----
+
+    @Test
+    void depthZeroMakesTheSpeculativeShimReadOnlyAfterTheCommitAndCountsTheRefusal() throws Exception {
+        SpeculativeCoShim<String, String> capped = new SpeculativeCoShim<>(store, LOCK_TIMEOUT,
+                SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, DeadlockPolicy.WAIT_DIE, false,
+                new SpeculationLimits(0, SpeculationLimits.NO_LIMIT));
+        capped.start("w");
+        capped.put("w", "x", "1");
+        capped.end("w");
+        capped.start("r");
+        CompletableFuture<String> read = CompletableFuture.supplyAsync(() -> capped.get("r", "x"));
+        Thread.sleep(100);
+        assertFalse(read.isDone(), "an executed writer is not enough at depth 0");
+        assertEquals(Vote.YES, capped.prepare("w"));
+        Thread.sleep(100);
+        assertFalse(read.isDone(), "nor is a prepared one");
+        capped.commit("w");
+        assertEquals("1", read.get(1, TimeUnit.SECONDS));
+        capped.end("r");
+        assertEquals(Vote.YES, capped.prepare("r"));
+        capped.commit("r");
+        assertEquals(1, capped.stats().refusedByDepth());
+        assertTrue(capped.stats().speculationSummary().contains("spec_refused_depth_total=1"));
     }
 
     // ---- non-speculative baseline: same shim, lock() waits for the predecessors to commit ----

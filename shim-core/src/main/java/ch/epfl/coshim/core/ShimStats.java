@@ -76,6 +76,10 @@ public final class ShimStats {
   private final LongAdder abortedLockWaitUs = new LongAdder();
   private final LongAdder abortedPrepareWaitUs = new LongAdder();
   private final Map<AbortCause, LongAdder> lostUs = new EnumMap<>(AbortCause.class);
+  /** Speculation limits: lock calls whose speculative grant was refused, by first reason, and their wait. */
+  private final LongAdder refusedDepth = new LongAdder();
+  private final LongAdder refusedFanout = new LongAdder();
+  private final LongAdder refusedWaitUs = new LongAdder();
   /** Running sums of (depth, saved µs) over the commits, for their Pearson correlation. */
   private double n, sx, sy, sxx, syy, sxy;
 
@@ -256,6 +260,27 @@ public final class ShimStats {
     committedPostVoteUs.add(TimeUnit.NANOSECONDS.toMicros(postVoteNanos));
   }
 
+  /**
+   * A resolved txn's lock calls the speculation limits held back (once per txn, at commit or abort).
+   *
+   * @param waitNanos from each one's first refusal to the end of its wait
+   */
+  void limited(int byDepth, int byFanout, long waitNanos) {
+    refusedDepth.add(byDepth);
+    refusedFanout.add(byFanout);
+    refusedWaitUs.add(TimeUnit.NANOSECONDS.toMicros(waitNanos));
+  }
+
+  /** Lock calls whose speculative grant the depth cap refused at least once. */
+  public long refusedByDepth() {
+    return refusedDepth.sum();
+  }
+
+  /** Lock calls whose speculative grant the fanout cap refused (and the depth cap did not). */
+  public long refusedByFanout() {
+    return refusedFanout.sum();
+  }
+
   /** The time an aborted branch wasted: creation to abort, by the cause of the abort. */
   void abortedBudget(AbortCause cause, long lifetimeNanos, long lockWaitNanos, long prepareWaitNanos) {
     lostUs.get(cause).add(TimeUnit.NANOSECONDS.toMicros(lifetimeNanos));
@@ -315,7 +340,8 @@ public final class ShimStats {
    * then the totals (µs) the bench sums over nodes: commits, gross and net saved, lost to cascades,
    * net saved per commit (net saved minus lost, per commit), and the time budget (committed branches:
    * lifetime, lock wait, prepare wait, post-vote wait; aborted ones: lock and prepare wait, lifetime
-   * by cause).
+   * by cause), and the speculation limits' refusals (lock calls held back by depth / fanout, and the
+   * time they waited because of it).
    */
   public String speculationSummary() {
     long c = commits();
@@ -352,6 +378,9 @@ public final class ShimStats {
             + " committed_post_vote_us_total=%d aborted_lock_wait_us_total=%d aborted_prepare_wait_us_total=%d",
         committedLifetimeUs.sum(), committedLockWaitUs.sum(), committedPrepareWaitUs.sum(), committedPostVoteUs.sum(),
         abortedLockWaitUs.sum(), abortedPrepareWaitUs.sum()));
+    sb.append(String.format(Locale.ROOT,
+        " spec_refused_depth_total=%d spec_refused_fanout_total=%d spec_refused_wait_us_total=%d",
+        refusedDepth.sum(), refusedFanout.sum(), refusedWaitUs.sum()));
     for (AbortCause cause : AbortCause.values()) {
       sb.append(" lost_").append(cause.name().toLowerCase()).append("_us_total=").append(lostUs(cause));
     }
