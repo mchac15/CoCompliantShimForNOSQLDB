@@ -25,7 +25,7 @@ _spec.loader.exec_module(bench_peak)
 
 SYSTEMS = {"speculative": ("#2a78d6", "o", "Speculative"), "nonspeculative": ("#eb6834", "s", "Non-speculative")}
 CAUSES = [("upgrade_conflict", "#2a78d6", "Upgrade conflict"), ("lock_timeout", "#6250d6", "Lock timeout"),
-          ("prepare_wait_die", "#e87ba4", "Prepare wait-die (vote NO)"),
+          ("prepare_wait_die", "#e87ba4", "Prepare wait-die (vote NO)"), ("wounded", "#008300", "Wounded (wound-wait)"),
           ("coordinator", "#eb6834", "Coordinator abort"), ("cascade", "#1baf7a", "Cascade"),
           (None, "#eda100", "Other")]
 NAMED = tuple(c for c, _, _ in CAUSES if c)
@@ -127,11 +127,12 @@ def paired_stacks(ax, runs, labels, threads, system, parts, scale=1.0, totals=Tr
             bottom += vals
         tag = label if len(label) <= 6 else label[:3] + "."   # under a bar: the long labels overlap
         for p, b in zip(pos, bottom):
-            ax.text(p, -0.02, tag, transform=ax.get_xaxis_transform(), ha="center", va="top",
-                    fontsize=7 if len(runs) == 2 else 6.5,
-                    color=INK_MUTED)
+            if len(runs) > 1:
+                ax.text(p, -0.02, tag, transform=ax.get_xaxis_transform(), ha="center", va="top",
+                        fontsize=7 if len(runs) == 2 else 6.5, color=INK_MUTED)
             if totals:
-                ax.text(p, b, f"{b:.0f}", ha="center", va="bottom", fontsize=7.5, color=INK_MUTED)
+                ax.text(p, b, f"{b:.1f}" if 0 < b < 10 else f"{b:.0f}", ha="center", va="bottom", fontsize=7.5,
+                        color=INK_MUTED)
     ax.set_xticks(x, [f"\n{t}" for t in threads])
 
 
@@ -151,8 +152,8 @@ def plot(runs, labels, threads, out, skew, db):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    what = f"{db}, skew {skew}: " + ", ".join(f"{label} ({EARLIER[k][2]})" for k, label in enumerate(labels[:-1])) \
-        + f", {labels[-1]} (solid)"
+    what = f"{db}, skew {skew}: " + "".join(f"{label} ({EARLIER[k][2]}), " for k, label in enumerate(labels[:-1])) \
+        + (f"{labels[-1]} (solid)" if len(labels) > 1 else labels[0])
     vs = " vs ".join(labels)
 
     # throughput and latency
@@ -192,9 +193,9 @@ def plot(runs, labels, threads, out, skew, db):
     style(a3, "Client: failed attempts", "Attempts that aborted (%)")
     a3.set_ylim(bottom=0)
     a3.legend(frameon=False, fontsize=8, loc="center right")
-    fig.text(0.06, 0.03, "Shim counters of both nodes, cut at the last second before the audit. "
-             + "; ".join(f"{EARLIER[k][1]}: {label}" for k, label in enumerate(labels[:-1]))
-             + f"; solid: {labels[-1]}.", fontsize=8, color=INK_MUTED)
+    fig.text(0.06, 0.03, "Shim counters of both nodes, cut at the last second before the audit."
+             + "".join(f" {EARLIER[k][1]}: {label};" for k, label in enumerate(labels[:-1]))
+             + (f" solid: {labels[-1]}." if len(labels) > 1 else ""), fontsize=8, color=INK_MUTED)
     fig.savefig(f"{out}-aborts.png", dpi=150, facecolor=SURFACE)
 
     # time budget per branch commit
@@ -214,7 +215,7 @@ def plot(runs, labels, threads, out, skew, db):
 def table(runs, labels, threads, out):
     lines_ = [f"# {' vs '.join(labels)}", "",
               "| system | threads | tps | p50 ms | client abort % | shim aborts / 100 commits (upgrade, lock timeout, "
-              "prepare wait-die, coordinator, cascade) | lock wait ms | prepare wait ms | lost ms |", "|---|---|---|---|---|---|---|---|---|"]
+              "prepare wait-die, wounded, coordinator, cascade) | lock wait ms | prepare wait ms | lost ms |", "|---|---|---|---|---|---|---|---|---|"]
     for system in SYSTEMS:
         for t in threads:
             for run, label in zip(runs, labels):
@@ -242,7 +243,7 @@ def main(argv):
             else:
                 skew = argv[i + 1]
             del argv[i:i + 2]
-    if not 4 <= len(argv) <= 2 + 1 + len(EARLIER) or not all("=" in a for a in argv[2:]):
+    if not 3 <= len(argv) <= 2 + 1 + len(EARLIER) or not all("=" in a for a in argv[2:]):
         sys.exit(__doc__)
     out = argv[1]
     labels, runs = [], []
@@ -250,7 +251,7 @@ def main(argv):
         label, d = a.split("=", 1)
         labels.append(label)
         runs.append(load(Path(d), db, skew))
-    threads = sorted(set.intersection(*(set(t for s in r.values() for t in s) for r in runs)))
+    threads = sorted(set.intersection(*(set(t for s in r.values() for t in s) for r in runs)))   # one run: its own
     if not threads:
         sys.exit("the two runs share no thread count")
     table(runs, labels, threads, out)
