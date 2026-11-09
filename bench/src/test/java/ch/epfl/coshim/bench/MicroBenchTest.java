@@ -205,6 +205,8 @@ class MicroBenchTest {
         assertEquals("xa_rollback", MicroBench.failureCause(new SQLException("prepare failed",
                 new XAException(XAException.XA_RBROLLBACK))));
         assertEquals("shim_abort", MicroBench.failureCause(new SQLTransactionRollbackException("aborted")));
+        assertEquals("shim_upgrade_conflict", MicroBench.failureCause(
+                new SQLTransactionRollbackException("put: lock failed, must abort [cause=upgrade_conflict]")));
         assertEquals("other:IllegalStateException", MicroBench.failureCause(new SQLException(new IllegalStateException())));
     }
 

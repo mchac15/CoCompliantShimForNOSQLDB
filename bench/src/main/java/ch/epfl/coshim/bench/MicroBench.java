@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.transaction.xa.XAException;
 import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.core.context.RootContext;
@@ -737,6 +739,9 @@ public final class MicroBench implements AutoCloseable {
      * also raised by Sonata's SSI dummy write), XA rollback codes (the shim's NO vote), the shim's
      * aborts during execution, and the TC refusing the branch.
      */
+    /** The shim's abort cause in its exception message, e.g. "[cause=upgrade_conflict]". */
+    private static final Pattern SHIM_CAUSE = Pattern.compile("\\[cause=([a-z_]+)\\]");
+
     static String failureCause(Throwable e) {
         for (Throwable t = e; t != null; t = t.getCause()) {
             if (t instanceof SQLException s) {
@@ -750,7 +755,9 @@ public final class MicroBench implements AutoCloseable {
                     return "serialization";
                 }
                 if (s instanceof SQLTransactionRollbackException && s.getSQLState() == null) {
-                    return "shim_abort";   // the shim aborted the branch while it executed
+                    // the shim aborted the branch while it executed; its message names why, if it knows
+                    Matcher m = SHIM_CAUSE.matcher(String.valueOf(s.getMessage()));
+                    return m.find() ? "shim_" + m.group(1) : "shim_abort";
                 }
             }
             if (t instanceof TransactionException) {

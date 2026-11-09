@@ -225,7 +225,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
         : timedLock(key, txn, LockType.LockMode.SHARED);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
-      throw new TxnAbortedException("get: lock failed, must abort");
+      throw new TxnAbortedException("get: lock failed, must abort" + causeTag(txn));
     }
     // own write first: read_buffer may hold the value read before this txn's own put
     V own = txn.getWriteSet().get(key);
@@ -235,7 +235,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     LocksMap.ReadResult<V> readRes = locksMap.read(key, txn);
     if (readRes.isDoomed()) {
       abortTransaction(txn, AbortCause.CASCADE);
-      throw new TxnAbortedException("get: read failed, must abort");
+      throw new TxnAbortedException("get: read failed, must abort" + causeTag(txn));
     }
     if (readRes.value() != null) {
       txn.addToReadSet(key, readRes.value());
@@ -253,7 +253,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     LockResult res = timedLock(key, txn, LockType.LockMode.EXCLUSIVE);
     if (res == LockResult.MUST_ABORT || res == LockResult.TIMED_OUT || res == LockResult.DIE) {
       abortTransaction(txn, lockFailure(res));
-      throw new TxnAbortedException("put: lock failed, must abort");
+      throw new TxnAbortedException("put: lock failed, must abort" + causeTag(txn));
     }
     txn.addToWriteSet(key, value);
   }
@@ -360,6 +360,15 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     };
   }
 
+  /**
+   * " [cause=upgrade_conflict]": why txn aborted, for the client's statistics (the bench reads it off
+   * the message). Whoever aborted it (this thread or a foreign abort) set it before releasing.
+   */
+  private static String causeTag(Transaction<?, ?> txn) {
+    Enum<?> cause = txn.abortCause();
+    return cause == null ? "" : " [cause=" + cause.name().toLowerCase() + "]";
+  }
+
   /** Why a must_abort txn was doomed, whichever site finally aborts it. */
   private static AbortCause doomedBy(Transaction<?, ?> txn) {
     return txn.isWounded() ? AbortCause.WOUNDED : AbortCause.CASCADE;
@@ -368,21 +377,36 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   /**
    * @param cause why the caller aborts txn; a txn that was must_abort counts as a cascade (or a
    *     wound) whatever the site that finally aborts it
+   * @return statistics only: the txns this call doomed transitively (its marks, plus those of the
+   *     executed victims it aborted in turn); 0 if txn was already aborted or resolved
    */
-  private void abortTransaction(Transaction<K, V> txn, AbortCause cause) {
+  private int abortTransaction(Transaction<K, V> txn, AbortCause cause) {
     Status before = txn.compareAndSwapStatus(ABORTABLE, Status.ABORTED);
     if (!ABORTABLE.contains(before)) {
-      return; // already aborted or committing/committed
+      return 0; // already aborted or committing/committed
     }
     txn.markResolved();
-    List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
     AbortCause finalCause = before == Status.MUST_ABORT ? doomedBy(txn) : cause;
+    // the root of txn's cascade tree, copied by the cascade's marks: so set before the release
+    AbortCause root =
+        finalCause == AbortCause.CASCADE && txn.rootCause() instanceof AbortCause r ? r : finalCause;
+    txn.setAbortCauses(finalCause, root);
+    List<Transaction<K, V>> doomed = locksMap.abortAndRelease(txn);
     long lifetime = System.nanoTime() - txn.createdAtNanos();
     stats.aborted(finalCause, txn.maxDepth(), txn.cascadeFanout(), lifetime);
     stats.abortedBudget(finalCause, lifetime, txn.lockWaitNanos(), txn.prepareWaitNanos());
-    transactionsMap.remove(txn.getTransactionId(), txn);
-    for (Transaction<K, V> t : doomed) {
-      abortTransaction(t, AbortCause.CASCADE);
+    stats.cascadeMarks(txn.cascadeFanout(), doomed.size(), txn.waitingMarks());
+    if (finalCause == AbortCause.CASCADE) {
+      stats.cascadeVictim(root, lifetime);
     }
+    transactionsMap.remove(txn.getTransactionId(), txn);
+    int victims = txn.cascadeFanout();
+    for (Transaction<K, V> t : doomed) {
+      victims += abortTransaction(t, AbortCause.CASCADE);
+    }
+    if (finalCause != AbortCause.CASCADE && victims > 0) {
+      stats.cascadeTree(root, victims);
+    }
+    return victims;
   }
 }

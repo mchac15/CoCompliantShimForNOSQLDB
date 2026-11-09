@@ -11,6 +11,7 @@ import ch.epfl.coshim.store.InMemoryKvStore;
 import ch.epfl.coshim.types.DeadlockPolicy;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
@@ -210,6 +211,81 @@ class SpeculativeCoShimTest {
         shim.get("r2", "x");
         shim.abort("w");
         assertEquals(1, shim.stats().abortsWithFanout(2), shim.stats().speculationSummary());
+    }
+
+    /** No deadlock prevention (the ordered-access runs): lets an older txn wait for a younger one. */
+    private final SpeculativeCoShim<String, String> nodp = new SpeculativeCoShim<>(store, LOCK_TIMEOUT,
+            SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, DeadlockPolicy.NONE);
+
+    @Test
+    void cascadeVictimsAreAttributedToTheCauseAtTheRootOfTheirTree() {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("r1");
+        shim.get("r1", "x");   // speculates on w
+        shim.put("r1", "y", "2");
+        shim.end("r1");
+        shim.start("r2");
+        shim.get("r2", "y");   // speculates on r1: depth 2, w's tree
+        shim.end("r2");
+        shim.abort("w");
+        ShimStats st = shim.stats();
+        assertEquals(2, st.aborts(AbortCause.CASCADE), st.speculationSummary());
+        assertEquals(2, st.cascadeVictimsWithRoot(AbortCause.COORDINATOR), st.speculationSummary());
+        assertEquals(0, st.cascadeVictimsWithRoot(AbortCause.CASCADE));
+        assertEquals(1, st.cascadeTreesWithRoot(AbortCause.COORDINATOR));
+        assertEquals(2, st.cascadeTreeVictimsWithRoot(AbortCause.COORDINATOR), "r2 counted through r1");
+        assertEquals(2, st.cascadeMarked());
+        assertEquals(2, st.cascadeMarkedExecuted());
+        assertEquals(0, st.cascadeMarkedWaiting());
+        assertTrue(st.speculationSummary().contains("cascade_root_coordinator_victims_total=2"),
+                st.speculationSummary());
+        assertTrue(st.speculationSummary().contains("cascade_tree=2-3:1"), st.speculationSummary());
+    }
+
+    @Test
+    void aVictimStillBlockedInLockIsCountedAsAWaitingMark() throws Exception {
+        shim.start("w");
+        shim.put("w", "x", "1");
+        shim.end("w");
+        shim.start("a");
+        shim.get("a", "x");   // granted on w
+        shim.put("a", "x", "2");   // upgraded in place: a read w's value
+        shim.start("b");
+        CompletableFuture<String> blocked = CompletableFuture.supplyAsync(() -> shim.get("b", "x"));
+        Thread.sleep(100);
+        assertFalse(blocked.isDone(), "b waits for a, still running");
+        shim.abort("w");
+        ExecutionException e = assertThrows(ExecutionException.class, () -> blocked.get(1, TimeUnit.SECONDS));
+        assertTrue(e.getCause().getMessage().contains("[cause=cascade]"), e.getCause().getMessage());
+        ShimStats st = shim.stats();
+        assertEquals(2, st.cascadeMarked(), st.speculationSummary());
+        assertEquals(1, st.cascadeMarkedWaiting(), "b read nothing: " + st.speculationSummary());
+        assertEquals(0, st.cascadeMarkedExecuted());
+        assertEquals(1, st.cascadeVictimsWithRoot(AbortCause.COORDINATOR), "only b aborted yet");
+    }
+
+    @Test
+    void theUpgradeLoserIsARootThatNamesItsCauseAndDoomsNobody() throws Exception {
+        nodp.start("w");
+        nodp.put("w", "z", "1");
+        nodp.end("w");
+        nodp.start("r1");
+        nodp.start("r2");
+        nodp.get("r1", "x");
+        nodp.get("r2", "x");   // both read x on the same shared node
+        nodp.get("r2", "z");   // and r2 speculated on w
+        CompletableFuture<Void> upgrade = CompletableFuture.runAsync(() -> nodp.put("r1", "x", "1"));
+        Thread.sleep(100);
+        assertFalse(upgrade.isDone(), "r1 queues behind r2's read");
+        TxnAbortedException e = assertThrows(TxnAbortedException.class, () -> nodp.put("r2", "x", "2"));
+        assertTrue(e.getMessage().contains("[cause=upgrade_conflict]"), e.getMessage());
+        upgrade.get(1, TimeUnit.SECONDS);
+        ShimStats st = nodp.stats();
+        assertEquals(1, st.aborts(AbortCause.UPGRADE_CONFLICT));
+        assertEquals(0, st.cascadeMarked(), "a txn that never executed has no reader");
+        assertEquals(0, st.cascadeTreesWithRoot(AbortCause.UPGRADE_CONFLICT));
     }
 
     // ---- non-speculative baseline: same shim, lock() waits for the predecessors to commit ----

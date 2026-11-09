@@ -191,7 +191,12 @@ class Chain<K, V> {
       long deadlineNanos,
       DeadlockPolicy policy,
       List<Transaction<K, V>> victims) {
-    return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
+    txn.setWaitingOn(this);   // statistics only, see abortAndRelease
+    try {
+      return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
+    } finally {
+      txn.setWaitingOn(null);
+    }
   }
 
   /**
@@ -383,6 +388,9 @@ class Chain<K, V> {
    * @param cascade false for the non-speculative baseline: release only
    * @param marked receives every txn this call moved to must_abort (to wake them up)
    * @param doomedFinished receives those of them that were executed (the caller aborts them)
+   * @param granted statistics only: for every holder met behind txn's node, whether it was met at
+   *     least once on a node it had been granted (or upgraded to, having read the key): false means it
+   *     was still blocked in lock() there, and had read nothing on that key
    * @return true iff the chain is now empty, as in {@link #release}
    */
   synchronized boolean abortAndRelease(
@@ -390,14 +398,16 @@ class Chain<K, V> {
       LockType<K, V> held,
       boolean cascade,
       List<Transaction<K, V>> marked,
-      List<Transaction<K, V>> doomedFinished) {
+      List<Transaction<K, V>> doomedFinished,
+      Map<Transaction<K, V>, Boolean> granted) {
     if (cascade && held.mode() == LockMode.EXCLUSIVE && txn.hasReachedExecuted()) {
       for (LockNode<K, V> s = held.node().getNext(); s != null; s = s.getNext()) {
         if (s.getMode() == LockMode.EXCLUSIVE && !s.isUpgraded()) {
           break;   // blind write: it does not depend on txn's value
         }
         for (Transaction<K, V> t : s.getHolders()) {
-          Status before = t.compareAndSwapStatus(MARKABLE, Status.MUST_ABORT);
+          granted.merge(t, s.isUpgraded() || !t.isWaitingOn(this), Boolean::logicalOr);
+          Status before = t.markMustAbort(MARKABLE, txn.rootCause());
           if (MARKABLE.contains(before)) {
             marked.add(t);
             if (before == Status.EXECUTED) {
