@@ -349,8 +349,9 @@ public final class MicroBench implements AutoCloseable {
 
     private List<Branch> nextPlan() {
         List<Branch> plan = randomPlan(config, participants.size());
-        int hot = config.hotRangeSize();
-        for (Branch b : plan) {
+        for (int i = 0; i < plan.size(); i++) {
+            Branch b = plan.get(i);
+            int hot = config.hotRangeSize(i);
             writtenKeys.computeIfAbsent(b.shim(), p -> new ConcurrentHashMap<>())
                     .computeIfAbsent(b.table(), t -> ConcurrentHashMap.newKeySet()).addAll(b.writeKeys());
             for (Op op : b.ops()) {
@@ -376,10 +377,10 @@ public final class MicroBench implements AutoCloseable {
             int w;
             do {
                 r = config.drawReads();
-                w = config.drawWrites();
+                w = config.readOnly(b) ? 0 : config.drawWrites();
             } while (r + w == 0);
-            List<Integer> reads = workingSet(config, r, used);
-            List<Integer> writes = workingSet(config, w, used);
+            List<Integer> reads = workingSet(config, b, r, used);
+            List<Integer> writes = workingSet(config, b, w, used);
             List<Op> ops = new ArrayList<>();
             reads.forEach(k -> ops.add(new Op(k, false)));
             writes.forEach(k -> ops.add(new Op(k, true)));
@@ -397,14 +398,15 @@ public final class MicroBench implements AutoCloseable {
      * with probability skewness, else from the cold range; acta, Acta's makeWorkingSet, ops × skewness keys
      * from the hot range, the rest from the cold range.
      */
-    private static List<Integer> workingSet(BenchConfig config, int ops, Set<Integer> used) {
+    private static List<Integer> workingSet(BenchConfig config, int branch, int ops, Set<Integer> used) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
-        int hot = config.hotRangeSize();
+        int hot = config.hotRangeSize(branch);
+        double skewness = config.skewness(branch);
         List<Integer> keys = new ArrayList<>();
         if (config.dist() == BenchConfig.KeyDist.HOTSPOT) {
             while (keys.size() < ops) {
                 // validate() made both ranges large enough for a whole txn: the redraws end
-                boolean isHot = random.nextDouble() < config.skewness();
+                boolean isHot = random.nextDouble() < skewness;
                 int candidate = isHot ? random.nextInt(0, hot) : random.nextInt(hot, config.tableSize());
                 if (used.add(candidate)) {
                     keys.add(candidate);
@@ -412,7 +414,7 @@ public final class MicroBench implements AutoCloseable {
             }
             return keys;
         }
-        while (keys.size() < ops * config.skewness()) {
+        while (keys.size() < ops * skewness) {
             int candidate = random.nextInt(0, hot);
             if (used.add(candidate)) {
                 keys.add(candidate);
