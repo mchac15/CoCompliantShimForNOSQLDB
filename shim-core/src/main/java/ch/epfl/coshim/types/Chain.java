@@ -373,7 +373,7 @@ class Chain<K, V> {
   /** Wait-die for a refused grant: one of the txns it waits for is younger and not leaving. */
   private static <K, V> boolean hasYounger(Transaction<K, V> txn, List<Transaction<K, V>> blockers) {
     for (Transaction<K, V> t : blockers) {
-      if (t.getTs() > txn.getTs() && !LEAVING.contains(t.getStatus())) {
+      if (t.isYoungerThan(txn) && !LEAVING.contains(t.getStatus())) {
         return true;
       }
     }
@@ -400,12 +400,12 @@ class Chain<K, V> {
       Status s = t.getStatus();
       if (!ready.contains(s)
           && !LEAVING.contains(s)
-          && !(s == Status.STARTED && t.getTs() > txn.getTs())) {
+          && !(s == Status.STARTED && t.isYoungerThan(txn))) {
         blocked = true;   // an older live txn, or a younger one past started: not woundable
       }
     }
     for (Transaction<K, V> t : pred.getHolders()) {
-      if (!blocked && t.getTs() > txn.getTs() && t.wound()) {
+      if (!blocked && t.isYoungerThan(txn) && t.wound()) {
         victims.add(t);
       } else if (t.getStatus() == Status.MUST_ABORT && !t.hasReachedExecuted()) {
         victims.add(t);

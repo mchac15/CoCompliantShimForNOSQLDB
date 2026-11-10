@@ -64,6 +64,12 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
     }
 
     @Override
+    public Outcome start(String txnId, long age) {
+        return call(Protocol.START_AGED, txnId, null, null, age, in -> in.readBoolean())
+                ? Outcome.SUCCEEDED : Outcome.FAILED;
+    }
+
+    @Override
     public V get(String txnId, K key) {
         return call(Protocol.GET, txnId, key, null, in -> {
             byte[] bytes = Protocol.readBytes(in);
@@ -109,6 +115,11 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
     }
 
     private <R> R call(byte op, String txnId, K key, V value, Reader<R> payload) {
+        return call(op, txnId, key, value, 0, payload);
+    }
+
+    /** @param age sent only with START_AGED */
+    private <R> R call(byte op, String txnId, K key, V value, long age, Reader<R> payload) {
         if (closed) {
             throw new IllegalStateException("closed");
         }
@@ -119,6 +130,9 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
         try {
             c.out.writeByte(op);
             c.out.writeUTF(txnId);
+            if (op == Protocol.START_AGED) {
+                c.out.writeLong(age);
+            }
             if (op == Protocol.GET || op == Protocol.GET_FOR_UPDATE || op == Protocol.PUT) {
                 Protocol.writeBytes(c.out, keyCodec.encode(key));
             }

@@ -287,6 +287,23 @@ class LocksMapTest {
   // ---- deadlock prevention: wait only for older txns ----
 
   @Test
+  void aRetryKeepsItsFirstAttemptsAgeAndIsYoungerOnlyThanItsLeftovers() {
+    // first attempt 10, a txn begun after it 20, the retry of the first one (attempt id 30, age 10)
+    Transaction<String, String> leftover = new Transaction<>("leftover", Status.STARTED, null, 10, 10);
+    Transaction<String, String> later = txn("later", 20);
+    Transaction<String, String> retry = new Transaction<>("retry", Status.STARTED, null, 10, 30);
+    locks.lock("x", later, LockMode.EXCLUSIVE, LONG);
+    locks.lock("y", leftover, LockMode.EXCLUSIVE, LONG);
+
+    assertTrue(later.isYoungerThan(retry));
+    assertTrue(retry.isYoungerThan(leftover));
+    // wait-die: behind its own leftover (older) the retry waits; behind `later` (younger) it dies, as the
+    // first attempt would have
+    assertEquals(LockResult.TIMED_OUT, locks.lock("y", retry, LockMode.SHARED, Duration.ofMillis(50)));
+    assertEquals(LockResult.DIE, locks.lock("x", retry, LockMode.SHARED, LONG));
+  }
+
+  @Test
   void anOlderTxnDiesInsteadOfWaitingForAYoungerOne() {
     Transaction<String, String> young = txn("young", 2);
     Transaction<String, String> old = txn("old", 1);

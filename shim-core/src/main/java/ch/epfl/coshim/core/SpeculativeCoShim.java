@@ -184,8 +184,24 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
 
   @Override
   public Outcome start(String txnId) {
-    Transaction<K, V> txn = new Transaction<>(txnId, Status.STARTED, null, globalAge(txnId));
-    if (transactionsMap.putIfAbsent(txnId, txn) != null) {
+    return register(new Transaction<>(txnId, Status.STARTED, null, globalAge(txnId)));
+  }
+
+  /**
+   * A retry's start: its age is its first attempt's, its own id's age only breaks ties (a retry is younger than
+   * what is left of its earlier attempts, older than every txn that began after its first one). Only with global
+   * ages: the order of start() on this shim does not compare with a global transaction id.
+   */
+  @Override
+  public Outcome start(String txnId, long age) {
+    if (!globalAges) {
+      return start(txnId);
+    }
+    return register(new Transaction<>(txnId, Status.STARTED, null, age, globalAge(txnId)));
+  }
+
+  private Outcome register(Transaction<K, V> txn) {
+    if (transactionsMap.putIfAbsent(txn.getTransactionId(), txn) != null) {
       return Outcome.FAILED; // already registered or tombstone
     }
     return Outcome.SUCCEEDED;
