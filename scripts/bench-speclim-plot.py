@@ -111,7 +111,10 @@ def load(results):
             p["refused_fanout_pc"] = c.get("spec_refused_fanout_total", 0) / commits
             p["refused_wait_ms_pc"] = c.get("spec_refused_wait_us_total", 0) / 1000 / commits
             marked = c.get("cascade_marked_total", 0)
-            p["marked_waiting_share"] = c.get("cascade_marked_waiting_total", 0) / marked if marked else 0
+            # met while still blocked in lock(): spared since the granted flag, marked anyway before it
+            blocked = c.get("cascade_spared_total", c.get("cascade_marked_waiting_total", 0))
+            met = marked + c.get("cascade_spared_total", 0)
+            p["marked_waiting_share"] = blocked / met if met else 0
             p["lock_timeouts"] = c.get("lock_timeout", 0)
             rows.append(p)
         configs[key] = sorted(rows, key=lambda p: p["threads"])
@@ -244,7 +247,7 @@ def limiter(configs, out):
     depths, fanouts = grid(configs)
     rows = [("refused_fanout_pc", "refused by the fanout cap\nper commit"),
             ("refused_depth_pc", "refused by the depth cap\nper commit"),
-            ("marked_waiting_share", "cascade marks on txns\nstill blocked in lock()")]
+            ("marked_waiting_share", "txns a cascade met while\nstill blocked in lock()")]
     style = styles(depths)
     fig, axes = plt.subplots(len(rows), len(fanouts), figsize=(4 * len(fanouts), 2.6 * len(rows)), sharex=True,
                              sharey="row", squeeze=False)

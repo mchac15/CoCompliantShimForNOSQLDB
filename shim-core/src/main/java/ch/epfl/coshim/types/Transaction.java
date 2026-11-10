@@ -43,11 +43,6 @@ public class Transaction<K, V> {
   private Enum<?> abortCause;
   private Enum<?> rootCause;
   /**
-   * Statistics only: the chain this txn is blocked on inside lock()/upgrade(), null otherwise. Set and
-   * read only under that chain's monitor: a cascade marking it there knows it has not read that key.
-   */
-  private Object waitingOn;
-  /**
    * Speculation limiter (fanout): the txns this one counted itself as a speculative dependent of, each
    * once. Guarded by the monitor; only added to while started, emptied when it resolves.
    */
@@ -64,7 +59,7 @@ public class Transaction<K, V> {
   private final List<Grant> grants = new ArrayList<>();
   private int maxDepth;
   private int cascadeFanout;
-  private int waitingMarks;
+  private int sparedMarks;
   /** When this txn was created, in {@link System#nanoTime()}. */
   private final long createdAtNanos = System.nanoTime();
   /** How long prepare() waited for its predecessors to commit. */
@@ -231,16 +226,6 @@ public class Transaction<K, V> {
   /** The root cause of its cascade tree: set by the mark of a cascade, or by its own abort. */
   public synchronized Enum<?> rootCause() {
     return rootCause;
-  }
-
-  /** Callers hold the monitor of {@code chain} (or of the chain this txn waited on, to clear it). */
-  void setWaitingOn(Object chain) {
-    waitingOn = chain;
-  }
-
-  /** Callers hold the monitor of {@code chain}. */
-  boolean isWaitingOn(Object chain) {
-    return waitingOn == chain;
   }
 
   /**
@@ -424,16 +409,16 @@ public class Transaction<K, V> {
   }
 
   /**
-   * Of the txns counted in {@link #cascadeFanout()}, those this abort reached only on keys where they
-   * were still blocked in lock(), never through a node they had been granted: they had read nothing
-   * this txn (nor a txn behind it on that key) wrote, so the cascade did not need them.
+   * The txns this abort met behind it but spared: on every key it met them on they were still blocked
+   * in lock(), so they had read nothing this txn (nor a txn behind it there) wrote. Not counted in
+   * {@link #cascadeFanout()}.
    */
-  public synchronized int waitingMarks() {
-    return waitingMarks;
+  public synchronized int sparedMarks() {
+    return sparedMarks;
   }
 
-  synchronized void setWaitingMarks(int n) {
-    waitingMarks = n;
+  synchronized void setSparedMarks(int n) {
+    sparedMarks = n;
   }
 
   public static enum Status {

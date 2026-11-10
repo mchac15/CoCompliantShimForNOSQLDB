@@ -54,10 +54,10 @@ public final class ShimStats {
   private final Map<AbortCause, LongAdder> cascadeTreeVictimsByRoot = new EnumMap<>(AbortCause.class);
   /** Tree sizes (txns doomed transitively by one root abort), in power-of-two buckets. */
   private final LongAdder[] cascadeTreeSize = adders();
-  /** Txns marked must_abort by a cascade: all, those already executed, those reached only while blocked. */
+  /** Txns marked must_abort by a cascade: all, those already executed; and the blocked ones it spared. */
   private final LongAdder cascadeMarked = new LongAdder();
   private final LongAdder cascadeMarkedExecuted = new LongAdder();
-  private final LongAdder cascadeMarkedWaiting = new LongAdder();
+  private final LongAdder cascadeSpared = new LongAdder();
   /** Per depth bucket: lifetime of the aborted txns (µs), and how many of them were cascade victims. */
   private final LongAdder[] lostUsByDepth = adders();
   private final LongAdder[] cascadesByDepth = adders();
@@ -174,12 +174,12 @@ public final class ShimStats {
    *
    * @param marked txns it moved to must_abort
    * @param executed those of them already executed (aborted right away, and cascading in turn)
-   * @param waiting those it reached only on keys where they were still blocked in lock()
+   * @param spared the txns it met but spared, still blocked in lock() on every key it met them on
    */
-  void cascadeMarks(int marked, int executed, int waiting) {
+  void cascadeMarks(int marked, int executed, int spared) {
     cascadeMarked.add(marked);
     cascadeMarkedExecuted.add(executed);
-    cascadeMarkedWaiting.add(waiting);
+    cascadeSpared.add(spared);
   }
 
   /** A root abort (not a cascade victim) doomed {@code victims > 0} txns transitively. */
@@ -204,9 +204,9 @@ public final class ShimStats {
     return cascadeTreeVictimsByRoot.get(root).sum();
   }
 
-  /** Txns some abort marked must_abort while they were blocked on every key it reached them on. */
-  public long cascadeMarkedWaiting() {
-    return cascadeMarkedWaiting.sum();
+  /** Txns an abort met behind it but spared: still blocked in lock() on every key it met them on. */
+  public long cascadeSpared() {
+    return cascadeSpared.sum();
   }
 
   public long cascadeMarked() {
@@ -392,7 +392,7 @@ public final class ShimStats {
    * The cascade attribution, appended to {@link #speculationSummary}: per depth bucket {@code
    * d:aborts/cascade aborts/mean lifetime µs of the aborts}, tree sizes {@code size range:roots}, then
    * totals (named *_total, never lost_*_us_total, which the bench sums as lost time): the marks (all,
-   * executed, only while blocked), and per root cause the victims, their lost µs, the trees and the
+   * executed) and the blocked txns spared, and per root cause the victims, their lost µs, the trees and the
    * victims counted at their roots (the two victim counts differ by the victims of trees whose
    * executed txns another thread aborted first, e.g. the coordinator).
    */
@@ -413,8 +413,8 @@ public final class ShimStats {
       }
     }
     sb.append(String.format(Locale.ROOT,
-        "cascade_marked_total=%d cascade_marked_executed_total=%d cascade_marked_waiting_total=%d",
-        cascadeMarked.sum(), cascadeMarkedExecuted.sum(), cascadeMarkedWaiting.sum()));
+        "cascade_marked_total=%d cascade_marked_executed_total=%d cascade_spared_total=%d",
+        cascadeMarked.sum(), cascadeMarkedExecuted.sum(), cascadeSpared.sum()));
     for (AbortCause root : AbortCause.values()) {
       if (root == AbortCause.CASCADE) {
         continue;   // never a root

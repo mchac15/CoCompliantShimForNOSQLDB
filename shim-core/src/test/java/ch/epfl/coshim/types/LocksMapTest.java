@@ -973,4 +973,50 @@ class LocksMapTest {
     commit(locks, young);
     assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
   }
+
+  // ---- a cascade dooms only the holders that may have read the key ----
+
+  @Test
+  void aCascadeSparesAGetForUpdateWaiterThatReadNothing() throws Exception {
+    // X(a, executed) <- X(b, gfu: granted on a) <- X(c, gfu: waits for b): c's node is marked as read
+    // from its creation, but c was never granted
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    Transaction<String, String> c = txn("c");
+    locks.lockForUpdate("x", a, LONG);
+    set(a, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", b, LONG));
+    CompletableFuture<LockResult> f = CompletableFuture.supplyAsync(() -> locks.lockForUpdate("x", c, LONG));
+    assertBlocked(f);
+
+    set(a, Status.ABORTED);
+    locks.abortAndRelease(a);
+
+    assertEquals(Status.MUST_ABORT, b.getStatus());
+    assertEquals(Status.STARTED, c.getStatus(), "c read nothing of a's");
+    assertEquals(1, a.cascadeFanout());
+    assertEquals(1, a.sparedMarks());
+    assertBlocked(f);   // still behind b, doomed: until b's release
+    set(b, Status.ABORTED);
+    locks.abortAndRelease(b);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  @Test
+  void aCascadeSparesAGrantTheLimiterHeldBack() throws Exception {
+    LocksMap<String, String> locks = limited(0, NONE);
+    Transaction<String, String> w = txn("w");
+    Transaction<String, String> r = txn("r");
+    locks.lock("x", w, LockMode.EXCLUSIVE, LONG);
+    set(locks, w, Status.EXECUTED);
+    CompletableFuture<LockResult> f = CompletableFuture.supplyAsync(() -> locks.lock("x", r, LockMode.SHARED, LONG));
+    assertBlocked(f);   // refused: depth 1 > 0
+
+    set(locks, w, Status.ABORTED);
+    locks.abortAndRelease(w);
+
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+    assertEquals(Status.STARTED, r.getStatus());
+    assertEquals(0, w.cascadeFanout());
+  }
 }

@@ -293,8 +293,8 @@ public class LocksMap<K, V> {
           (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished, granted) ? null : c);
     }
     txn.setCascadeFanout(marked.size());
-    // statistics only: marked txns met on no key behind txn but where they were still blocked
-    txn.setWaitingMarks((int) marked.stream().filter(t -> !granted.get(t)).count());
+    // statistics only: the txns met behind txn but spared, blocked on every key it met them on
+    txn.setSparedMarks((int) granted.values().stream().filter(g -> !g).count());
     for (Transaction<K, V> t : marked) {
       statusChanged(t);
     }

@@ -239,14 +239,15 @@ class SpeculativeCoShimTest {
         assertEquals(2, st.cascadeTreeVictimsWithRoot(AbortCause.COORDINATOR), "r2 counted through r1");
         assertEquals(2, st.cascadeMarked());
         assertEquals(2, st.cascadeMarkedExecuted());
-        assertEquals(0, st.cascadeMarkedWaiting());
+        assertEquals(0, st.cascadeSpared());
         assertTrue(st.speculationSummary().contains("cascade_root_coordinator_victims_total=2"),
                 st.speculationSummary());
         assertTrue(st.speculationSummary().contains("cascade_tree=2-3:1"), st.speculationSummary());
     }
 
     @Test
-    void aVictimStillBlockedInLockIsCountedAsAWaitingMark() throws Exception {
+    void aCascadeSparesATxnStillBlockedInLock() throws Exception {
+        store.store("x", "0");
         shim.start("w");
         shim.put("w", "x", "1");
         shim.end("w");
@@ -258,13 +259,17 @@ class SpeculativeCoShimTest {
         Thread.sleep(100);
         assertFalse(blocked.isDone(), "b waits for a, still running");
         shim.abort("w");
-        ExecutionException e = assertThrows(ExecutionException.class, () -> blocked.get(1, TimeUnit.SECONDS));
-        assertTrue(e.getCause().getMessage().contains("[cause=cascade]"), e.getCause().getMessage());
+        Thread.sleep(100);
+        assertFalse(blocked.isDone(), "b still waits for a, now doomed");
+        shim.abort("a");   // e.g. a's own next request
+        assertEquals("0", blocked.get(1, TimeUnit.SECONDS), "b read nothing of w's or a's: the committed value");
         ShimStats st = shim.stats();
-        assertEquals(2, st.cascadeMarked(), st.speculationSummary());
-        assertEquals(1, st.cascadeMarkedWaiting(), "b read nothing: " + st.speculationSummary());
+        assertEquals(1, st.cascadeMarked(), "a only: " + st.speculationSummary());
+        assertEquals(1, st.cascadeSpared(), "b read nothing: " + st.speculationSummary());
         assertEquals(0, st.cascadeMarkedExecuted());
-        assertEquals(1, st.cascadeVictimsWithRoot(AbortCause.COORDINATOR), "only b aborted yet");
+        shim.end("b");
+        assertEquals(Vote.YES, shim.prepare("b"));
+        shim.commit("b");
     }
 
     @Test

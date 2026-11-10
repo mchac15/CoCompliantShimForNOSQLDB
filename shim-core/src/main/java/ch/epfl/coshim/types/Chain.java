@@ -151,9 +151,13 @@ class Chain<K, V> {
       }
       // cases 2 and 3a: a new EXCLUSIVE node right behind p (at the end, or in front of the blind
       // writer `after`)
+      boolean read = node.isGranted(txn);   // it read k as a reader: a cascade must still reach it
       node.removeHolder(txn);
       LockNode<K, V> newNode = new LockNode<>(key, LockMode.EXCLUSIVE, txn);
       newNode.setUpgraded(true);
+      if (read) {
+        newNode.markGranted(txn);
+      }
       insertAfter(p, newNode);
       if (node.getHolders().isEmpty()) {   // only possible when p != node
         unlink(node);
@@ -210,12 +214,7 @@ class Chain<K, V> {
       DeadlockPolicy policy,
       SpeculationLimits limits,
       List<Transaction<K, V>> victims) {
-    txn.setWaitingOn(this);   // statistics only, see abortAndRelease
-    try {
-      return awaitPredecessor(txn, ready, true, deadlineNanos, policy, limits, victims);
-    } finally {
-      txn.setWaitingOn(null);
-    }
+    return awaitPredecessor(txn, ready, true, deadlineNanos, policy, limits, victims);
   }
 
   /**
@@ -279,6 +278,7 @@ class Chain<K, V> {
           List<Transaction<K, V>> b = new ArrayList<>();
           Refusal r = bounded ? admit(txn, limits, b) : null;
           if (r == null) {
+            txn.getLock(key).node().markGranted(txn);
             if (bounded) {
               recordGrant(txn, pred);
             }
@@ -474,7 +474,9 @@ class Chain<K, V> {
   /**
    * abort_transaction()'s critical section on this key: if txn held it EXCLUSIVE, marks every holder
    * of the later nodes up to the next blind writer must_abort (mark_must_abort), and only then
-   * releases (cascade before splice).
+   * releases (cascade before splice). Only the holders granted on their node there (see {@link
+   * LockNode#isGranted}): one still blocked in lock() read nothing on this key, so it is spared,
+   * however it may be marked through another key it did read.
    *
    * <p>No cascade either if txn never reached executed (e.g. it was wounded, or aborted by the
    * coordinator while running): no successor got past its node, since none does before every holder
@@ -489,9 +491,8 @@ class Chain<K, V> {
    * @param cascade false for the non-speculative baseline: release only
    * @param marked receives every txn this call moved to must_abort (to wake them up)
    * @param doomedFinished receives those of them that were executed (the caller aborts them)
-   * @param granted statistics only: for every holder met behind txn's node, whether it was met at
-   *     least once on a node it had been granted (or upgraded to, having read the key): false means it
-   *     was still blocked in lock() there, and had read nothing on that key
+   * @param granted statistics only: for every holder met behind txn's node, whether it was granted on
+   *     at least one of the nodes met: false means it was spared on every key txn met it on
    * @return true iff the chain is now empty, as in {@link #release}
    */
   synchronized boolean abortAndRelease(
@@ -507,7 +508,14 @@ class Chain<K, V> {
           break;   // blind write: it does not depend on txn's value
         }
         for (Transaction<K, V> t : s.getHolders()) {
-          granted.merge(t, s.isUpgraded() || !t.isWaitingOn(this), Boolean::logicalOr);
+          boolean read = s.isGranted(t);
+          granted.merge(t, read, Boolean::logicalOr);
+          if (!read) {
+            // still blocked in lock() on this node: it read nothing of txn's (nor of a txn behind it
+            // here, which it would first have to wait for), so it is spared; it waits on and is
+            // woken up by the release
+            continue;
+          }
           Status before = t.markMustAbort(MARKABLE, txn.rootCause());
           if (MARKABLE.contains(before)) {
             marked.add(t);
