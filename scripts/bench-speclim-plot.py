@@ -30,8 +30,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 
 # reference palette (dataviz skill): categorical slots 1-3, neutral ink, surface, hairline grid
-DEPTH_COLORS = {"1": "#2a78d6", "2": "#eb6834", "4": "#1baf7a"}
-DEPTH_MARKERS = {"1": "o", "2": "s", "4": "^"}
+# one (color, marker) per depth cap (or fanout cap), in order: categorical slots 1-3
+SERIES = [("#2a78d6", "o"), ("#eb6834", "s"), ("#1baf7a", "^")]
 INK, MUTED, SURFACE, GRID = "#1f1f1e", "#52514e", "#fcfcfb", "#e1e0d9"
 DIVERGING = LinearSegmentedColormap.from_list("gain", ["#e34948", "#f0efec", "#2a78d6"])
 STALL_S = 5
@@ -41,7 +41,7 @@ BUDGET = [("active_us", "active (work + think)", "#2a78d6", ""), ("lock_wait_us"
           ("prepare_wait_us", "prepare wait", "#1baf7a", ""),
           ("post_vote_us", "post-vote wait (2PC decision)", "#e34948", ".."),
           ("lost_wounded_us", "lost: wounded", "#eda100", "//"), ("lost_cascade_us", "lost: cascade", "#e87ba4", "//"),
-          ("lost_coordinator_us", "lost: coordinator", "#008300", "//"), ("lost_other_us", "lost: other", "#6250d6", "//")]
+          ("lost_coordinator_us", "lost: coordinator", "#008300", "//"), ("lost_other_us", "lost: other (upgrade conflicts, …)", "#6250d6", "//")]
 
 plt.rcParams.update({
     "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
@@ -100,7 +100,7 @@ def load(results):
         for r in csv.DictReader(open(d / "points.csv")):
             t = int(r["threads"])
             p = {k: float(r[k]) for k in ("tps", "tps_raw", "abort_rate", "cascades_per_100", "wounded_per_100",
-                                           "coordinator_per_100", "op_p50_us")}
+                                           "coordinator_per_100", "upgrade_per_100", "op_p50_us")}
             p.update({k: float(r[k] or 0) for k, *_ in BUDGET})
             p["threads"] = t
             p["stalled"] = stalled(point_dir, t)
@@ -124,6 +124,11 @@ def grid(configs):
     return depths, fanouts
 
 
+def styles(values):
+    """{value: dict(color, marker)} in the fixed categorical order."""
+    return {v: dict(color=c, marker=m) for v, (c, m) in zip(values, SERIES)}
+
+
 def plot_line(ax, pts, y, **kw):
     xs = [p["threads"] for p in pts]
     ax.plot(xs, [p[y] for p in pts], **kw)
@@ -145,12 +150,13 @@ def references(ax, configs, y):
 
 def throughput(configs, out):
     depths, fanouts = grid(configs)
-    fig, axes = plt.subplots(1, len(fanouts), figsize=(4 * len(fanouts), 3.6), sharey=True)
+    style = styles(depths)
+    fig, axes = plt.subplots(1, len(fanouts), figsize=(4 * len(fanouts), 3.6), sharey=True, squeeze=False)
+    axes = axes[0]
     for ax, f in zip(axes, fanouts):
         references(ax, configs, "tps_plot")
         for d in depths:
-            plot_line(ax, configs[("spec", d, f)], "tps_plot", color=DEPTH_COLORS.get(d), marker=DEPTH_MARKERS.get(d),
-                      label=f"depth ≤ {d}")
+            plot_line(ax, configs[("spec", d, f)], "tps_plot", label=f"depth ≤ {d}", **style[d])
         ax.set_title(f"fanout ≤ {f}", color=INK)
         ax.set_xlabel("client threads")
     axes[0].set_ylabel("committed txns / s")
@@ -166,18 +172,23 @@ def throughput(configs, out):
 
 def gain(configs, out):
     depths, fanouts = grid(configs)
+    if ("nonspec", None, None) not in configs:
+        return
     base = {p["threads"]: p["tps_plot"] for p in configs[("nonspec", None, None)]}
     uncapped = {p["threads"]: p["tps_plot"] for p in configs.get(("spec", "none", "none"), [])}
-    threads = sorted(base)
     cells = {}
     for d in depths:
         for f in fanouts:
             for p in configs[("spec", d, f)]:
-                cells[(d, f, p["threads"])] = (100 * (p["tps_plot"] / base[p["threads"]] - 1), p["stalled"])
+                if p["threads"] in base:
+                    cells[(d, f, p["threads"])] = (100 * (p["tps_plot"] / base[p["threads"]] - 1), p["stalled"])
+    # the thread counts both the baseline and every capped config ran
+    threads = sorted(t for t in base if all((d, f, t) in cells for d in depths for f in fanouts))
     # the color scale follows the points that ran normally: a stall would wash out the rest
     lim = max(abs(v) for v, s in cells.values() if not s)
     norm = TwoSlopeNorm(vmin=-lim, vcenter=0, vmax=lim)
-    fig, axes = plt.subplots(1, len(threads), figsize=(2.6 * len(threads), 3.2))
+    fig, axes = plt.subplots(1, len(threads), figsize=(2.6 * len(threads), 3.2), squeeze=False)
+    axes = axes[0]
     for ax, t in zip(axes, threads):
         m = [[float("nan") if cells[(d, f, t)][1] else cells[(d, f, t)][0] for f in fanouts] for d in depths]
         im = ax.imshow(m, cmap=DIVERGING, norm=norm, origin="lower")
@@ -204,15 +215,19 @@ def gain(configs, out):
 def aborts(configs, out):
     depths, fanouts = grid(configs)
     d = max(depths, key=int)
-    causes = [("cascades_per_100", "cascade aborts"), ("wounded_per_100", "wounds"),
-              ("coordinator_per_100", "coordinator aborts")]
-    fan_colors = dict(zip(fanouts, DEPTH_COLORS.values()))
-    fan_markers = dict(zip(fanouts, DEPTH_MARKERS.values()))
-    fig, axes = plt.subplots(1, len(causes), figsize=(4 * len(causes), 3.4))
+    causes = [(y, title) for y, title in (("cascades_per_100", "cascade aborts"), ("wounded_per_100", "wounds"),
+                                           ("coordinator_per_100", "coordinator aborts"),
+                                           ("upgrade_per_100", "upgrade conflicts"))
+              if any(p[y] > 0 for pts in configs.values() for p in pts)]
+    if not causes:
+        return
+    style = styles(fanouts)
+    fig, axes = plt.subplots(1, len(causes), figsize=(4 * len(causes), 3.4), squeeze=False)
+    axes = axes[0]
     for ax, (y, title) in zip(axes, causes):
         references(ax, configs, y)
         for f in fanouts:
-            plot_line(ax, configs[("spec", d, f)], y, color=fan_colors[f], marker=fan_markers[f], label=f"fanout ≤ {f}")
+            plot_line(ax, configs[("spec", d, f)], y, label=f"fanout ≤ {f}", **style[f])
         ax.set_title(f"{title} per 100 commits", color=INK)
         ax.set_xlabel("client threads")
         ax.set_ylim(bottom=0)
@@ -230,8 +245,9 @@ def limiter(configs, out):
     rows = [("refused_fanout_pc", "refused by the fanout cap\nper commit"),
             ("refused_depth_pc", "refused by the depth cap\nper commit"),
             ("marked_waiting_share", "cascade marks on txns\nstill blocked in lock()")]
+    style = styles(depths)
     fig, axes = plt.subplots(len(rows), len(fanouts), figsize=(4 * len(fanouts), 2.6 * len(rows)), sharex=True,
-                             sharey="row")
+                             sharey="row", squeeze=False)
     for i, (y, label) in enumerate(rows):
         for j, f in enumerate(fanouts):
             ax = axes[i][j]
@@ -239,8 +255,7 @@ def limiter(configs, out):
                 plot_line(ax, configs[("spec", "none", "none")], y, color=MUTED, linestyle=":", marker="D",
                           markersize=4, label="speculative, uncapped")
             for d in depths:
-                plot_line(ax, configs[("spec", d, f)], y, color=DEPTH_COLORS.get(d), marker=DEPTH_MARKERS.get(d),
-                          label=f"depth ≤ {d}")
+                plot_line(ax, configs[("spec", d, f)], y, label=f"depth ≤ {d}", **style[d])
             if i == 0:
                 ax.set_title(f"fanout ≤ {f}", color=INK)
             if j == 0:
@@ -250,7 +265,7 @@ def limiter(configs, out):
     for (y, _), row in zip(rows, axes):
         # after every panel of the row is drawn, so the shared scale fits them all
         top = max(p[y] for k, pts in configs.items() if k[0] == "spec" for p in pts)
-        row[0].set_ylim(0, 1.08 * top)
+        row[0].set_ylim(0, 1.08 * top or 1)
     for ax in axes[-1]:
         ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
     handles, labels = axes[-1][0].get_legend_handles_labels()
@@ -324,16 +339,16 @@ def table(configs, out):
     def name(k):
         return "non-speculative" if k[0] == "nonspec" else f"spec d≤{k[1]} f≤{k[2]}".replace("≤none", " none")
 
-    lines = ["| config | threads | tps | stalled | abort rate | cascades/100 | wounds/100 | coord/100 | "
+    lines = ["| config | threads | tps | stalled | abort rate | cascades/100 | wounds/100 | coord/100 | upgrade/100 | "
              "refused fanout/commit | refused depth/commit | refused wait ms/commit | marks on blocked | "
-             "lock timeouts | op p50 ms |", "|" + "---|" * 14]
+             "lock timeouts | op p50 ms |", "|" + "---|" * 15]
     order = sorted(configs, key=lambda k: (k[0] != "nonspec", k[1] != "none", int(k[1]) if k[1] not in (None, "none") else 0,
                                            int(k[2]) if k[2] not in (None, "none") else 0))
     for k in order:
         for p in configs[k]:
             lines.append(f"| {name(k)} | {p['threads']} | {p['tps_plot']:.0f} | {'yes' if p['stalled'] else ''} | "
                          f"{p['abort_rate']:.2f} | {p['cascades_per_100']:.0f} | {p['wounded_per_100']:.0f} | "
-                         f"{p['coordinator_per_100']:.0f} | {p['refused_fanout_pc']:.2f} | {p['refused_depth_pc']:.2f} | "
+                         f"{p['coordinator_per_100']:.0f} | {p['upgrade_per_100']:.0f} | {p['refused_fanout_pc']:.2f} | {p['refused_depth_pc']:.2f} | "
                          f"{p['refused_wait_ms_pc']:.1f} | {100 * p['marked_waiting_share']:.0f}% | {p['lock_timeouts']} | "
                          f"{p['op_p50_us'] / 1000:.1f} |")
     (out / "speclim.md").write_text(
