@@ -6,6 +6,7 @@ import ch.epfl.coshim.types.DeadlockPolicy;
 import ch.epfl.coshim.types.LockType;
 import ch.epfl.coshim.types.LocksMap;
 import ch.epfl.coshim.types.LocksMap.LockResult;
+import ch.epfl.coshim.types.SpeculationLimits;
 import ch.epfl.coshim.types.Transaction;
 import ch.epfl.coshim.types.Transaction.Status;
 import java.time.Duration;
@@ -104,6 +105,23 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       boolean speculative,
       DeadlockPolicy deadlockPolicy,
       boolean prepareWaitDie) {
+    this(store, lockTimeout, tombstoneTtl, speculative, deadlockPolicy, prepareWaitDie,
+        SpeculationLimits.UNLIMITED);
+  }
+
+  /**
+   * @param limits caps on speculation: a lock grant on uncommitted txns that would exceed them waits
+   *     as in the non-speculative baseline instead (see {@link SpeculationLimits}); ignored when not
+   *     speculative
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      boolean prepareWaitDie,
+      SpeculationLimits limits) {
     this.globalAges = prepareWaitDie;
     // a wound-wait victim is already must_abort: abort_transaction releases its locks, on the
     // wounder's thread, outside any latch
@@ -112,7 +130,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
             speculative,
             Objects.requireNonNull(deadlockPolicy),
             victim -> abortTransaction(victim, AbortCause.WOUNDED),
-            prepareWaitDie);
+            prepareWaitDie,
+            limits);
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
     this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);
@@ -304,6 +323,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (!txn.compareAndSwapStatus(Status.PREPARED, Status.COMMITTING)) {
       return;
     }
+    locksMap.committing(txn);
     // statistics only: every predecessor resolved (prepare passed); stamp this txn before any
     // successor can see it committed
     int grants = txn.speculativeGrants();
@@ -314,6 +334,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
     stats.committed(txn.maxDepth(), grants, saved, txn.prepareWaitNanos());
+    stats.limited(txn.limitedByDepth(), txn.limitedByFanout(), txn.limitedWaitNanos());
     long now = System.nanoTime();
     stats.committedBudget(now - txn.createdAtNanos(), txn.lockWaitNanos(), txn.prepareWaitNanos(),
         now - txn.votedAtNanos());
@@ -395,7 +416,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     long lifetime = System.nanoTime() - txn.createdAtNanos();
     stats.aborted(finalCause, txn.maxDepth(), txn.cascadeFanout(), lifetime);
     stats.abortedBudget(finalCause, lifetime, txn.lockWaitNanos(), txn.prepareWaitNanos());
-    stats.cascadeMarks(txn.cascadeFanout(), doomed.size(), txn.waitingMarks());
+    stats.cascadeMarks(txn.cascadeFanout(), doomed.size(), txn.sparedMarks());
+    stats.limited(txn.limitedByDepth(), txn.limitedByFanout(), txn.limitedWaitNanos());
     if (finalCause == AbortCause.CASCADE) {
       stats.cascadeVictim(root, lifetime);
     }

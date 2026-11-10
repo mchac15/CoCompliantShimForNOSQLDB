@@ -790,4 +790,233 @@ class LocksMapTest {
     assertTrue(t.compareAndSwapStatus(Status.PREPARED, Status.COMMITTING));
     assertEquals(Status.COMMITTING, t.getStatus());
   }
+
+  // ---- speculation limits ----
+
+  private static final int NONE = SpeculationLimits.NO_LIMIT;
+
+  private static LocksMap<String, String> limited(int maxDepth, int maxFanout) {
+    return limited(maxDepth, maxFanout, DeadlockPolicy.WAIT_DIE);
+  }
+
+  private static LocksMap<String, String> limited(int maxDepth, int maxFanout, DeadlockPolicy policy) {
+    return new LocksMap<>(true, policy, null, false, new SpeculationLimits(maxDepth, maxFanout));
+  }
+
+  /** commit()'s steps on the lock table: committing (wakes the limiter's waiters), committed, release. */
+  private static void commit(LocksMap<String, String> locks, Transaction<String, String> t) {
+    set(locks, t, Status.COMMITTING);
+    locks.committing(t);
+    set(locks, t, Status.COMMITTED);
+    locks.release(t);
+  }
+
+  @Test
+  void theDepthCapHoldsBackAGrantUntilATxnAheadCanNoLongerAbort() throws Exception {
+    LocksMap<String, String> locks = limited(1, NONE);
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    Transaction<String, String> c = txn("c");
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", a, LONG));
+    set(locks, a, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", b, LONG), "depth 1: a");
+    set(locks, b, Status.EXECUTED);
+    CompletableFuture<LockResult> f = CompletableFuture.supplyAsync(() -> locks.lockForUpdate("x", c, LONG));
+    assertBlocked(f);   // depth 2: b, a
+
+    set(locks, a, Status.COMMITTING);   // decided: no longer counts
+    locks.committing(a);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+    assertEquals(1, c.limitedByDepth());
+  }
+
+  @Test
+  void depthZeroWaitsForTheCommitLikeTheBaseline() throws Exception {
+    LocksMap<String, String> locks = limited(0, NONE);
+    Transaction<String, String> w = txn("w");
+    Transaction<String, String> r = txn("r");
+    locks.lock("x", w, LockMode.EXCLUSIVE, LONG);
+    set(locks, w, Status.EXECUTED);
+    CompletableFuture<LockResult> f = CompletableFuture.supplyAsync(() -> locks.lock("x", r, LockMode.SHARED, LONG));
+    assertBlocked(f);
+    set(locks, w, Status.PREPARED);
+    assertBlocked(f);   // a prepared txn can still be aborted by the coordinator
+
+    commit(locks, w);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  @Test
+  void aBlindWriteDependsOnNobody() {
+    LocksMap<String, String> locks = limited(0, 0);
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    locks.lockForUpdate("x", a, LONG);
+    set(locks, a, Status.EXECUTED);
+
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", b, LockMode.EXCLUSIVE, LONG));
+  }
+
+  @Test
+  void theDepthStopsAtABlindWriterAndSkipsReaders() {
+    // X(a, rmw) <- X(b, blind) <- S(r) <- X(c, rmw): c depends on b only (a's cascade stops at b)
+    LocksMap<String, String> locks = limited(1, NONE);
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    Transaction<String, String> r = txn("r");
+    Transaction<String, String> c = txn("c");
+    locks.lockForUpdate("x", a, LONG);
+    set(locks, a, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", b, LockMode.EXCLUSIVE, LONG));
+    set(locks, b, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", r, LockMode.SHARED, LONG));
+    set(locks, r, Status.EXECUTED);
+
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", c, LONG));
+  }
+
+  @Test
+  void theFanoutCapHoldsBackAReaderUntilAnotherDependentAborts() throws Exception {
+    LocksMap<String, String> locks = limited(NONE, 2);
+    Transaction<String, String> w = txn("w");
+    Transaction<String, String> r1 = txn("r1");
+    Transaction<String, String> r2 = txn("r2");
+    Transaction<String, String> r3 = txn("r3");
+    locks.lock("x", w, LockMode.EXCLUSIVE, LONG);
+    set(locks, w, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", r1, LockMode.SHARED, LONG));
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", r2, LockMode.SHARED, LONG));
+    assertEquals(2, w.specDependents());
+    CompletableFuture<LockResult> f = CompletableFuture.supplyAsync(() -> locks.lock("x", r3, LockMode.SHARED, LONG));
+    assertBlocked(f);
+
+    set(locks, r1, Status.ABORTED);   // e.g. a coordinator abort of r1
+    locks.abortAndRelease(r1);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+    assertEquals(2, w.specDependents());
+    assertEquals(1, r3.limitedByFanout());
+  }
+
+  @Test
+  void aDependentCountsOnceWhateverTheNumberOfKeys() {
+    LocksMap<String, String> locks = limited(NONE, 1);
+    Transaction<String, String> w = txn("w");
+    Transaction<String, String> r = txn("r");
+    Transaction<String, String> other = txn("other");
+    locks.lockForUpdate("x", w, LONG);
+    locks.lockForUpdate("y", w, LONG);
+    set(locks, w, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", r, LockMode.SHARED, LONG));
+    assertEquals(LockResult.ACQUIRED, locks.lock("y", r, LockMode.SHARED, LONG));
+    assertEquals(1, w.specDependents());
+
+    assertEquals(LockResult.TIMED_OUT, locks.lock("x", other, LockMode.SHARED, Duration.ofMillis(100)));
+  }
+
+  @Test
+  void aRefusedFanoutCountsNothing() {
+    // X(a) <- X(b, rmw: depends on a) <- S(r): r depends on b and a, and a is full
+    LocksMap<String, String> locks = limited(NONE, 1);
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    Transaction<String, String> r = txn("r");
+    locks.lock("x", a, LockMode.EXCLUSIVE, LONG);
+    set(locks, a, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", b, LONG));
+    set(locks, b, Status.EXECUTED);
+
+    assertEquals(LockResult.TIMED_OUT, locks.lock("x", r, LockMode.SHARED, Duration.ofMillis(100)));
+    assertEquals(0, b.specDependents(), "b's count was rolled back");
+    assertEquals(1, a.specDependents());
+  }
+
+  @Test
+  void aRefusedOlderTxnDiesInsteadOfWaitingForAYoungerOneToCommit() {
+    // unlimited, old would be granted at once (young executed); refused, it would wait for young's
+    // commit, which may wait for old on another shim
+    LocksMap<String, String> locks = limited(0, NONE);
+    Transaction<String, String> young = txn("young", 2);
+    Transaction<String, String> old = txn("old", 1);
+    locks.lock("x", young, LockMode.EXCLUSIVE, LONG);
+    set(locks, young, Status.EXECUTED);
+
+    assertEquals(LockResult.DIE, locks.lock("x", old, LockMode.SHARED, LONG));
+  }
+
+  @Test
+  void aRefusedYoungerTxnWaitsForAnOlderOneToCommit() throws Exception {
+    LocksMap<String, String> locks = limited(0, NONE);
+    Transaction<String, String> old = txn("old", 1);
+    Transaction<String, String> young = txn("young", 2);
+    locks.lock("x", old, LockMode.EXCLUSIVE, LONG);
+    set(locks, old, Status.EXECUTED);
+    CompletableFuture<LockResult> f =
+        CompletableFuture.supplyAsync(() -> locks.lock("x", young, LockMode.SHARED, LONG));
+    assertBlocked(f);
+
+    commit(locks, old);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  @Test
+  void underWoundWaitARefusedOlderTxnWaitsForAnExecutedYoungerOne() throws Exception {
+    LocksMap<String, String> locks = limited(0, NONE, DeadlockPolicy.WOUND_WAIT);
+    Transaction<String, String> young = txn("young", 2);
+    Transaction<String, String> old = txn("old", 1);
+    locks.lock("x", young, LockMode.EXCLUSIVE, LONG);
+    set(locks, young, Status.EXECUTED);
+    CompletableFuture<LockResult> f =
+        CompletableFuture.supplyAsync(() -> locks.lock("x", old, LockMode.SHARED, LONG));
+    assertBlocked(f);
+    assertEquals(Status.EXECUTED, young.getStatus(), "an executed txn is never wounded");
+
+    commit(locks, young);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  // ---- a cascade dooms only the holders that may have read the key ----
+
+  @Test
+  void aCascadeSparesAGetForUpdateWaiterThatReadNothing() throws Exception {
+    // X(a, executed) <- X(b, gfu: granted on a) <- X(c, gfu: waits for b): c's node is marked as read
+    // from its creation, but c was never granted
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    Transaction<String, String> c = txn("c");
+    locks.lockForUpdate("x", a, LONG);
+    set(a, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", b, LONG));
+    CompletableFuture<LockResult> f = CompletableFuture.supplyAsync(() -> locks.lockForUpdate("x", c, LONG));
+    assertBlocked(f);
+
+    set(a, Status.ABORTED);
+    locks.abortAndRelease(a);
+
+    assertEquals(Status.MUST_ABORT, b.getStatus());
+    assertEquals(Status.STARTED, c.getStatus(), "c read nothing of a's");
+    assertEquals(1, a.cascadeFanout());
+    assertEquals(1, a.sparedMarks());
+    assertBlocked(f);   // still behind b, doomed: until b's release
+    set(b, Status.ABORTED);
+    locks.abortAndRelease(b);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+  }
+
+  @Test
+  void aCascadeSparesAGrantTheLimiterHeldBack() throws Exception {
+    LocksMap<String, String> locks = limited(0, NONE);
+    Transaction<String, String> w = txn("w");
+    Transaction<String, String> r = txn("r");
+    locks.lock("x", w, LockMode.EXCLUSIVE, LONG);
+    set(locks, w, Status.EXECUTED);
+    CompletableFuture<LockResult> f = CompletableFuture.supplyAsync(() -> locks.lock("x", r, LockMode.SHARED, LONG));
+    assertBlocked(f);   // refused: depth 1 > 0
+
+    set(locks, w, Status.ABORTED);
+    locks.abortAndRelease(w);
+
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+    assertEquals(Status.STARTED, r.getStatus());
+    assertEquals(0, w.cascadeFanout());
+  }
 }

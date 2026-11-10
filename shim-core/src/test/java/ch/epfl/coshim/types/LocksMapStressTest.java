@@ -76,6 +76,17 @@ class LocksMapStressTest {
     assertTrue(wounded.get() > 0, "the run exercised wounds");
   }
 
+  @Test
+  void speculationLimitsKeepTheAlgorithmsInvariantsAndReleaseEveryCount() {
+    locks = new LocksMap<>(true, DeadlockPolicy.WAIT_DIE, null, false, new SpeculationLimits(1, 2));
+    checkInvariants();
+    for (Transaction<String, String> t : txns.values()) {
+      assertEquals(0, t.specDependents(), t.getTransactionId() + " still counts dependents");
+    }
+    assertTrue(txns.values().stream().anyMatch(t -> t.limitedByDepth() + t.limitedByFanout() > 0),
+        "the run exercised the limits");
+  }
+
   private void checkInvariants() {
     assertTimeoutPreemptively(Duration.ofSeconds(120), this::run, "a wait never returned");
 

@@ -4,9 +4,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A txn of pseudo.txt. Its monitor ({@code synchronized (txn)}) guards {@code status} and {@code
@@ -41,10 +43,12 @@ public class Transaction<K, V> {
   private Enum<?> abortCause;
   private Enum<?> rootCause;
   /**
-   * Statistics only: the chain this txn is blocked on inside lock()/upgrade(), null otherwise. Set and
-   * read only under that chain's monitor: a cascade marking it there knows it has not read that key.
+   * Speculation limiter (fanout): the txns this one counted itself as a speculative dependent of, each
+   * once. Guarded by the monitor; only added to while started, emptied when it resolves.
    */
-  private Object waitingOn;
+  private final Set<Transaction<K, V>> dependsOn = new HashSet<>();
+  /** Speculation limiter (fanout): the running txns counted in their {@code dependsOn}. */
+  private final AtomicInteger specDependents = new AtomicInteger();
 
   /** A lock granted while the txns ahead on its chain were not all committed yet (speculation). */
   private record Grant(long atNanos, List<? extends Transaction<?, ?>> pending) {}
@@ -55,7 +59,7 @@ public class Transaction<K, V> {
   private final List<Grant> grants = new ArrayList<>();
   private int maxDepth;
   private int cascadeFanout;
-  private int waitingMarks;
+  private int sparedMarks;
   /** When this txn was created, in {@link System#nanoTime()}. */
   private final long createdAtNanos = System.nanoTime();
   /** How long prepare() waited for its predecessors to commit. */
@@ -64,6 +68,10 @@ public class Transaction<K, V> {
   private long lockWaitNanos;
   /** When prepare() voted YES, in {@link System#nanoTime()}; 0 before. */
   private long votedAtNanos;
+  /** lock()/upgrade() calls whose speculative grant the limiter refused (first reason), and their wait. */
+  private int limitedByDepth;
+  private int limitedByFanout;
+  private long limitedWaitNanos;
 
   /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
   public Transaction(String transactionId, Status status, Long expiresAtMillis) {
@@ -220,14 +228,93 @@ public class Transaction<K, V> {
     return rootCause;
   }
 
-  /** Callers hold the monitor of {@code chain} (or of the chain this txn waited on, to clear it). */
-  void setWaitingOn(Object chain) {
-    waitingOn = chain;
+  /**
+   * The fanout cap's admission, under the caller's chain monitor: counts this txn as a dependent of
+   * every txn of {@code on} it does not depend on yet, all or nothing. Touches only their counters,
+   * never their monitors (lock order: chain, then a single txn).
+   *
+   * @param full receives the txn that already had {@code max} dependents, on refusal
+   * @return false if one of them is full (nothing changed); true otherwise, also when this txn is no
+   *     longer started (nothing recorded: it is doomed, its wait loop sees it)
+   */
+  synchronized boolean addSpecDependencies(
+      List<Transaction<K, V>> on, int max, List<Transaction<K, V>> full) {
+    if (status != Status.STARTED) {
+      return true;
+    }
+    List<Transaction<K, V>> added = new ArrayList<>();
+    for (Transaction<K, V> t : on) {
+      if (dependsOn.contains(t)) {
+        continue;
+      }
+      if (!t.tryAddSpecDependent(max)) {
+        // no wake-up for the decrements: a txn refused meanwhile on t retries at t's next change
+        for (Transaction<K, V> a : added) {
+          a.specDependents.decrementAndGet();
+          dependsOn.remove(a);
+        }
+        full.add(t);
+        return false;
+      }
+      dependsOn.add(t);
+      added.add(t);
+    }
+    return true;
   }
 
-  /** Callers hold the monitor of {@code chain}. */
-  boolean isWaitingOn(Object chain) {
-    return waitingOn == chain;
+  private boolean tryAddSpecDependent(int max) {
+    while (true) {
+      int n = specDependents.get();
+      if (n >= max) {
+        return false;
+      }
+      if (specDependents.compareAndSet(n, n + 1)) {
+        return true;
+      }
+    }
+  }
+
+  /**
+   * Once resolved (status no longer started, so nothing adds to it anymore): drops this txn from the
+   * dependents of the txns it depended on, and returns them (their waiters may now fit).
+   */
+  List<Transaction<K, V>> clearSpecDependencies() {
+    List<Transaction<K, V>> out;
+    synchronized (this) {
+      out = new ArrayList<>(dependsOn);
+      dependsOn.clear();
+    }
+    for (Transaction<K, V> t : out) {
+      t.specDependents.decrementAndGet();
+    }
+    return out;
+  }
+
+  /** The running txns counted as speculative dependents of this one (fanout cap). */
+  public int specDependents() {
+    return specDependents.get();
+  }
+
+  /** Statistics only: one lock()/upgrade() call the limiter held back, for {@code waitNanos}. */
+  synchronized void recordLimited(boolean byDepth, long waitNanos) {
+    if (byDepth) {
+      limitedByDepth++;
+    } else {
+      limitedByFanout++;
+    }
+    limitedWaitNanos += waitNanos;
+  }
+
+  public synchronized int limitedByDepth() {
+    return limitedByDepth;
+  }
+
+  public synchronized int limitedByFanout() {
+    return limitedByFanout;
+  }
+
+  public synchronized long limitedWaitNanos() {
+    return limitedWaitNanos;
   }
 
   /** Was ever executed: only then can a successor have read its write buffer. */
@@ -322,16 +409,16 @@ public class Transaction<K, V> {
   }
 
   /**
-   * Of the txns counted in {@link #cascadeFanout()}, those this abort reached only on keys where they
-   * were still blocked in lock(), never through a node they had been granted: they had read nothing
-   * this txn (nor a txn behind it on that key) wrote, so the cascade did not need them.
+   * The txns this abort met behind it but spared: on every key it met them on they were still blocked
+   * in lock(), so they had read nothing this txn (nor a txn behind it there) wrote. Not counted in
+   * {@link #cascadeFanout()}.
    */
-  public synchronized int waitingMarks() {
-    return waitingMarks;
+  public synchronized int sparedMarks() {
+    return sparedMarks;
   }
 
-  synchronized void setWaitingMarks(int n) {
-    waitingMarks = n;
+  synchronized void setSparedMarks(int n) {
+    sparedMarks = n;
   }
 
   public static enum Status {

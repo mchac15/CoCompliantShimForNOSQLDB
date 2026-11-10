@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.InMemoryKvStore;
 import ch.epfl.coshim.types.DeadlockPolicy;
+import ch.epfl.coshim.types.SpeculationLimits;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -238,14 +239,15 @@ class SpeculativeCoShimTest {
         assertEquals(2, st.cascadeTreeVictimsWithRoot(AbortCause.COORDINATOR), "r2 counted through r1");
         assertEquals(2, st.cascadeMarked());
         assertEquals(2, st.cascadeMarkedExecuted());
-        assertEquals(0, st.cascadeMarkedWaiting());
+        assertEquals(0, st.cascadeSpared());
         assertTrue(st.speculationSummary().contains("cascade_root_coordinator_victims_total=2"),
                 st.speculationSummary());
         assertTrue(st.speculationSummary().contains("cascade_tree=2-3:1"), st.speculationSummary());
     }
 
     @Test
-    void aVictimStillBlockedInLockIsCountedAsAWaitingMark() throws Exception {
+    void aCascadeSparesATxnStillBlockedInLock() throws Exception {
+        store.store("x", "0");
         shim.start("w");
         shim.put("w", "x", "1");
         shim.end("w");
@@ -257,13 +259,17 @@ class SpeculativeCoShimTest {
         Thread.sleep(100);
         assertFalse(blocked.isDone(), "b waits for a, still running");
         shim.abort("w");
-        ExecutionException e = assertThrows(ExecutionException.class, () -> blocked.get(1, TimeUnit.SECONDS));
-        assertTrue(e.getCause().getMessage().contains("[cause=cascade]"), e.getCause().getMessage());
+        Thread.sleep(100);
+        assertFalse(blocked.isDone(), "b still waits for a, now doomed");
+        shim.abort("a");   // e.g. a's own next request
+        assertEquals("0", blocked.get(1, TimeUnit.SECONDS), "b read nothing of w's or a's: the committed value");
         ShimStats st = shim.stats();
-        assertEquals(2, st.cascadeMarked(), st.speculationSummary());
-        assertEquals(1, st.cascadeMarkedWaiting(), "b read nothing: " + st.speculationSummary());
+        assertEquals(1, st.cascadeMarked(), "a only: " + st.speculationSummary());
+        assertEquals(1, st.cascadeSpared(), "b read nothing: " + st.speculationSummary());
         assertEquals(0, st.cascadeMarkedExecuted());
-        assertEquals(1, st.cascadeVictimsWithRoot(AbortCause.COORDINATOR), "only b aborted yet");
+        shim.end("b");
+        assertEquals(Vote.YES, shim.prepare("b"));
+        shim.commit("b");
     }
 
     @Test
@@ -286,6 +292,32 @@ class SpeculativeCoShimTest {
         assertEquals(1, st.aborts(AbortCause.UPGRADE_CONFLICT));
         assertEquals(0, st.cascadeMarked(), "a txn that never executed has no reader");
         assertEquals(0, st.cascadeTreesWithRoot(AbortCause.UPGRADE_CONFLICT));
+    }
+
+    // ---- speculation limits ----
+
+    @Test
+    void depthZeroMakesTheSpeculativeShimReadOnlyAfterTheCommitAndCountsTheRefusal() throws Exception {
+        SpeculativeCoShim<String, String> capped = new SpeculativeCoShim<>(store, LOCK_TIMEOUT,
+                SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, DeadlockPolicy.WAIT_DIE, false,
+                new SpeculationLimits(0, SpeculationLimits.NO_LIMIT));
+        capped.start("w");
+        capped.put("w", "x", "1");
+        capped.end("w");
+        capped.start("r");
+        CompletableFuture<String> read = CompletableFuture.supplyAsync(() -> capped.get("r", "x"));
+        Thread.sleep(100);
+        assertFalse(read.isDone(), "an executed writer is not enough at depth 0");
+        assertEquals(Vote.YES, capped.prepare("w"));
+        Thread.sleep(100);
+        assertFalse(read.isDone(), "nor is a prepared one");
+        capped.commit("w");
+        assertEquals("1", read.get(1, TimeUnit.SECONDS));
+        capped.end("r");
+        assertEquals(Vote.YES, capped.prepare("r"));
+        capped.commit("r");
+        assertEquals(1, capped.stats().refusedByDepth());
+        assertTrue(capped.stats().speculationSummary().contains("spec_refused_depth_total=1"));
     }
 
     // ---- non-speculative baseline: same shim, lock() waits for the predecessors to commit ----

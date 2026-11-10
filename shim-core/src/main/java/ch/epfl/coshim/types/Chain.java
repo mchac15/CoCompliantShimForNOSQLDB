@@ -32,6 +32,16 @@ class Chain<K, V> {
    */
   private static final Set<Status> PREPARE_NO_CYCLE =
       EnumSet.of(Status.COMMITTED, Status.COMMITTING, Status.MUST_ABORT, Status.ABORTED);
+  /** Holders that can no longer abort: nobody depends on them for the speculation limits. */
+  private static final Set<Status> DECIDED = EnumSet.of(Status.COMMITTING, Status.COMMITTED);
+  /** What a grant the limiter refused waits for, as in the non-speculative baseline. */
+  private static final Set<Status> COMMITTED = EnumSet.of(Status.COMMITTED);
+
+  /** Why the speculation limiter refused a grant. */
+  static enum Refusal {
+    DEPTH,
+    FANOUT
+  }
 
   static enum UpgradeResult {
     /** txn is no longer started, or read-modify-write against read-modify-write: txn aborts. */
@@ -141,9 +151,13 @@ class Chain<K, V> {
       }
       // cases 2 and 3a: a new EXCLUSIVE node right behind p (at the end, or in front of the blind
       // writer `after`)
+      boolean read = node.isGranted(txn);   // it read k as a reader: a cascade must still reach it
       node.removeHolder(txn);
       LockNode<K, V> newNode = new LockNode<>(key, LockMode.EXCLUSIVE, txn);
       newNode.setUpgraded(true);
+      if (read) {
+        newNode.markGranted(txn);
+      }
       insertAfter(p, newNode);
       if (node.getHolders().isEmpty()) {   // only possible when p != node
         unlink(node);
@@ -182,7 +196,15 @@ class Chain<K, V> {
    *       gone it wounds the younger ones it would otherwise wait for.
    * </ul>
    *
+   * <p>Speculation limits: at the speculation point the grant must also fit {@code limits} (see
+   * {@link SpeculationLimits}); if not, txn keeps waiting (it sleeps on this monitor, and every
+   * commit or abort that can make it fit wakes it up here). Such a wait is the baseline's: txn now
+   * waits for txns that executed to commit, and their commits wait on prepare()/2PC, so the deadlock
+   * prevention treats them as waited for, as when not speculative: wait-die dies if one of the txns
+   * it waits for (the ones that must commit, or the full one) is younger, wound-wait waits.
+   *
    * @param deadlineNanos a {@link System#nanoTime()} deadline
+   * @param limits the caps on speculative grants
    * @param victims receives the txns marked on WOUND (only with WOUND_WAIT)
    */
   synchronized WaitResult awaitLockReady(
@@ -190,13 +212,9 @@ class Chain<K, V> {
       Set<Status> ready,
       long deadlineNanos,
       DeadlockPolicy policy,
+      SpeculationLimits limits,
       List<Transaction<K, V>> victims) {
-    txn.setWaitingOn(this);   // statistics only, see abortAndRelease
-    try {
-      return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
-    } finally {
-      txn.setWaitingOn(null);
-    }
+    return awaitPredecessor(txn, ready, true, deadlineNanos, policy, limits, victims);
   }
 
   /**
@@ -244,39 +262,122 @@ class Chain<K, V> {
       boolean bounded,
       long deadlineNanos,
       DeadlockPolicy policy,
+      SpeculationLimits limits,
       List<Transaction<K, V>> victims) {
-    while (true) {
-      if (txn.isDoomed()) {
-        return WaitResult.DOOMED;
-      }
-      LockNode<K, V> pred = txn.getLock(key).node().getPrev();
-      if (pred == null || pred.allHoldersIn(ready)) {
-        if (bounded) {
-          recordGrant(txn, pred);
+    Refusal refused = null;   // statistics only: the first refusal of this wait, and when
+    long refusedAt = 0;
+    try {
+      while (true) {
+        if (txn.isDoomed()) {
+          return WaitResult.DOOMED;
         }
-        return WaitResult.READY;
-      }
-      if (bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, ready)) {
-        return WaitResult.DIE;
-      }
-      if (bounded && policy == DeadlockPolicy.WOUND_WAIT && wound(txn, pred, ready, victims)) {
-        return WaitResult.WOUND;
-      }
-      try {
-        if (bounded) {
-          long remaining = deadlineNanos - System.nanoTime();
-          if (remaining <= 0) {
-            return WaitResult.TIMED_OUT;
+        LockNode<K, V> pred = txn.getLock(key).node().getPrev();
+        // the txns a refused grant waits for (null: not refused)
+        List<Transaction<K, V>> blockers = null;
+        if (pred == null || pred.allHoldersIn(ready)) {
+          List<Transaction<K, V>> b = new ArrayList<>();
+          Refusal r = bounded ? admit(txn, limits, b) : null;
+          if (r == null) {
+            txn.getLock(key).node().markGranted(txn);
+            if (bounded) {
+              recordGrant(txn, pred);
+            }
+            return WaitResult.READY;
           }
-          TimeUnit.NANOSECONDS.timedWait(this, remaining);
-        } else {
-          wait();
+          if (refused == null) {
+            refused = r;
+            refusedAt = System.nanoTime();
+          }
+          blockers = b;
         }
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        return WaitResult.TIMED_OUT;
+        if (bounded && policy == DeadlockPolicy.WAIT_DIE
+            && (blockers == null ? pred.hasYoungerHolderNotIn(txn, ready) : hasYounger(txn, blockers))) {
+          return WaitResult.DIE;
+        }
+        if (bounded && policy == DeadlockPolicy.WOUND_WAIT
+            && wound(txn, pred, blockers == null ? ready : COMMITTED, victims)) {
+          return WaitResult.WOUND;
+        }
+        try {
+          if (bounded) {
+            long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0) {
+              return WaitResult.TIMED_OUT;
+            }
+            TimeUnit.NANOSECONDS.timedWait(this, remaining);
+          } else {
+            wait();
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return WaitResult.TIMED_OUT;
+        }
+      }
+    } finally {
+      if (refused != null) {
+        txn.recordLimited(refused == Refusal.DEPTH, System.nanoTime() - refusedAt);
       }
     }
+  }
+
+  /**
+   * The speculation limits' check of a grant at the speculation point, under this monitor: null if
+   * txn's grant fits {@code limits} (with a fanout cap, txn is then counted as a dependent of the txns
+   * it depends on here), else why not, {@code blockers} receiving the txns txn now waits for: the
+   * farthest ones ahead that must commit for the depth to fit, or the txn with too many dependents.
+   */
+  private Refusal admit(
+      Transaction<K, V> txn, SpeculationLimits limits, List<Transaction<K, V>> blockers) {
+    if (limits.isUnlimited()) {
+      return null;
+    }
+    List<Transaction<K, V>> risky = riskyAhead(txn.getLock(key).node());
+    if (risky.size() > limits.maxDepth()) {
+      blockers.addAll(risky.subList(limits.maxDepth(), risky.size()));
+      return Refusal.DEPTH;
+    }
+    if (!risky.isEmpty()
+        && limits.limitsFanout()
+        && !txn.addSpecDependencies(risky, limits.maxFanout(), blockers)) {
+      return Refusal.FANOUT;
+    }
+    return null;
+  }
+
+  /**
+   * The txns whose abort would doom the holder of {@code node} once granted, nearest first: the
+   * undecided holders of the EXCLUSIVE nodes ahead of it, back to the first blind writer (included),
+   * exactly those whose abortAndRelease would reach node. A reader's abort never cascades, and a
+   * blind write ({@code node} itself, or one ahead) depends on nobody's value.
+   */
+  private List<Transaction<K, V>> riskyAhead(LockNode<K, V> node) {
+    List<Transaction<K, V>> risky = new ArrayList<>();
+    if (node.getMode() == LockMode.EXCLUSIVE && !node.isUpgraded()) {
+      return risky;
+    }
+    for (LockNode<K, V> n = node.getPrev(); n != null; n = n.getPrev()) {
+      if (n.getMode() != LockMode.EXCLUSIVE) {
+        continue;
+      }
+      Transaction<K, V> t = n.getHolders().iterator().next();   // an EXCLUSIVE node has one holder
+      if (!DECIDED.contains(t.getStatus())) {
+        risky.add(t);
+      }
+      if (!n.isUpgraded()) {
+        break;
+      }
+    }
+    return risky;
+  }
+
+  /** Wait-die for a refused grant: one of the txns it waits for is younger and not leaving. */
+  private static <K, V> boolean hasYounger(Transaction<K, V> txn, List<Transaction<K, V>> blockers) {
+    for (Transaction<K, V> t : blockers) {
+      if (t.getTs() > txn.getTs() && !LEAVING.contains(t.getStatus())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -373,7 +474,9 @@ class Chain<K, V> {
   /**
    * abort_transaction()'s critical section on this key: if txn held it EXCLUSIVE, marks every holder
    * of the later nodes up to the next blind writer must_abort (mark_must_abort), and only then
-   * releases (cascade before splice).
+   * releases (cascade before splice). Only the holders granted on their node there (see {@link
+   * LockNode#isGranted}): one still blocked in lock() read nothing on this key, so it is spared,
+   * however it may be marked through another key it did read.
    *
    * <p>No cascade either if txn never reached executed (e.g. it was wounded, or aborted by the
    * coordinator while running): no successor got past its node, since none does before every holder
@@ -388,9 +491,8 @@ class Chain<K, V> {
    * @param cascade false for the non-speculative baseline: release only
    * @param marked receives every txn this call moved to must_abort (to wake them up)
    * @param doomedFinished receives those of them that were executed (the caller aborts them)
-   * @param granted statistics only: for every holder met behind txn's node, whether it was met at
-   *     least once on a node it had been granted (or upgraded to, having read the key): false means it
-   *     was still blocked in lock() there, and had read nothing on that key
+   * @param granted statistics only: for every holder met behind txn's node, whether it was granted on
+   *     at least one of the nodes met: false means it was spared on every key txn met it on
    * @return true iff the chain is now empty, as in {@link #release}
    */
   synchronized boolean abortAndRelease(
@@ -406,7 +508,14 @@ class Chain<K, V> {
           break;   // blind write: it does not depend on txn's value
         }
         for (Transaction<K, V> t : s.getHolders()) {
-          granted.merge(t, s.isUpgraded() || !t.isWaitingOn(this), Boolean::logicalOr);
+          boolean read = s.isGranted(t);
+          granted.merge(t, read, Boolean::logicalOr);
+          if (!read) {
+            // still blocked in lock() on this node: it read nothing of txn's (nor of a txn behind it
+            // here, which it would first have to wait for), so it is spared; it waits on and is
+            // woken up by the release
+            continue;
+          }
           Status before = t.markMustAbort(MARKABLE, txn.rootCause());
           if (MARKABLE.contains(before)) {
             marked.add(t);

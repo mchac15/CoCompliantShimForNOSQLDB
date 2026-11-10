@@ -54,10 +54,10 @@ public final class ShimStats {
   private final Map<AbortCause, LongAdder> cascadeTreeVictimsByRoot = new EnumMap<>(AbortCause.class);
   /** Tree sizes (txns doomed transitively by one root abort), in power-of-two buckets. */
   private final LongAdder[] cascadeTreeSize = adders();
-  /** Txns marked must_abort by a cascade: all, those already executed, those reached only while blocked. */
+  /** Txns marked must_abort by a cascade: all, those already executed; and the blocked ones it spared. */
   private final LongAdder cascadeMarked = new LongAdder();
   private final LongAdder cascadeMarkedExecuted = new LongAdder();
-  private final LongAdder cascadeMarkedWaiting = new LongAdder();
+  private final LongAdder cascadeSpared = new LongAdder();
   /** Per depth bucket: lifetime of the aborted txns (µs), and how many of them were cascade victims. */
   private final LongAdder[] lostUsByDepth = adders();
   private final LongAdder[] cascadesByDepth = adders();
@@ -76,6 +76,10 @@ public final class ShimStats {
   private final LongAdder abortedLockWaitUs = new LongAdder();
   private final LongAdder abortedPrepareWaitUs = new LongAdder();
   private final Map<AbortCause, LongAdder> lostUs = new EnumMap<>(AbortCause.class);
+  /** Speculation limits: lock calls whose speculative grant was refused, by first reason, and their wait. */
+  private final LongAdder refusedDepth = new LongAdder();
+  private final LongAdder refusedFanout = new LongAdder();
+  private final LongAdder refusedWaitUs = new LongAdder();
   /** Running sums of (depth, saved µs) over the commits, for their Pearson correlation. */
   private double n, sx, sy, sxx, syy, sxy;
 
@@ -170,12 +174,12 @@ public final class ShimStats {
    *
    * @param marked txns it moved to must_abort
    * @param executed those of them already executed (aborted right away, and cascading in turn)
-   * @param waiting those it reached only on keys where they were still blocked in lock()
+   * @param spared the txns it met but spared, still blocked in lock() on every key it met them on
    */
-  void cascadeMarks(int marked, int executed, int waiting) {
+  void cascadeMarks(int marked, int executed, int spared) {
     cascadeMarked.add(marked);
     cascadeMarkedExecuted.add(executed);
-    cascadeMarkedWaiting.add(waiting);
+    cascadeSpared.add(spared);
   }
 
   /** A root abort (not a cascade victim) doomed {@code victims > 0} txns transitively. */
@@ -200,9 +204,9 @@ public final class ShimStats {
     return cascadeTreeVictimsByRoot.get(root).sum();
   }
 
-  /** Txns some abort marked must_abort while they were blocked on every key it reached them on. */
-  public long cascadeMarkedWaiting() {
-    return cascadeMarkedWaiting.sum();
+  /** Txns an abort met behind it but spared: still blocked in lock() on every key it met them on. */
+  public long cascadeSpared() {
+    return cascadeSpared.sum();
   }
 
   public long cascadeMarked() {
@@ -254,6 +258,27 @@ public final class ShimStats {
     committedLockWaitUs.add(TimeUnit.NANOSECONDS.toMicros(lockWaitNanos));
     committedPrepareWaitUs.add(TimeUnit.NANOSECONDS.toMicros(prepareWaitNanos));
     committedPostVoteUs.add(TimeUnit.NANOSECONDS.toMicros(postVoteNanos));
+  }
+
+  /**
+   * A resolved txn's lock calls the speculation limits held back (once per txn, at commit or abort).
+   *
+   * @param waitNanos from each one's first refusal to the end of its wait
+   */
+  void limited(int byDepth, int byFanout, long waitNanos) {
+    refusedDepth.add(byDepth);
+    refusedFanout.add(byFanout);
+    refusedWaitUs.add(TimeUnit.NANOSECONDS.toMicros(waitNanos));
+  }
+
+  /** Lock calls whose speculative grant the depth cap refused at least once. */
+  public long refusedByDepth() {
+    return refusedDepth.sum();
+  }
+
+  /** Lock calls whose speculative grant the fanout cap refused (and the depth cap did not). */
+  public long refusedByFanout() {
+    return refusedFanout.sum();
   }
 
   /** The time an aborted branch wasted: creation to abort, by the cause of the abort. */
@@ -315,7 +340,8 @@ public final class ShimStats {
    * then the totals (µs) the bench sums over nodes: commits, gross and net saved, lost to cascades,
    * net saved per commit (net saved minus lost, per commit), and the time budget (committed branches:
    * lifetime, lock wait, prepare wait, post-vote wait; aborted ones: lock and prepare wait, lifetime
-   * by cause).
+   * by cause), and the speculation limits' refusals (lock calls held back by depth / fanout, and the
+   * time they waited because of it).
    */
   public String speculationSummary() {
     long c = commits();
@@ -352,6 +378,9 @@ public final class ShimStats {
             + " committed_post_vote_us_total=%d aborted_lock_wait_us_total=%d aborted_prepare_wait_us_total=%d",
         committedLifetimeUs.sum(), committedLockWaitUs.sum(), committedPrepareWaitUs.sum(), committedPostVoteUs.sum(),
         abortedLockWaitUs.sum(), abortedPrepareWaitUs.sum()));
+    sb.append(String.format(Locale.ROOT,
+        " spec_refused_depth_total=%d spec_refused_fanout_total=%d spec_refused_wait_us_total=%d",
+        refusedDepth.sum(), refusedFanout.sum(), refusedWaitUs.sum()));
     for (AbortCause cause : AbortCause.values()) {
       sb.append(" lost_").append(cause.name().toLowerCase()).append("_us_total=").append(lostUs(cause));
     }
@@ -363,7 +392,7 @@ public final class ShimStats {
    * The cascade attribution, appended to {@link #speculationSummary}: per depth bucket {@code
    * d:aborts/cascade aborts/mean lifetime µs of the aborts}, tree sizes {@code size range:roots}, then
    * totals (named *_total, never lost_*_us_total, which the bench sums as lost time): the marks (all,
-   * executed, only while blocked), and per root cause the victims, their lost µs, the trees and the
+   * executed) and the blocked txns spared, and per root cause the victims, their lost µs, the trees and the
    * victims counted at their roots (the two victim counts differ by the victims of trees whose
    * executed txns another thread aborted first, e.g. the coordinator).
    */
@@ -384,8 +413,8 @@ public final class ShimStats {
       }
     }
     sb.append(String.format(Locale.ROOT,
-        "cascade_marked_total=%d cascade_marked_executed_total=%d cascade_marked_waiting_total=%d",
-        cascadeMarked.sum(), cascadeMarkedExecuted.sum(), cascadeMarkedWaiting.sum()));
+        "cascade_marked_total=%d cascade_marked_executed_total=%d cascade_spared_total=%d",
+        cascadeMarked.sum(), cascadeMarkedExecuted.sum(), cascadeSpared.sum()));
     for (AbortCause root : AbortCause.values()) {
       if (root == AbortCause.CASCADE) {
         continue;   // never a root
