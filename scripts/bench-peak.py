@@ -823,7 +823,7 @@ def main():
     p.add_argument("--sample-ms", type=int, default=1000)
     p.add_argument("--stats-interval-s", type=int, default=1)
     p.add_argument("--tc", default="127.0.0.1:8091")
-    p.add_argument("--deadlock", default="wound-wait", choices=["wound-wait", "wait-die", "none"],
+    p.add_argument("--deadlock", default="wound-wait", choices=["wound-wait", "wound-blocked", "wait-die", "none"],
                    help="the shims' deadlock prevention in lock(); none only for workloads that cannot deadlock "
                         "(e.g. -- --randomness 0 with sequential branches)")
     p.add_argument("--prepare-deadlock", default="none", choices=["none", "wait-die"],

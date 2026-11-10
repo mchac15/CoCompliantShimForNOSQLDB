@@ -14,10 +14,23 @@ public enum DeadlockPolicy {
    */
   WOUND_WAIT,
   /**
+   * Wound-wait that wounds a younger running holder only while it is blocked itself (waiting in
+   * lock()/upgrade()); while it runs, the older txn waits for it. A deadlock is a cycle of blocked txns, and its
+   * oldest member waits for a younger one: when that one blocks, the txns waiting behind it re-check (it wakes
+   * the chains it holds) and the oldest wounds it. So no cycle survives, and a younger txn that would just have
+   * finished executing is not aborted for nothing.
+   */
+  WOUND_BLOCKED,
+  /**
    * No deadlock prevention: lock()/upgrade() just wait, bounded by lock_timeout. Only for workloads that
    * cannot deadlock, e.g. every txn taking its locks in one global order (MicroBench --randomness 0 with
    * sequential branches): there wound-wait and wait-die abort txns for cycles that never form. With any
    * other workload a deadlock lasts until lock_timeout.
    */
-  NONE
+  NONE;
+
+  /** The policies that wound younger holders instead of waiting for them. */
+  public boolean wounds() {
+    return this == WOUND_WAIT || this == WOUND_BLOCKED;
+  }
 }

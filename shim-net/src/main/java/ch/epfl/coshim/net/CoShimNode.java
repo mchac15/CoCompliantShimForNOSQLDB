@@ -35,7 +35,8 @@ import java.util.concurrent.TimeUnit;
  *     --lock-timeout-ms   lock_timeout of speculative/nonspeculative; default 200
  *     --deadlock          deadlock prevention of speculative/nonspeculative: wait-die (an older txn
  *                         dies instead of waiting for a younger one) | wound-wait (it aborts the
- *                         younger running one instead) | none (just wait until lock_timeout: only for
+ *                         younger running one instead) | wound-blocked (wound-wait, but it wounds a younger
+ *                         running txn only while that one is blocked itself) | none (just wait until lock_timeout: only for
  *                         workloads that cannot deadlock, e.g. ordered locking); default wait-die
  *     --prepare-deadlock  cross-shim deadlock prevention in prepare(): none | wait-die (prepare() votes
  *                         NO instead of waiting for a younger txn; the ages then come from the Seata
@@ -133,6 +134,7 @@ public final class CoShimNode {
             return switch (value) {
                 case "wait-die" -> DeadlockPolicy.WAIT_DIE;
                 case "wound-wait" -> DeadlockPolicy.WOUND_WAIT;
+                case "wound-blocked" -> DeadlockPolicy.WOUND_BLOCKED;
                 case "none" -> DeadlockPolicy.NONE;
                 default -> throw new IllegalArgumentException("unknown deadlock policy " + value);
             };

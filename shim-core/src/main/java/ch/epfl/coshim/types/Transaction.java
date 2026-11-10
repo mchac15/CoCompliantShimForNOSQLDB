@@ -36,6 +36,10 @@ public class Transaction<K, V> {
   private boolean reachedExecuted;
   /** Doomed by wound-wait ({@link #wound()}), not by a cascade: statistics only. */
   private boolean wounded;
+  /** Statistics only: whether it was blocked in lock() when wounded (false: it was running). */
+  private boolean woundedWhileBlocked;
+  /** Waiting in lock()/upgrade() (WOUND_BLOCKED wounds only such a txn); written by its own thread. */
+  private volatile boolean blocked;
   /**
    * Statistics only (a {@code ShimStats.AbortCause}; this package does not depend on core): why the
    * txn aborted, and the cause of the abort at the root of its cascade tree (its own cause unless a
@@ -208,7 +212,26 @@ public class Transaction<K, V> {
     }
     status = Status.MUST_ABORT;
     wounded = true;
+    woundedWhileBlocked = blocked;
     return true;
+  }
+
+  /** Statistics only: it was blocked in lock()/upgrade() when it was wounded. */
+  public synchronized boolean woundedWhileBlocked() {
+    return woundedWhileBlocked;
+  }
+
+  void setBlocked(boolean blocked) {
+    this.blocked = blocked;
+  }
+
+  boolean isBlocked() {
+    return blocked;
+  }
+
+  /** The keys it holds so far (a copy: it may still be running and acquiring). */
+  synchronized List<K> heldKeys() {
+    return new ArrayList<>(locksAcquired.keySet());
   }
 
   public synchronized boolean isWounded() {
