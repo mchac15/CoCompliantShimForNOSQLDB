@@ -55,8 +55,10 @@ def label(cfg):
 
 
 def order(cfg):
-    m = re.fullmatch(r"spec-d(\d+)-f(\d+)", cfg)
-    return (0, 0, 0) if cfg == "nonspec" else (1, int(m.group(1)), int(m.group(2)))
+    """Non-speculative, then the capped configs by depth and fanout, then uncapped speculation."""
+    m = re.fullmatch(r"spec-d(\w+)-f(\w+)", cfg)
+    cap = lambda v: int(v) if v.isdigit() else 10**9
+    return (0, 0, 0) if cfg == "nonspec" else (1, cap(m.group(1)), cap(m.group(2)))
 
 
 def load(results):
