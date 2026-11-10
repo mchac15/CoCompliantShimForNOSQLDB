@@ -154,6 +154,7 @@ public class CoShimServer<K, V> implements AutoCloseable {
 
     private void handle(CoShim<K, V> shim, byte op, DataInputStream in, DataOutputStream out) throws IOException {
         String txnId = in.readUTF();
+        long age = op == Protocol.START_AGED ? in.readLong() : 0;
         K key = null;
         V value = null;
         if (op == Protocol.GET || op == Protocol.GET_FOR_UPDATE || op == Protocol.PUT) {
@@ -166,6 +167,11 @@ public class CoShimServer<K, V> implements AutoCloseable {
             switch (op) {
                 case Protocol.START -> {
                     boolean started = shim.start(txnId) == Outcome.SUCCEEDED;
+                    out.writeByte(Protocol.OK);
+                    out.writeBoolean(started);
+                }
+                case Protocol.START_AGED -> {
+                    boolean started = shim.start(txnId, age) == Outcome.SUCCEEDED;
                     out.writeByte(Protocol.OK);
                     out.writeBoolean(started);
                 }

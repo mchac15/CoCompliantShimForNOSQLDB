@@ -1,5 +1,6 @@
 package ch.epfl.coshim.bench;
 
+import ch.epfl.coshim.jdbc.RetryAge;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -446,16 +447,29 @@ public final class MicroBench implements AutoCloseable {
      *     they run in order; when they run in parallel their pauses overlap, so the longest branch's
      */
     Attempt attempt(List<Branch> plan, Collection<String> causes, AtomicLong thinkNanos) {
+        return attempt(plan, causes, thinkNanos, -1, null);
+    }
+
+    /**
+     * @param retryAge the age its branches start with ({@code --retry-age first}: the plan's first attempt's
+     *     transaction id), or -1: the age of this attempt's own global txn
+     * @param firstId receives this attempt's transaction id when it is the plan's first (retryAge -1), or null
+     */
+    Attempt attempt(List<Branch> plan, Collection<String> causes, AtomicLong thinkNanos, long retryAge,
+            AtomicLong firstId) {
         GlobalTransaction tx = GlobalTransactionContext.createNew();
         try {
             tx.begin((int) config.txnTimeout().toMillis(), "micro");
         } catch (TransactionException e) {
             throw new IllegalStateException("TC at " + config.tc() + ": begin failed", e);
         }
+        if (firstId != null && retryAge < 0) {
+            firstId.set(transactionId(tx.getXid()));
+        }
         try {
-            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan, causes, thinkNanos)
-                    : config.pipelinedBranches() ? phaseOnePipelined(tx, plan, causes, thinkNanos)
-                    : phaseOneInOrder(tx, plan, causes, thinkNanos);
+            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan, causes, thinkNanos, retryAge)
+                    : config.pipelinedBranches() ? phaseOnePipelined(tx, plan, causes, thinkNanos, retryAge)
+                    : phaseOneInOrder(tx, plan, causes, thinkNanos, retryAge);
             if (!allYes) {
                 return rollback(tx);
             }
@@ -477,6 +491,23 @@ public final class MicroBench implements AutoCloseable {
         }
     }
 
+    /** A Seata xid's transaction id (ip:port:transactionId), the age the shims derive from a branch's id. */
+    static long transactionId(String xid) {
+        return Long.parseLong(xid.substring(xid.lastIndexOf(':') + 1));
+    }
+
+    /** Seata's xa start runs in setAutoCommit(false): the shim gets the age set on this thread meanwhile. */
+    private static void startBranch(Connection c, long age) throws SQLException {
+        if (age >= 0) {
+            RetryAge.set(age);
+        }
+        try {
+            c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
+        } finally {
+            RetryAge.clear();
+        }
+    }
+
     private static boolean isTimeout(GlobalStatus status) {
         return status == GlobalStatus.TimeoutRollbacking || status == GlobalStatus.TimeoutRollbacked
                 || status == GlobalStatus.TimeoutRollbackRetrying || status == GlobalStatus.TimeoutRollbackFailed;
@@ -494,9 +525,9 @@ public final class MicroBench implements AutoCloseable {
     }
 
     private boolean phaseOneInOrder(GlobalTransaction tx, List<Branch> plan, Collection<String> causes,
-            AtomicLong thinkNanos) {
+            AtomicLong thinkNanos, long age) {
         for (Branch b : plan) {
-            if (!runBranch(tx.getXid(), b, false, causes, thinkNanos)) {
+            if (!runBranch(tx.getXid(), b, false, causes, thinkNanos, age)) {
                 return false;
             }
         }
@@ -509,14 +540,14 @@ public final class MicroBench implements AutoCloseable {
      * an abort on every shim (including one where a sibling still waits in prepare: it votes NO).
      */
     private boolean phaseOneInParallel(GlobalTransaction tx, List<Branch> plan, Collection<String> causes,
-            AtomicLong thinkNanos) {
+            AtomicLong thinkNanos, long age) {
         ExecutorCompletionService<Boolean> done = new ExecutorCompletionService<>(branchPool);
         Collection<String> shared = Collections.synchronizedCollection(causes);
         List<AtomicLong> branchThink = new ArrayList<>();
         for (Branch b : plan) {
             AtomicLong think = new AtomicLong();
             branchThink.add(think);
-            done.submit(() -> runBranch(tx.getXid(), b, true, shared, think));
+            done.submit(() -> runBranch(tx.getXid(), b, true, shared, think, age));
         }
         boolean allYes = true;
         RuntimeException error = null;
@@ -547,7 +578,7 @@ public final class MicroBench implements AutoCloseable {
      * further branch once one failed or a vote already came back NO; returns when every started branch voted.
      */
     private boolean phaseOnePipelined(GlobalTransaction tx, List<Branch> plan, Collection<String> causes,
-            AtomicLong thinkNanos) {
+            AtomicLong thinkNanos, long age) {
         String xid = tx.getXid();
         Collection<String> shared = Collections.synchronizedCollection(causes);
         List<Future<Boolean>> votes = new ArrayList<>();
@@ -567,7 +598,7 @@ public final class MicroBench implements AutoCloseable {
                 break;
             }
             try {
-                c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
+                startBranch(c, age);
                 executeBranch(p, c, b, thinkNanos);
                 c.commit();   // only checks the XA state: end + prepare happen in close()
             } catch (SQLException e) {
@@ -629,13 +660,13 @@ public final class MicroBench implements AutoCloseable {
      *     TC refused the branch (e.g. the txn already timed out)
      */
     private boolean runBranch(String xid, Branch b, boolean bindXid, Collection<String> causes,
-            AtomicLong thinkNanos) {
+            AtomicLong thinkNanos, long age) {
         if (bindXid) {
             RootContext.bind(xid);
         }
         Participant p = participants.get(b.shim());
         try (Connection c = p.dataSource().getConnection()) {
-            c.setAutoCommit(false);   // branchRegister with the TC + xa start on the participant
+            startBranch(c, age);
             try {
                 executeBranch(p, c, b, thinkNanos);
                 c.commit();   // only checks the XA state: end + prepare (the vote) happen in close()
@@ -809,6 +840,7 @@ public final class MicroBench implements AutoCloseable {
             long planStart = 0;
             List<String> causes = new ArrayList<>();
             AtomicLong thinkNanos = new AtomicLong();   // over every attempt of the plan
+            AtomicLong firstId = new AtomicLong(-1);   // the plan's first attempt's transaction id
             while (!stop.get() && System.nanoTime() < measureEnd) {
                 long t0 = System.nanoTime();
                 if (attempts++ == 0) {
@@ -817,7 +849,8 @@ public final class MicroBench implements AutoCloseable {
                 int causesBefore = causes.size();
                 Attempt result;
                 try {
-                    result = attempt(plan, causes, thinkNanos);
+                    long retryAge = config.retryAgeFirst() && attempts > 1 ? firstId.get() : -1;
+                    result = attempt(plan, causes, thinkNanos, retryAge, firstId);
                 } catch (RuntimeException e) {
                     error = e;
                     stop.set(true);
@@ -861,6 +894,7 @@ public final class MicroBench implements AutoCloseable {
                     attempts = 0;
                     causes = new ArrayList<>();
                     thinkNanos = new AtomicLong();
+                    firstId = new AtomicLong(-1);
                 }
             }
             if (attempts > 0 && planStart < measureEnd) {
@@ -885,7 +919,8 @@ public final class MicroBench implements AutoCloseable {
      * {@code COSHIM_TOKEN=... java ... MicroBench [--variant LABEL] [--shims PARTICIPANT,...]
      * [--tc host:port] [--threads N] [--table-size N] [--branches N] [--reads N] [--writes N] [--skew X]
      * [--rmw true|false] [--get-for-update true|false] [--warmup-s S] [--measure-s S] [--txn-timeout-ms MS]
-     * [--parallel-branches true|false] [--sonata true|false] [--csv FILE] [--label TEXT]}, where a
+     * [--parallel-branches true|false] [--sonata true|false] [--retry-age first|fresh] [--csv FILE] [--label TEXT]},
+     * where a
      * participant is a shim database {@code host:port/db} or {@code jdbc:mysql://...} /
      * {@code jdbc:postgresql://...}. Needs a running Seata TC and the shim nodes ({@code CoShimNode})
      * or databases; COSHIM_TOKEN only with shim databases. The run is appended to {@code FILE} (default

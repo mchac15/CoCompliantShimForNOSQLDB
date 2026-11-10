@@ -47,6 +47,15 @@ public interface CoShim<K, V> {
   Outcome start(String txnId);
 
   /**
+   * {@link #start(String)}, giving the txn {@code age} for deadlock prevention instead of the age its id implies:
+   * the age of the first attempt of the global transaction this branch retries, so that a retry keeps its
+   * seniority. A shim that orders nothing by age ignores it.
+   */
+  default Outcome start(String txnId, long age) {
+    return start(txnId);
+  }
+
+  /**
    * pseudo.txt {@code get(k)}: SHARED lock, then own buffered write, else the nearest predecessor
    * write, else the store. May block the calling thread.
    *

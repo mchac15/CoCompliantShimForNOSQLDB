@@ -72,12 +72,15 @@ import java.util.stream.Collectors;
  * @param readOnlyBranches branch indices (0-based: branch i uses table micro-i) that only read: no writes, at least
  *                         one read. Readers never wait for each other, so no transaction ever waits on those tables:
  *                         with parallel branches, no cross-branch deadlock can form through them. Empty (default): none
+ * @param retryAgeFirst    a retry starts its branches with the age of the global txn's first attempt ({@code
+ *                         --retry-age first}), so the shims' wound-wait / wait-die never starve it; false ({@code
+ *                         fresh}, default): every attempt is a new global txn, hence the youngest
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
         boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
         double thinkSdUs, int sampleMs, KeyDist dist, double randomness, boolean getForUpdate,
-        boolean pipelinedBranches, List<Double> branchSkews, Set<Integer> readOnlyBranches) {
+        boolean pipelinedBranches, List<Double> branchSkews, Set<Integer> readOnlyBranches, boolean retryAgeFirst) {
 
     /** How the keys of a branch are drawn; see {@code dist}. */
     public enum KeyDist {
@@ -101,7 +104,8 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false, false, List.of(), Set.of());
+                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false, false, List.of(), Set.of(),
+                false);
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -245,6 +249,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         boolean pipelinedBranches = c.pipelinedBranches;
         List<Double> branchSkews = c.branchSkews;
         Set<Integer> readOnlyBranches = c.readOnlyBranches;
+        boolean retryAgeFirst = c.retryAgeFirst;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -284,6 +289,11 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--pipelined-branches" -> pipelinedBranches = Boolean.parseBoolean(v);
                 case "--read-only-branches" -> readOnlyBranches = Arrays.stream(v.split(",")).map(String::trim)
                         .filter(x -> !x.isEmpty()).map(Integer::parseInt).collect(Collectors.toUnmodifiableSet());
+                case "--retry-age" -> retryAgeFirst = switch (v) {
+                    case "first" -> true;
+                    case "fresh" -> false;
+                    default -> throw new IllegalArgumentException("--retry-age is first or fresh, not " + v);
+                };
                 case "--branch-skews" -> branchSkews = Arrays.stream(v.split(",")).map(String::trim)
                         .filter(x -> !x.isEmpty()).map(Double::parseDouble).toList();
                 default -> throw new IllegalArgumentException("unknown option " + flag);
@@ -291,7 +301,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
                 measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs,
-                dist, randomness, getForUpdate, pipelinedBranches, branchSkews, readOnlyBranches)
+                dist, randomness, getForUpdate, pipelinedBranches, branchSkews, readOnlyBranches, retryAgeFirst)
                 .validate();
     }
 

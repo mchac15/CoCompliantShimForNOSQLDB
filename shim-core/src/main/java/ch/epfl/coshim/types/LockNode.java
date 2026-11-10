@@ -95,7 +95,7 @@ public class LockNode<K, V> {
    */
   boolean hasYoungerHolderNotIn(Transaction<K, V> txn, Set<Transaction.Status> statuses) {
     for (Transaction<K, V> t : holders) {
-      if (t.getTs() > txn.getTs() && !statuses.contains(t.getStatus())) {
+      if (t.isYoungerThan(txn) && !statuses.contains(t.getStatus())) {
         return true;
       }
     }

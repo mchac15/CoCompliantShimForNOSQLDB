@@ -55,7 +55,8 @@ public class CoShimXAResource implements XAResource {
             throw xaError(XAException.XAER_OUTSIDE, "connection has a local transaction in progress");
         }
         String txnId = txnId(xid);
-        if (shim.start(txnId) != Outcome.SUCCEEDED) {
+        Long age = RetryAge.get();   // a retry's first attempt's age, if the application set one
+        if ((age == null ? shim.start(txnId) : shim.start(txnId, age)) != Outcome.SUCCEEDED) {
             // the coordinator already rolled the branch back (tombstone on the shim), or a duplicate start
             throw xaError(XAException.XA_RBROLLBACK, "branch " + txnId + " was rolled back before it started");
         }

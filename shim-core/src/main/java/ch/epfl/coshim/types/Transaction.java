@@ -24,8 +24,10 @@ public class Transaction<K, V> {
   private final Map<K, V> readSet;
   /** expires_at of pseudo.txt, in {@link System#currentTimeMillis()}: set only on a tombstone. */
   private final Long expiresAtMillis;
-  /** Age for deadlock prevention (smaller = older); see {@link LockNode#hasYoungerHolderNotIn}. */
+  /** Age for deadlock prevention (smaller = older); see {@link #isYoungerThan}. */
   private final long ts;
+  /** Breaks ties between equal ages (a retry and what is left of its earlier attempts); equal to ts otherwise. */
+  private final long tieBreak;
   private Status status;
   /**
    * Has ever been executed (guarded by the monitor). A txn that never was has no reader of its
@@ -80,6 +82,12 @@ public class Transaction<K, V> {
 
   /** @param ts the txn's age; txns of equal ts never abort each other for deadlock prevention */
   public Transaction(String transactionId, Status status, Long expiresAtMillis, long ts) {
+    this(transactionId, status, expiresAtMillis, ts, ts);
+  }
+
+  /** @param tieBreak orders txns of equal {@code ts} (larger = younger); equal ts and tieBreak: same age */
+  public Transaction(String transactionId, Status status, Long expiresAtMillis, long ts, long tieBreak) {
+    this.tieBreak = tieBreak;
     this.transactionId = transactionId;
     this.locksAcquired = new HashMap<>();
     this.status = status;
@@ -91,6 +99,14 @@ public class Transaction<K, V> {
 
   public long getTs() {
     return ts;
+  }
+
+  /**
+   * Younger than {@code other} for deadlock prevention: a later age, or the same age and a later tie-break. Txns
+   * of the same age and tie-break (e.g. two branches of one global txn on one shim) never abort each other.
+   */
+  public boolean isYoungerThan(Transaction<?, ?> other) {
+    return ts > other.ts || (ts == other.ts && tieBreak > other.tieBreak);
   }
 
   public String getTransactionId() {
