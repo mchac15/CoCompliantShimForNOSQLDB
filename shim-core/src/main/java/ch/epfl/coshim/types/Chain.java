@@ -205,7 +205,7 @@ class Chain<K, V> {
    *
    * @param deadlineNanos a {@link System#nanoTime()} deadline
    * @param limits the caps on speculative grants
-   * @param victims receives the txns marked on WOUND (only with WOUND_WAIT)
+   * @param victims receives the txns marked on WOUND (only with WOUND_WAIT / WOUND_BLOCKED)
    */
   synchronized WaitResult awaitLockReady(
       Transaction<K, V> txn,
@@ -294,8 +294,9 @@ class Chain<K, V> {
             && (blockers == null ? pred.hasYoungerHolderNotIn(txn, ready) : hasYounger(txn, blockers))) {
           return WaitResult.DIE;
         }
-        if (bounded && policy == DeadlockPolicy.WOUND_WAIT
-            && wound(txn, pred, blockers == null ? ready : COMMITTED, victims)) {
+        if (bounded && policy.wounds()
+            && wound(txn, pred, blockers == null ? ready : COMMITTED,
+                policy == DeadlockPolicy.WOUND_BLOCKED, victims)) {
           return WaitResult.WOUND;
         }
         try {
@@ -388,30 +389,36 @@ class Chain<K, V> {
    * nobody else releases those until their own thread calls the shim again (e.g. during client think
    * time), and aborting them never cascades.
    *
+   * @param onlyBlocked WOUND_BLOCKED: a younger started holder is woundable only while blocked itself
    * @return true iff victims is non-empty: the caller must abort them before waiting again
    */
   private boolean wound(
       Transaction<K, V> txn,
       LockNode<K, V> pred,
       Set<Status> ready,
+      boolean onlyBlocked,
       List<Transaction<K, V>> victims) {
     boolean blocked = false;
     for (Transaction<K, V> t : pred.getHolders()) {
       Status s = t.getStatus();
-      if (!ready.contains(s)
-          && !LEAVING.contains(s)
-          && !(s == Status.STARTED && t.isYoungerThan(txn))) {
-        blocked = true;   // an older live txn, or a younger one past started: not woundable
+      if (!ready.contains(s) && !LEAVING.contains(s) && !woundable(txn, t, s, onlyBlocked)) {
+        blocked = true;   // an older live txn, a younger one past started (or running): not woundable
       }
     }
     for (Transaction<K, V> t : pred.getHolders()) {
-      if (!blocked && t.isYoungerThan(txn) && t.wound()) {
+      if (!blocked && woundable(txn, t, t.getStatus(), onlyBlocked) && t.wound()) {
         victims.add(t);
       } else if (t.getStatus() == Status.MUST_ABORT && !t.hasReachedExecuted()) {
         victims.add(t);
       }
     }
     return !victims.isEmpty();
+  }
+
+  /** A younger started holder; with onlyBlocked, one that is also blocked in lock()/upgrade() now. */
+  private static <K, V> boolean woundable(
+      Transaction<K, V> txn, Transaction<K, V> t, Status s, boolean onlyBlocked) {
+    return s == Status.STARTED && t.isYoungerThan(txn) && (!onlyBlocked || t.isBlocked());
   }
 
   /** Statistics only: the uncommitted txns ahead of txn's node, and on how many nodes. */

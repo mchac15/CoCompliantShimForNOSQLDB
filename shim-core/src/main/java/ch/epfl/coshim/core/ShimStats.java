@@ -58,6 +58,9 @@ public final class ShimStats {
   private final LongAdder cascadeMarked = new LongAdder();
   private final LongAdder cascadeMarkedExecuted = new LongAdder();
   private final LongAdder cascadeSpared = new LongAdder();
+  /** Wound-wait victims: blocked in lock() when wounded (could be in a deadlock), or running (could not). */
+  private final LongAdder woundedBlocked = new LongAdder();
+  private final LongAdder woundedRunning = new LongAdder();
   /** Per depth bucket: lifetime of the aborted txns (µs), and how many of them were cascade victims. */
   private final LongAdder[] lostUsByDepth = adders();
   private final LongAdder[] cascadesByDepth = adders();
@@ -180,6 +183,19 @@ public final class ShimStats {
     cascadeMarked.add(marked);
     cascadeMarkedExecuted.add(executed);
     cascadeSpared.add(spared);
+  }
+
+  /** A wound-wait victim aborted; {@code blocked}: it was waiting in lock() when wounded. */
+  void woundedVictim(boolean blocked) {
+    (blocked ? woundedBlocked : woundedRunning).increment();
+  }
+
+  public long woundedBlocked() {
+    return woundedBlocked.sum();
+  }
+
+  public long woundedRunning() {
+    return woundedRunning.sum();
   }
 
   /** A root abort (not a cascade victim) doomed {@code victims > 0} txns transitively. */
@@ -381,6 +397,8 @@ public final class ShimStats {
     sb.append(String.format(Locale.ROOT,
         " spec_refused_depth_total=%d spec_refused_fanout_total=%d spec_refused_wait_us_total=%d",
         refusedDepth.sum(), refusedFanout.sum(), refusedWaitUs.sum()));
+    sb.append(String.format(Locale.ROOT, " wounded_blocked_total=%d wounded_running_total=%d",
+        woundedBlocked.sum(), woundedRunning.sum()));
     for (AbortCause cause : AbortCause.values()) {
       sb.append(" lost_").append(cause.name().toLowerCase()).append("_us_total=").append(lostUs(cause));
     }

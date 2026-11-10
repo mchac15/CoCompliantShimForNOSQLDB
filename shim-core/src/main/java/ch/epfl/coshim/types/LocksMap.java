@@ -352,23 +352,38 @@ public class LocksMap<K, V> {
    * chain stays txn's chain meanwhile: txn's own node keeps it from being emptied and removed.
    */
   private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline) {
-    while (true) {
-      List<Transaction<K, V>> victims = new ArrayList<>();
-      switch (chain.awaitLockReady(txn, lockReady, deadline, deadlockPolicy, limits, victims)) {
-        case READY -> {
-          return LockResult.ACQUIRED;
+    txn.setBlocked(true);
+    if (deadlockPolicy == DeadlockPolicy.WOUND_BLOCKED) {
+      // the older txns waiting behind txn on its keys (this one included) may now wound it: wake them to
+      // re-check, outside every latch, after the flag is visible
+      for (K k : txn.heldKeys()) {
+        Chain<K, V> c = locksMap.get(k);
+        if (c != null) {
+          c.signalAll();
         }
-        case DOOMED -> {
-          return LockResult.MUST_ABORT;
-        }
-        case TIMED_OUT -> {
-          return LockResult.TIMED_OUT;
-        }
-        case DIE -> {
-          return LockResult.DIE;
-        }
-        case WOUND -> victims.forEach(woundHandler);
       }
+    }
+    try {
+      while (true) {
+        List<Transaction<K, V>> victims = new ArrayList<>();
+        switch (chain.awaitLockReady(txn, lockReady, deadline, deadlockPolicy, limits, victims)) {
+          case READY -> {
+            return LockResult.ACQUIRED;
+          }
+          case DOOMED -> {
+            return LockResult.MUST_ABORT;
+          }
+          case TIMED_OUT -> {
+            return LockResult.TIMED_OUT;
+          }
+          case DIE -> {
+            return LockResult.DIE;
+          }
+          case WOUND -> victims.forEach(woundHandler);
+        }
+      }
+    } finally {
+      txn.setBlocked(false);
     }
   }
 

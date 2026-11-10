@@ -437,6 +437,9 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     if (finalCause == AbortCause.CASCADE) {
       stats.cascadeVictim(root, lifetime);
     }
+    if (finalCause == AbortCause.WOUNDED) {
+      stats.woundedVictim(txn.woundedWhileBlocked());
+    }
     transactionsMap.remove(txn.getTransactionId(), txn);
     int victims = txn.cascadeFanout();
     for (Transaction<K, V> t : doomed) {
