@@ -78,6 +78,8 @@ public class Transaction<K, V> {
   private int limitedByDepth;
   private int limitedByFanout;
   private long limitedWaitNanos;
+  /** Statistics only: grants the limits refused but that went ahead, as they would have waited for a younger txn. */
+  private int overCap;
 
   /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
   public Transaction(String transactionId, Status status, Long expiresAtMillis) {
@@ -342,6 +344,15 @@ public class Transaction<K, V> {
       limitedByFanout++;
     }
     limitedWaitNanos += waitNanos;
+  }
+
+  /** Statistics only: a refused grant went ahead over the cap rather than wait for a younger txn. */
+  synchronized void recordOverCap() {
+    overCap++;
+  }
+
+  public synchronized int overCap() {
+    return overCap;
   }
 
   public synchronized int limitedByDepth() {

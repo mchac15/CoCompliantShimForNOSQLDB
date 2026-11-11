@@ -83,6 +83,8 @@ public final class ShimStats {
   private final LongAdder refusedDepth = new LongAdder();
   private final LongAdder refusedFanout = new LongAdder();
   private final LongAdder refusedWaitUs = new LongAdder();
+  /** Grants the limits refused but that went ahead, as they would have waited for a younger txn. */
+  private final LongAdder overCap = new LongAdder();
   /** Running sums of (depth, saved µs) over the commits, for their Pearson correlation. */
   private double n, sx, sy, sxx, syy, sxy;
 
@@ -280,8 +282,10 @@ public final class ShimStats {
    * A resolved txn's lock calls the speculation limits held back (once per txn, at commit or abort).
    *
    * @param waitNanos from each one's first refusal to the end of its wait
+   * @param overCapGrants refused grants that went ahead anyway, rather than wait for a younger txn
    */
-  void limited(int byDepth, int byFanout, long waitNanos) {
+  void limited(int byDepth, int byFanout, long waitNanos, int overCapGrants) {
+    overCap.add(overCapGrants);
     refusedDepth.add(byDepth);
     refusedFanout.add(byFanout);
     refusedWaitUs.add(TimeUnit.NANOSECONDS.toMicros(waitNanos));
@@ -395,8 +399,9 @@ public final class ShimStats {
         committedLifetimeUs.sum(), committedLockWaitUs.sum(), committedPrepareWaitUs.sum(), committedPostVoteUs.sum(),
         abortedLockWaitUs.sum(), abortedPrepareWaitUs.sum()));
     sb.append(String.format(Locale.ROOT,
-        " spec_refused_depth_total=%d spec_refused_fanout_total=%d spec_refused_wait_us_total=%d",
-        refusedDepth.sum(), refusedFanout.sum(), refusedWaitUs.sum()));
+        " spec_refused_depth_total=%d spec_refused_fanout_total=%d spec_refused_wait_us_total=%d"
+            + " spec_over_cap_total=%d",
+        refusedDepth.sum(), refusedFanout.sum(), refusedWaitUs.sum(), overCap.sum()));
     sb.append(String.format(Locale.ROOT, " wounded_blocked_total=%d wounded_running_total=%d",
         woundedBlocked.sum(), woundedRunning.sum()));
     for (AbortCause cause : AbortCause.values()) {
