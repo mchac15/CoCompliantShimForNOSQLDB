@@ -350,7 +350,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
     stats.committed(txn.maxDepth(), grants, saved, txn.prepareWaitNanos());
-    stats.limited(txn.limitedByDepth(), txn.limitedByFanout(), txn.limitedWaitNanos());
+    stats.limited(txn.limitedByDepth(), txn.limitedByFanout(), txn.limitedWaitNanos(), txn.overCap());
     long now = System.nanoTime();
     stats.committedBudget(now - txn.createdAtNanos(), txn.lockWaitNanos(), txn.prepareWaitNanos(),
         now - txn.votedAtNanos());
@@ -433,7 +433,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     stats.aborted(finalCause, txn.maxDepth(), txn.cascadeFanout(), lifetime);
     stats.abortedBudget(finalCause, lifetime, txn.lockWaitNanos(), txn.prepareWaitNanos());
     stats.cascadeMarks(txn.cascadeFanout(), doomed.size(), txn.sparedMarks());
-    stats.limited(txn.limitedByDepth(), txn.limitedByFanout(), txn.limitedWaitNanos());
+    stats.limited(txn.limitedByDepth(), txn.limitedByFanout(), txn.limitedWaitNanos(), txn.overCap());
     if (finalCause == AbortCause.CASCADE) {
       stats.cascadeVictim(root, lifetime);
     }

@@ -948,16 +948,17 @@ class LocksMapTest {
   }
 
   @Test
-  void aRefusedOlderTxnDiesInsteadOfWaitingForAYoungerOneToCommit() {
-    // unlimited, old would be granted at once (young executed); refused, it would wait for young's
-    // commit, which may wait for old on another shim
+  void aRefusedOlderTxnIsGrantedOverTheCapRatherThanWaitForAYoungerOneToCommit() {
+    // refused, old would wait for young's commit, which may wait for old on another shim (a cycle no
+    // lock-level prevention sees): it speculates instead, under wait-die as under any policy
     LocksMap<String, String> locks = limited(0, NONE);
     Transaction<String, String> young = txn("young", 2);
     Transaction<String, String> old = txn("old", 1);
     locks.lock("x", young, LockMode.EXCLUSIVE, LONG);
     set(locks, young, Status.EXECUTED);
 
-    assertEquals(LockResult.DIE, locks.lock("x", old, LockMode.SHARED, LONG));
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", old, LockMode.SHARED, LONG));
+    assertEquals(1, old.overCap());
   }
 
   @Test
@@ -976,19 +977,16 @@ class LocksMapTest {
   }
 
   @Test
-  void underWoundWaitARefusedOlderTxnWaitsForAnExecutedYoungerOne() throws Exception {
+  void underWoundWaitARefusedOlderTxnIsGrantedOverTheCapBehindAnExecutedYoungerOne() {
     LocksMap<String, String> locks = limited(0, NONE, DeadlockPolicy.WOUND_WAIT);
     Transaction<String, String> young = txn("young", 2);
     Transaction<String, String> old = txn("old", 1);
     locks.lock("x", young, LockMode.EXCLUSIVE, LONG);
     set(locks, young, Status.EXECUTED);
-    CompletableFuture<LockResult> f =
-        CompletableFuture.supplyAsync(() -> locks.lock("x", old, LockMode.SHARED, LONG));
-    assertBlocked(f);
-    assertEquals(Status.EXECUTED, young.getStatus(), "an executed txn is never wounded");
 
-    commit(locks, young);
-    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", old, LockMode.SHARED, LONG));
+    assertEquals(Status.EXECUTED, young.getStatus(), "an executed txn is never wounded");
+    assertEquals(1, old.overCap());
   }
 
   // ---- a cascade dooms only the holders that may have read the key ----

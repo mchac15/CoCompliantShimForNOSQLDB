@@ -198,10 +198,14 @@ class Chain<K, V> {
    *
    * <p>Speculation limits: at the speculation point the grant must also fit {@code limits} (see
    * {@link SpeculationLimits}); if not, txn keeps waiting (it sleeps on this monitor, and every
-   * commit or abort that can make it fit wakes it up here). Such a wait is the baseline's: txn now
-   * waits for txns that executed to commit, and their commits wait on prepare()/2PC, so the deadlock
-   * prevention treats them as waited for, as when not speculative: wait-die dies if one of the txns
-   * it waits for (the ones that must commit, or the full one) is younger, wound-wait waits.
+   * commit or abort that can make it fit wakes it up here). Such a wait is for txns that executed to
+   * commit, and their commits wait on prepare()/2PC (on other shims too), which no lock-level deadlock
+   * prevention sees. So the limiter only ever makes txn wait for older txns: if one of the txns it would
+   * wait for (the ones that must commit, or the one with too many dependents) is younger, txn is granted
+   * over the cap instead (it speculates). Its waits then all go from younger to older txns, like those
+   * of wound-wait, wait-die and prepare's wait-die, and the branches of one global txn share their age,
+   * so no cycle can form through them. (Waiting there instead deadlocked until lock_timeout: at depth 0
+   * every run froze within seconds.)
    *
    * @param deadlineNanos a {@link System#nanoTime()} deadline
    * @param limits the caps on speculative grants
@@ -277,6 +281,10 @@ class Chain<K, V> {
         if (pred == null || pred.allHoldersIn(ready)) {
           List<Transaction<K, V>> b = new ArrayList<>();
           Refusal r = bounded ? admit(txn, limits, b) : null;
+          if (r != null && hasYounger(txn, b)) {
+            txn.recordOverCap();   // it would wait for a younger txn's commit: speculate instead
+            r = null;
+          }
           if (r == null) {
             txn.getLock(key).node().markGranted(txn);
             if (bounded) {
@@ -290,8 +298,9 @@ class Chain<K, V> {
           }
           blockers = b;
         }
-        if (bounded && policy == DeadlockPolicy.WAIT_DIE
-            && (blockers == null ? pred.hasYoungerHolderNotIn(txn, ready) : hasYounger(txn, blockers))) {
+        // a refused grant waits only for older txns (see above): nothing to die for
+        if (bounded && policy == DeadlockPolicy.WAIT_DIE && blockers == null
+            && pred.hasYoungerHolderNotIn(txn, ready)) {
           return WaitResult.DIE;
         }
         if (bounded && policy.wounds()
@@ -371,7 +380,7 @@ class Chain<K, V> {
     return risky;
   }
 
-  /** Wait-die for a refused grant: one of the txns it waits for is younger and not leaving. */
+  /** One of the txns a refused grant would wait for is younger than txn and not leaving. */
   private static <K, V> boolean hasYounger(Transaction<K, V> txn, List<Transaction<K, V>> blockers) {
     for (Transaction<K, V> t : blockers) {
       if (t.isYoungerThan(txn) && !LEAVING.contains(t.getStatus())) {
