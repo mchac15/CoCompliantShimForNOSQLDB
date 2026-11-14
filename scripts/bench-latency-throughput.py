@@ -70,12 +70,14 @@ def main():
                 for p in pts:
                     ax.annotate(str(p["threads"]), (p["tps"], p[y]), textcoords="offset points", xytext=(4, 4),
                                 fontsize=7, color=MUTED)
-            ax.set_ylim(bottom=0)
             ax.set_title(f"{panel}: {title}", color=INK, fontsize=9)
             if j == 0:
                 ax.set_ylabel(f"{title}, ms (creation → commit)")
             if i == 1:
                 ax.set_xlabel("committed txns / s")
+    for i, y in enumerate(("p50", "p99")):
+        # once every panel of the row is drawn, so the shared scale fits them all
+        axes[i][0].set_ylim(0, 1.1 * max(p[y] for pts in data.values() for p in pts))
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False, bbox_to_anchor=(0.5, 1.02))
     fig.text(0.5, -0.02, "each point: one thread count (labeled); latency over the committed txns, retries included",
