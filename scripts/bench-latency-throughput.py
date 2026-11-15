@@ -42,6 +42,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out", type=Path)
     ap.add_argument("--skew", type=float, required=True)
+    ap.add_argument("--own-scales", action="store_true", help="each panel its own axes (default: shared per row)")
+    ap.add_argument("--log-latency", action="store_true", help="latency on a log scale")
     ap.add_argument("runs", nargs="+", help="PANEL/SERIES=CONFIG_DIR")
     args = ap.parse_args()
     panels, series = [], []
@@ -57,8 +59,9 @@ def main():
                          "axes.edgecolor": GRID, "axes.labelcolor": MUTED, "xtick.color": MUTED, "ytick.color": MUTED,
                          "text.color": INK, "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6,
                          "axes.spines.top": False, "axes.spines.right": False, "font.size": 9, "lines.linewidth": 2})
-    fig, axes = plt.subplots(2, len(panels), figsize=(3.6 * len(panels), 6.4), squeeze=False, sharex=True,
-                             sharey="row")
+    shared = not args.own_scales
+    fig, axes = plt.subplots(2, len(panels), figsize=(3.6 * len(panels), 6.4), squeeze=False,
+                             sharex="col" if not shared else True, sharey="row" if shared else False)
     for j, panel in enumerate(panels):
         for i, (y, title) in enumerate((("p50", "median latency"), ("p99", "p99 latency"))):
             ax = axes[i][j]
@@ -71,13 +74,20 @@ def main():
                     ax.annotate(str(p["threads"]), (p["tps"], p[y]), textcoords="offset points", xytext=(4, 4),
                                 fontsize=7, color=MUTED)
             ax.set_title(f"{panel}: {title}", color=INK, fontsize=9)
-            if j == 0:
-                ax.set_ylabel(f"{title}, ms (creation → commit)")
+            if j == 0 or not shared:
+                ax.set_ylabel(f"{title}, ms" + (" (log)" if args.log_latency else ""))
             if i == 1:
                 ax.set_xlabel("committed txns / s")
     for i, y in enumerate(("p50", "p99")):
-        # once every panel of the row is drawn, so the shared scale fits them all
-        axes[i][0].set_ylim(0, 1.1 * max(p[y] for pts in data.values() for p in pts))
+        for j, panel in enumerate(panels):
+            ax = axes[i][j]
+            if args.log_latency:
+                ax.set_yscale("log")
+            elif shared and j == 0:
+                # once every panel of the row is drawn, so the shared scale fits them all
+                ax.set_ylim(0, 1.1 * max(p[y] for pts in data.values() for p in pts))
+            elif not shared:
+                ax.set_ylim(0, 1.1 * max(p[y] for (pn, _), pts in data.items() if pn == panel for p in pts))
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False, bbox_to_anchor=(0.5, 1.02))
     fig.text(0.5, -0.02, "each point: one thread count (labeled); latency over the committed txns, retries included",

@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 
 INK, MUTED, SURFACE, GRID = "#1f1f1e", "#52514e", "#fcfcfb", "#e1e0d9"
 NONSPEC, SPEC = "#8a8984", "#2a78d6"
-GAINS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]   # peak vs peak, then one per shared thread count
+GAINS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]   # peak vs peak, then one per thread count
 
 
 def curve(cfg_dir, skew):
@@ -47,6 +47,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out", type=Path)
     ap.add_argument("--skew", type=float, required=True)
+    ap.add_argument("--gain-threads", type=int, nargs="+",
+                    help="the thread counts to show gains at (default: every one both systems ran, at most 4)")
     ap.add_argument("workloads", nargs="+", help="LABEL=DIR")
     args = ap.parse_args()
     rows = []
@@ -55,6 +57,9 @@ def main():
         non, spec = load(Path(d), args.skew)
         rows.append((label, non, spec))
     shared = sorted(set.intersection(*[set(n) & set(s) for _, n, s in rows]))
+    if args.gain_threads:
+        shared = [t for t in shared if t in args.gain_threads]
+    shared = shared[:len(GAINS) - 1]   # one color each, never cycled
 
     plt.rcParams.update({"figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
                          "axes.edgecolor": GRID, "axes.labelcolor": MUTED, "xtick.color": MUTED, "ytick.color": MUTED,
@@ -90,7 +95,7 @@ def main():
     b.set_ylabel("speculative vs non-speculative")
     b.set_title("speculation's gain", color=INK)
     b.margins(y=0.15)
-    b.legend(frameon=False, loc="upper left", fontsize=8)
+    b.legend(frameon=False, loc="lower left", fontsize=8)
     fig.text(0.5, -0.03, "speculative = best speculative config at each thread count; ↑ = peak at the largest thread "
              "count run (may peak higher)", ha="center", color=MUTED, fontsize=8)
     fig.tight_layout()
