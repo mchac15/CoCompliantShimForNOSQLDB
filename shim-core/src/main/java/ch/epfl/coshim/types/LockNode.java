@@ -1,19 +1,21 @@
 package ch.epfl.coshim.types;
 
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * One generation of holders on a key. A passive record: only the key's {@link Chain} reads or
- * modifies it, under its latch.
+ * One generation of holders on a key. A passive record: only the key's {@link Chain} modifies it,
+ * under its latch. The deadlock detection ({@link DeadlockPolicy#DETECT}) also reads {@code prev} and
+ * the holders of nodes of other chains without their latch (it may hold one chain's monitor only),
+ * hence the volatile pointer and the concurrent set.
  */
 public class LockNode<K, V> {
   private final K key;
   private LockType.LockMode mode;
   private LockNode<K, V> next;
-  private LockNode<K, V> prev;
-  private final Set<Transaction<K, V>> holders = new HashSet<>();
+  private volatile LockNode<K, V> prev;
+  private final Set<Transaction<K, V>> holders = ConcurrentHashMap.newKeySet();
   private boolean upgraded;
 
   LockNode(K key, LockType.LockMode mode, Transaction<K, V> holder) {

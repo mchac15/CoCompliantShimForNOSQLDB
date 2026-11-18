@@ -395,6 +395,9 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     long lifetime = System.nanoTime() - txn.createdAtNanos();
     stats.aborted(finalCause, txn.maxDepth(), txn.cascadeFanout(), lifetime);
     stats.abortedBudget(finalCause, lifetime, txn.lockWaitNanos(), txn.prepareWaitNanos());
+    if (finalCause == AbortCause.WOUNDED && txn.isWoundedInCycle()) {
+      stats.woundedInCycle();
+    }
     stats.cascadeMarks(txn.cascadeFanout(), doomed.size(), txn.waitingMarks());
     if (finalCause == AbortCause.CASCADE) {
       stats.cascadeVictim(root, lifetime);

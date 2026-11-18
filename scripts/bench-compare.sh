@@ -14,7 +14,8 @@
 #                                      variants (same servers, same settings, same tables and keys,
 #                                      same statements; see SqlKvStore), refilled at node start
 #   <shim variant>@wait-die,           a shim variant with that deadlock policy instead of DEADLOCK's
-#   <shim variant>@wound-wait          (e.g. speculative-pg@wound-wait); the label keeps the suffix
+#   <shim variant>@wound-wait,         (e.g. speculative-pg@wound-wait); the label keeps the suffix
+#   <shim variant>@detect
 #   sonata-mysql, sonata-pg            Sonata: SHIMS MySQL / PostgreSQL servers (scripts/bench-dbs.sh:
 #                                      Acta's settings, fsync off) behind Seata's stock XA proxy, with
 #                                      sonata.enableGlobalSerializability (Sonata's other settings at
@@ -32,7 +33,7 @@
 # Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), STATS_INTERVAL_S (0: the nodes log their
 #      counters at shutdown only; N: also every N s), PREPARE_DEADLOCK (none | wait-die: the nodes'
 #      --prepare-deadlock, default none), GC_LOGS (1: GC and safepoint logs of the nodes and of
-#      MicroBench, next to the node logs; the shim variants only), DEADLOCK (wait-die | wound-wait, default
+#      MicroBench, next to the node logs; the shim variants only), DEADLOCK (wait-die | wound-wait | detect | none, default
 #      wait-die), VARIANTS ("speculative nonspeculative"),
 #      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o), and
 #      scripts/bench-dbs.sh's MYSQL_PORT, PG_PORT, ...

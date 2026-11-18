@@ -17,9 +17,15 @@ public final class ShimStats {
   public enum AbortCause {
     /** lock()/upgrade() waited lock_timeout (assumed deadlock). */
     LOCK_TIMEOUT,
-    /** lock()/upgrade() would have waited for a younger txn (deadlock prevention). */
+    /**
+     * lock()/upgrade() would have waited for a younger txn (deadlock prevention), or the txn was the
+     * youngest member of the wait-for cycle it closed (deadlock detection).
+     */
     DEADLOCK_PREVENTION,
-    /** Wound-wait: an older txn wanted a lock this one held while still running. */
+    /**
+     * Wound-wait: an older txn wanted a lock this one held while still running. Deadlock detection:
+     * another txn found it the youngest member of a wait-for cycle.
+     */
     WOUNDED,
     /** Lost an upgrade race: read-modify-write against read-modify-write. */
     UPGRADE_CONFLICT,
@@ -61,6 +67,8 @@ public final class ShimStats {
   /** Per depth bucket: lifetime of the aborted txns (µs), and how many of them were cascade victims. */
   private final LongAdder[] lostUsByDepth = adders();
   private final LongAdder[] cascadesByDepth = adders();
+  /** WOUNDED aborts whose wound broke a real deadlock (the victim was on a wait-for cycle). */
+  private final LongAdder woundedInCycle = new LongAdder();
   private final LongAdder speculativeGrants = new LongAdder();
   private final LongAdder prepareWaitUs = new LongAdder();
   private final LongAdder prepares = new LongAdder();
@@ -213,6 +221,19 @@ public final class ShimStats {
     return cascadeMarkedExecuted.sum();
   }
 
+  /** A WOUNDED abort (counted once, with {@link #aborted}) whose victim was on a wait-for cycle. */
+  void woundedInCycle() {
+    woundedInCycle.increment();
+  }
+
+  /**
+   * WOUNDED aborts that broke a real deadlock; under wound-wait the rest wounded a txn that was not
+   * (yet) on a cycle, which deadlock detection would have let run.
+   */
+  public long woundedInCycleCount() {
+    return woundedInCycle.sum();
+  }
+
   /** prepare() waited this long for its predecessors to commit (the cost of ordering). */
   void prepared(long waitNanos) {
     prepares.increment();
@@ -352,6 +373,7 @@ public final class ShimStats {
             + " committed_post_vote_us_total=%d aborted_lock_wait_us_total=%d aborted_prepare_wait_us_total=%d",
         committedLifetimeUs.sum(), committedLockWaitUs.sum(), committedPrepareWaitUs.sum(), committedPostVoteUs.sum(),
         abortedLockWaitUs.sum(), abortedPrepareWaitUs.sum()));
+    sb.append(" wounded_in_cycle_total=").append(woundedInCycle.sum());
     for (AbortCause cause : AbortCause.values()) {
       sb.append(" lost_").append(cause.name().toLowerCase()).append("_us_total=").append(lostUs(cause));
     }
