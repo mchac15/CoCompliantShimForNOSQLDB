@@ -60,7 +60,7 @@ def main():
                          "text.color": INK, "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6,
                          "axes.spines.top": False, "axes.spines.right": False, "font.size": 9, "lines.linewidth": 2})
     shared = not args.own_scales
-    fig, axes = plt.subplots(2, len(panels), figsize=(3.6 * len(panels), 6.4), squeeze=False,
+    fig, axes = plt.subplots(2, len(panels), figsize=(max(3.6 * len(panels), 8), 6.4), squeeze=False,
                              sharex="col" if not shared else True, sharey="row" if shared else False)
     for j, panel in enumerate(panels):
         for i, (y, title) in enumerate((("p50", "median latency"), ("p99", "p99 latency"))):
