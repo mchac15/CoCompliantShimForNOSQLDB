@@ -41,6 +41,11 @@ class LocksMapTest {
     assertNotNull(locks.enqueue("x", t, mode));
   }
 
+  /** As if t's lock() on x had got past its wait: t may have read the holders ahead. */
+  private static void granted(Transaction<String, String> t) {
+    t.getLock("x").node().markGranted(t);
+  }
+
   /** Moves t to status and wakes its waiters, like the shim does after every CAS. */
   private void set(Transaction<String, String> t, Status status) {
     set(locks, t, status);
@@ -697,6 +702,8 @@ class LocksMapTest {
     enqueue(p, LockMode.SHARED);
     enqueue(w, LockMode.EXCLUSIVE);
     enqueue(r, LockMode.SHARED);
+    granted(e);
+    granted(p);
     set(a, Status.EXECUTED);
     set(e, Status.EXECUTED);
     set(p, Status.PREPARED);
@@ -734,6 +741,7 @@ class LocksMapTest {
     Transaction<String, String> b = txn("b");
     enqueue(a, LockMode.EXCLUSIVE);
     enqueue(b, LockMode.SHARED);
+    granted(b);
     set(a, Status.EXECUTED);
     set(b, Status.EXECUTED);
 
@@ -789,5 +797,74 @@ class LocksMapTest {
     assertEquals(Status.PREPARED, t.getStatus());
     assertTrue(t.compareAndSwapStatus(Status.PREPARED, Status.COMMITTING));
     assertEquals(Status.COMMITTING, t.getStatus());
+  }
+
+  // ---- prepare()'s wait-die (cross-shim deadlock prevention) ----
+
+  @Test
+  void prepareWaitDieDiesForAnExecutedYoungerPredecessorAndWaitsForAnOlderOne() throws Exception {
+    LocksMap<String, String> wd = new LocksMap<>(true, DeadlockPolicy.WOUND_WAIT, null, true);
+    Transaction<String, String> young = txn("young", 2);
+    Transaction<String, String> old = txn("old", 1);
+    Transaction<String, String> older = txn("older", 0);
+    wd.enqueue("x", young, LockMode.EXCLUSIVE);
+    wd.enqueue("x", old, LockMode.EXCLUSIVE);
+    set(wd, young, Status.EXECUTED);
+    set(wd, old, Status.EXECUTED);
+    assertEquals(LocksMap.PrepareWait.DIE, wd.awaitPredecessorsCommitted(old),
+        "young's commit may wait for old's vote on another shim");
+
+    Transaction<String, String> mid = txn("mid", 3);
+    wd.enqueue("y", older, LockMode.EXCLUSIVE);
+    wd.enqueue("y", mid, LockMode.EXCLUSIVE);
+    set(wd, older, Status.PREPARED);
+    set(wd, mid, Status.EXECUTED);
+    CompletableFuture<LocksMap.PrepareWait> f =
+        CompletableFuture.supplyAsync(() -> wd.awaitPredecessorsCommitted(mid));
+    assertBlocked(f);   // waits for the older txn
+    set(wd, older, Status.COMMITTING);
+    wd.release(older);
+    assertEquals(LocksMap.PrepareWait.READY, f.get(2, TimeUnit.SECONDS));
+  }
+
+  // ---- get-for-update ----
+
+  @Test
+  void aGetForUpdateHolderThatDidNotWriteHoldsNoVersion() {
+    Transaction<String, String> w = txn("w");
+    Transaction<String, String> g = txn("g");
+    Transaction<String, String> r = txn("r");
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", w, LockMode.EXCLUSIVE, LONG));
+    w.addToWriteSet("x", "1");
+    set(w, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", g, LONG));
+    assertEquals("1", locks.read("x", g).value(), "g reads w's write, not its own (empty) node");
+    set(g, Status.EXECUTED);   // never wrote x
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", r, LockMode.SHARED, LONG));
+    assertEquals("1", locks.read("x", r).value(), "g holds no version of x: r reads w's");
+  }
+
+  @Test
+  void aCascadeSparesAGetForUpdateWaiterThatReadNothing() throws Exception {
+    // X(a, executed) <- X(b, gfu: granted on a) <- X(c, gfu: waits for b): c's node is marked as read
+    // from its creation, but c was never granted
+    Transaction<String, String> a = txn("a");
+    Transaction<String, String> b = txn("b");
+    Transaction<String, String> c = txn("c");
+    locks.lockForUpdate("x", a, LONG);
+    set(a, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", b, LONG));
+    CompletableFuture<LockResult> f = CompletableFuture.supplyAsync(() -> locks.lockForUpdate("x", c, LONG));
+    assertBlocked(f);
+
+    set(a, Status.ABORTED);
+    locks.abortAndRelease(a);
+
+    assertEquals(Status.MUST_ABORT, b.getStatus());
+    assertEquals(Status.STARTED, c.getStatus(), "c read nothing of a's");
+    assertBlocked(f);   // still behind b, doomed: until b's release
+    set(b, Status.ABORTED);
+    locks.abortAndRelease(b);
+    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
   }
 }

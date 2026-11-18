@@ -66,6 +66,24 @@ public interface CoShim<K, V> {
   void put(String txnId, K key, V value);
 
   /**
+   * {@code get(k)} for a key the transaction will write afterwards (read-modify-write, like SQL's
+   * {@code SELECT ... FOR UPDATE}): takes the EXCLUSIVE lock right away instead of SHARED, so that
+   * the later {@link #put} on k needs no upgrade. Two read-modify-writes of k then queue behind each
+   * other instead of both reading under SHARED and one of them aborting at upgrade time. Reads like
+   * {@link #get}. The write itself is a separate {@link #put}; a txn that does not write k after all
+   * just held a stronger lock than it needed.
+   *
+   * <p>Only a hint about the lock mode: the default falls back to {@link #get} (a shim without
+   * upgrades, or one that ignores it, stays correct).
+   *
+   * @return the value, or {@code null} if the key has none
+   * @throws TxnAbortedException as {@link #get}
+   */
+  default V getForUpdate(String txnId, K key) {
+    return get(txnId, key);
+  }
+
+  /**
    * pseudo.txt {@code end(txn_id)}: the client sent its last operation, CAS {@code started →
    * executed}. If the txn was aborted or doomed meanwhile (a cascade or foreign abort landed after
    * the last request), it runs abort_transaction and returns FAILED; an unknown id also returns

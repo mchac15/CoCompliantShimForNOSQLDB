@@ -16,7 +16,7 @@ import java.util.stream.Stream;
  * @param unknown           attempts in the window whose commit got no clear answer (not retried)
  * @param commitLatencyUs   latency of each committed attempt in the window (TM begin to the end of TM
  *                          commit), sorted ascending
- * @param auditExpectedMin  rmw only: committed txns (whole run) × branches × writes, else -1
+ * @param auditExpectedMin  rmw only: the writes of the committed txns (whole run), else -1
  * @param auditExpectedMax  rmw only: the same counting the unknown outcomes as committed, else -1
  * @param auditActual       rmw only: sum of every value on every shim, else -1
  * @param warning           null, or why the run is not trustworthy (worker error, stuck worker)
@@ -59,14 +59,28 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
         return warning == null && auditOk();
     }
 
+    /** How the branches of a txn run: in parallel, pipelined or in order. */
+    private String branchMode() {
+        return config.parallelBranches() ? "in parallel" : config.pipelinedBranches() ? "pipelined" : "in order";
+    }
+
+    /** The ops of a branch: drawn per branch, or the fixed counts. */
+    private String opsPerBranch() {
+        return config.opsMean() > 0
+                ? String.format(Locale.ROOT, "reads,writes~N(%.1f,%.1f)<=%d", config.opsMean(), config.opsSd(),
+                        config.opsMax())
+                : String.format(Locale.ROOT, "reads=%d writes=%d", config.reads(), config.writes());
+    }
+
     public String summary() {
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format(Locale.ROOT, "[%s] shims=%s tc=%s threads=%d tableSize=%d branches=%d reads=%d "
-                        + "writes=%d skew=%.2f rmw=%b txnTimeout=%dms branches %s measure=%ds%n",
+        sb.append(String.format(Locale.ROOT, "[%s] shims=%s tc=%s threads=%d tableSize=%d branches=%d %s "
+                        + "skew=%.2f (%s) rmw=%b getForUpdate=%b think=%.0f±%.0fus txnTimeout=%dms branches %s "
+                        + "measure=%ds%n",
                 config.variant(), String.join(",", config.shims()), config.tc(), config.threads(), config.tableSize(),
-                config.branches(), config.reads(), config.writes(), config.skewness(), config.rmw(),
-                config.txnTimeout().toMillis(), config.parallelBranches() ? "in parallel" : "in order",
-                config.measure().toSeconds()));
+                config.branches(), opsPerBranch(), config.skewness(), config.dist(), config.rmw(),
+                config.getForUpdate(), config.thinkMeanUs(), config.thinkSdUs(), config.txnTimeout().toMillis(),
+                branchMode(), config.measure().toSeconds()));
         sb.append(String.format(Locale.ROOT, "  committed: %d (%.1f txn/s)   rolled back: %d (+%d by TC timeout), "
                         + "unknown: %d, abort rate %.1f%%%n",
                 committed, tps(), aborted, timedOut, unknown, 100 * abortRate()));
@@ -86,7 +100,9 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
 
     public static String csvHeader() {
         return Stream.of("label", "variant", "shims", "threads", "table_size", "branches", "reads", "writes", "skew",
-                        "rmw", "txn_timeout_ms", "parallel_branches", "measure_s", "committed", "tps", "aborted",
+                        "rmw", "txn_timeout_ms", "parallel_branches", "ops_mean", "ops_sd", "ops_max", "think_mean_us",
+                        "think_sd_us", "dist", "get_for_update", "pipelined_branches", "measure_s", "committed", "tps",
+                        "aborted",
                         "timed_out", "unknown", "abort_rate", "mean_us", "p50_us", "p99_us", "audit_ok")
                 .collect(Collectors.joining(","));
     }
@@ -94,7 +110,9 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
     public String csvRow(String label) {
         return Stream.of(label, config.variant(), config.shims().size(), config.threads(), config.tableSize(),
                         config.branches(), config.reads(), config.writes(), config.skewness(), config.rmw(),
-                        config.txnTimeout().toMillis(), config.parallelBranches(), config.measure().toSeconds(),
+                        config.txnTimeout().toMillis(), config.parallelBranches(), config.opsMean(), config.opsSd(),
+                        config.opsMax(), config.thinkMeanUs(), config.thinkSdUs(), config.dist(), config.getForUpdate(),
+                        config.pipelinedBranches(), config.measure().toSeconds(),
                         committed, String.format(Locale.ROOT, "%.1f", tps()), aborted, timedOut, unknown,
                         String.format(Locale.ROOT, "%.4f", abortRate()), meanLatencyUs(), latencyPercentileUs(50),
                         latencyPercentileUs(99), audited() ? auditOk() : "n/a")

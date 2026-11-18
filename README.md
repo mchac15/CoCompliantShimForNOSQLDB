@@ -194,11 +194,22 @@ services:
 
 Per attempt: TM begin (with `--txn-timeout-ms`, enforced by the TC); per branch, an XA connection to
 its shim (`setAutoCommit(false)` registers and starts the branch, the gets/puts go to the shim,
-`commit()` ends and prepares it); then TM commit, or TM rollback after any failure (retried with
-the same plan, as Acta does). On timeout the TC itself rolls the branches back on the shims. The
-variant (speculative or not) and the lock timeout are options of the nodes, not of the benchmark.
-With `--rmw true` (default) every write is `get + 1` and the run ends with an audit, read back
-through the shims (sum of all values = committed txns × branches × writes).
+closing the connection ends and prepares it); then TM commit, or TM rollback after any failure
+(retried with the same plan, as Acta does). On timeout the TC itself rolls the branches back on the
+shims. The variant (speculative or not), the lock timeout and the deadlock prevention are options
+of the nodes, not of the benchmark. With `--rmw true` (default) every write is `get + 1` and the run
+ends with an audit, read back through the shims (sum of all values = writes of the committed txns).
+
+The defaults are the setting where speculation pays off: 4 branches per global transaction,
+**pipelined** (`--pipelined-branches true`: each branch starts as soon as the previous one finished
+its operations, its end + prepare running in the background); each branch draws about 5 reads and 5
+writes (`--ops-mean 5 --ops-sd 1.5 --ops-max 10`; `--ops-mean 0` uses the fixed `--reads` /
+`--writes`) on keys drawn hot with probability `--skew` (`--dist hotspot`; `acta` is Acta's own
+rule), runs them in a random order, and pauses 10 ms on average between two operations
+(`--think-mean-us 10000 --think-sd-us 5000`, standing for the application's work and the network
+hop). With `--get-for-update true`, the reads of keys the branch writes later take the EXCLUSIVE
+lock right away. The nodes default to wound-wait in `lock()` and wait-die in `prepare()`
+(`CoShimNode --deadlock wound-wait --prepare-deadlock wait-die`).
 
 **Start a TC** once (stock Apache Seata 2.6.0; the download steps are in `../acta-server`'s README,
 which keeps it in `runtime/seata`), with a small heap and an existing log directory:
@@ -214,7 +225,8 @@ JVM_XMX=1g JVM_XMS=1g LOG_HOME="$PWD/logs" \
 ```sh
 scripts/bench-compare.sh                                   # the simple test, both variants, 2 shims
 scripts/bench-compare.sh --reps 3 --skew 0.99 --threads 100
-LOCK_TIMEOUT_MS=100 SHIMS=4 scripts/bench-compare.sh --parallel-branches true --txn-timeout-ms 500
+LOCK_TIMEOUT_MS=100 SHIMS=4 scripts/bench-compare.sh --pipelined-branches false --parallel-branches true \
+    --txn-timeout-ms 500
 ```
 
 Or by hand, e.g. against nodes on other machines:
@@ -225,17 +237,19 @@ COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.bench.MicroBench --variant specu
     --shims host1:7000/s0,host2:7000/s1 --tc tc-host:8091
 ```
 
-`--parallel-branches true` runs the branches of each global transaction at the same time instead of
-in order. Transactions then take the shims in different orders, so two of them can wait on each
-other's commit in `prepare` on different shims; the shim has no timeout there, only the TC's
-`--txn-timeout-ms` breaks such a cycle (column `timed_out`).
+`--parallel-branches true` (with `--pipelined-branches false`) runs the branches of each global
+transaction at the same time instead of one after the other. Transactions then take the shims in
+different orders, so two of them can wait on each other's commit in `prepare` on different shims;
+the nodes' prepare wait-die breaks such a cycle (with `--prepare-deadlock none`, only the TC's
+`--txn-timeout-ms` does, column `timed_out`).
 
 Options: `--variant --shims --tc --threads --table-size --branches --reads --writes --skew --rmw
---warmup-s --measure-s --txn-timeout-ms --parallel-branches`; script environment: `SHIMS`,
+--ops-mean --ops-sd --ops-max --think-mean-us --think-sd-us --dist --get-for-update --warmup-s
+--measure-s --txn-timeout-ms --parallel-branches --pipelined-branches`; script environment: `SHIMS`,
 `NODE_PORT`, `LOCK_TIMEOUT_MS`, `VARIANTS`, `CSV`. Every run is appended to
 `bench-results/<timestamp>.csv`, with the nodes' logs (final commit/abort counters per cause) next
 to it; the script prints a comparison table and exits 1 if a run warned or failed its audit.
-`MicroBenchTest` runs both variants and both branch modes briefly through a TC and an in-JVM shim
+`MicroBenchTest` runs both variants and every branch mode briefly through a TC and an in-JVM shim
 node; those runs are skipped when no TC is reachable (`-Dbench.tc=host:port`, default
 127.0.0.1:8091).
 
