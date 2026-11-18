@@ -17,6 +17,7 @@ import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -24,10 +25,12 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.LockSupport;
 import javax.sql.DataSource;
 import org.apache.seata.core.context.RootContext;
 import org.apache.seata.core.exception.TransactionException;
@@ -45,18 +48,21 @@ import org.apache.seata.tm.api.GlobalTransactionContext;
  * {@link DataSourceProxyCoShim} per shim database).
  *
  * <p>Workload: Acta's Micro (scripts in ../acta-server). Each worker runs global transactions in a
- * closed loop. A global transaction has {@code branches} branches; branch i reads {@code reads}
- * keys then writes {@code writes} other keys of table {@code micro-i}, on one of the shims chosen
- * at random. Hot and cold keys follow Acta's skew rule.
+ * closed loop. A global transaction has {@code branches} branches; branch i reads some keys and writes
+ * other keys of table {@code micro-i}, in a random order, on one of the shims chosen at random. The
+ * counts are fixed ({@code reads}, {@code writes}) or drawn per branch ({@code opsMean}); the keys are
+ * hot or cold by the skewness ({@code dist}); the application pauses between two operations ({@code
+ * thinkMeanUs}).
  *
  * <p>One attempt:
  *
  * <ol>
  *   <li>TM begin with {@code txnTimeout}: the TC creates the XID and starts its timeout;
  *   <li>per branch: an XA connection to its shim; {@code setAutoCommit(false)} registers the branch
- *       with the TC and starts it on the shim, the gets/puts go to the shim, {@code commit()} ends
- *       and prepares it (the shim votes). Branches run in order, or at the same time with
- *       {@code parallelBranches} (each thread binds the XID);
+ *       with the TC and starts it on the shim, the gets/puts go to the shim, closing the connection
+ *       ends and prepares it (the shim votes). Branches run in order, each starting when the previous
+ *       one finished its operations with {@code pipelinedBranches} (its vote then comes in the
+ *       background), or at the same time with {@code parallelBranches} (each thread binds the XID);
  *   <li>all YES: TM commit, the TC sends phase 2 to the RM, which commits each branch on its shim;
  *       any failure: TM rollback, the TC rolls every branch back on its shim, and the attempt is
  *       retried with the same plan, as Acta does. If the TC's timeout expires first, the TC rolls
@@ -64,8 +70,8 @@ import org.apache.seata.tm.api.GlobalTransactionContext;
  * </ol>
  *
  * <p>With {@code rmw}, every write is {@code v := get(k) + 1} on keys that start empty, so after
- * the run the sum of all values, read back through the shims, must equal committed txns × branches
- * × writes (lost updates, partial commits). Attempts whose outcome is unknown (the TM got no clear
+ * the run the sum of all values, read back through the shims, must equal the writes of the committed
+ * txns (lost updates, partial commits). Attempts whose outcome is unknown (the TM got no clear
  * answer to its commit) widen the accepted range.
  *
  * <p>The shims' own counters (commits, aborts by cause) are logged by the nodes.
@@ -75,8 +81,11 @@ public final class MicroBench implements AutoCloseable {
     static final String APPLICATION_ID = "coshim-bench";
     static final String TX_SERVICE_GROUP = "default_tx_group";
 
-    /** One branch of a plan: which shim, which table, which keys. */
-    record Branch(int shim, String table, List<Integer> readKeys, List<Integer> writeKeys) {}
+    /** One branch of a plan: which shim, which table, which keys, and its ops in the order it runs them. */
+    record Branch(int shim, String table, List<Integer> readKeys, List<Integer> writeKeys, List<Op> ops) {}
+
+    /** One operation of a branch: a read of {@code key}, or a write of it (read-modify-write with rmw). */
+    record Op(int key, boolean write) {}
 
     enum Attempt { COMMITTED, ABORTED, TIMED_OUT, UNKNOWN }
 
@@ -85,14 +94,15 @@ public final class MicroBench implements AutoCloseable {
     private final BenchConfig config;
     private final List<RemoteCoShim<TableKey<String>, String>> remotes = new ArrayList<>();
     private final List<DataSource> dataSources = new ArrayList<>();
-    /** --parallel-branches only: runs the branches of each attempt; grows to threads × branches. */
+    /** --parallel-branches: runs the branches of each attempt; --pipelined-branches: their votes. */
     private final ExecutorService branchPool = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "bench-branch");
         t.setDaemon(true);
         return t;
     });
-    private final LongAdder committedTotal = new LongAdder();
-    private final LongAdder unknownTotal = new LongAdder();
+    /** Whole run: the writes of the committed txns, and of those whose outcome is unknown (the audit). */
+    private final LongAdder committedWrites = new LongAdder();
+    private final LongAdder unknownWrites = new LongAdder();
     private final AtomicBoolean stop = new AtomicBoolean();
 
     /**
@@ -184,9 +194,8 @@ public final class MicroBench implements AutoCloseable {
         long expectedMax = -1;
         long actual = -1;
         if (config.rmw() && stuck == 0 && warning == null) {
-            long perTxn = (long) config.branches() * config.writes();
-            expectedMin = committedTotal.sum() * perTxn;
-            expectedMax = (committedTotal.sum() + unknownTotal.sum()) * perTxn;
+            expectedMin = committedWrites.sum();
+            expectedMax = committedWrites.sum() + unknownWrites.sum();
             actual = storedSum(expectedMin);
         }
         return new BenchResult(config, committed, aborted, timedOut, unknown, latencies, expectedMin, expectedMax,
@@ -233,25 +242,51 @@ public final class MicroBench implements AutoCloseable {
 
     /**
      * A new plan, as Acta's MicroWorkloadService: branch i on table micro-i, on a shim chosen at
-     * random, with distinct keys across the whole global txn.
+     * random, with distinct keys across the whole global txn; each branch's reads and writes in a
+     * random order.
      */
     static List<Branch> randomPlan(BenchConfig config, int shims) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Set<Integer> used = new HashSet<>();
         List<Branch> plan = new ArrayList<>();
         for (int b = 0; b < config.branches(); b++) {
-            List<Integer> reads = workingSet(config, config.reads(), used);
-            List<Integer> writes = workingSet(config, config.writes(), used);
-            plan.add(new Branch(random.nextInt(shims), table(b), reads, writes));
+            int r;
+            int w;
+            do {
+                r = config.drawReads();
+                w = config.drawWrites();
+            } while (r + w == 0);
+            List<Integer> reads = workingSet(config, r, used);
+            List<Integer> writes = workingSet(config, w, used);
+            List<Op> ops = new ArrayList<>();
+            reads.forEach(k -> ops.add(new Op(k, false)));
+            writes.forEach(k -> ops.add(new Op(k, true)));
+            Collections.shuffle(ops, random);
+            plan.add(new Branch(random.nextInt(shims), table(b), reads, writes, List.copyOf(ops)));
         }
         return plan;
     }
 
-    /** Acta's makeWorkingSet: ops × skewness keys from the hot range, the rest from the cold range. */
+    /**
+     * {@code ops} distinct keys (none in {@code used}, which receives them): hotspot, each from the hot
+     * range with probability skewness, else from the cold range; acta, Acta's makeWorkingSet, ops ×
+     * skewness keys from the hot range, the rest from the cold range.
+     */
     private static List<Integer> workingSet(BenchConfig config, int ops, Set<Integer> used) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
         int hot = config.hotRangeSize();
         List<Integer> keys = new ArrayList<>();
+        if (config.dist() == BenchConfig.KeyDist.HOTSPOT) {
+            while (keys.size() < ops) {
+                // validate() made both ranges large enough for a whole txn: the redraws end
+                boolean isHot = random.nextDouble() < config.skewness();
+                int candidate = isHot ? random.nextInt(0, hot) : random.nextInt(hot, config.tableSize());
+                if (used.add(candidate)) {
+                    keys.add(candidate);
+                }
+            }
+            return keys;
+        }
         while (keys.size() < ops * config.skewness()) {
             int candidate = random.nextInt(0, hot);
             if (used.add(candidate)) {
@@ -276,7 +311,9 @@ public final class MicroBench implements AutoCloseable {
             throw new IllegalStateException("TC at " + config.tc() + ": begin failed", e);
         }
         try {
-            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan) : phaseOneInOrder(tx, plan);
+            boolean allYes = config.parallelBranches() ? phaseOneInParallel(tx, plan)
+                    : config.pipelinedBranches() ? phaseOnePipelined(tx, plan)
+                    : phaseOneInOrder(tx, plan);
             if (!allYes) {
                 return rollback(tx);
             }
@@ -355,6 +392,78 @@ public final class MicroBench implements AutoCloseable {
     }
 
     /**
+     * Phase 1 with the branches pipelined: one after the other on this thread, but a branch's end +
+     * prepare (Seata's close() of its XA connection; its commit() only checks the state) runs on a
+     * pool thread, so the next branch starts as soon as this one finished its operations instead of
+     * after its vote. Starts no further branch once one failed or a vote already came back NO; returns
+     * when every started branch voted.
+     */
+    private boolean phaseOnePipelined(GlobalTransaction tx, List<Branch> plan) {
+        String xid = tx.getXid();
+        List<Future<Boolean>> votes = new ArrayList<>();
+        boolean executed = true;
+        for (Branch b : plan) {
+            if (votes.stream().anyMatch(v -> v.isDone() && !voteOf(v))) {
+                executed = false;   // a vote came back NO: the txn rolls back anyway
+                break;
+            }
+            Connection c;
+            try {
+                c = dataSources.get(b.shim()).getConnection();
+            } catch (SQLException e) {
+                executed = false;
+                break;
+            }
+            try {
+                c.setAutoCommit(false);   // branchRegister with the TC + xa start on the shim
+                executeBranch(c, b);
+                c.commit();   // only checks the XA state: end + prepare happen in close()
+            } catch (SQLException e) {
+                try {
+                    c.rollback();
+                } catch (SQLException ignored) {
+                    // the global rollback that follows aborts the branch anyway
+                }
+                try {
+                    c.close();
+                } catch (SQLException ignored) {
+                    // the branch failed already
+                }
+                executed = false;
+                break;
+            }
+            votes.add(branchPool.submit(() -> {
+                RootContext.bind(xid);
+                try {
+                    c.close();   // xa end + xa prepare: the shim votes
+                    return true;
+                } catch (SQLException e) {
+                    return false;
+                } finally {
+                    RootContext.unbind();
+                }
+            }));
+        }
+        boolean allYes = executed;
+        for (Future<Boolean> v : votes) {
+            allYes &= voteOf(v);
+        }
+        return allYes;
+    }
+
+    /** A pipelined branch's vote, waiting for it: false if its prepare failed or the wait was interrupted. */
+    private static boolean voteOf(Future<Boolean> vote) {
+        try {
+            return vote.get();
+        } catch (ExecutionException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /**
      * Phase 1 of one branch over an XA connection to its shim: register + start, the gets/puts,
      * end + prepare.
      *
@@ -369,22 +478,8 @@ public final class MicroBench implements AutoCloseable {
         try (Connection c = dataSources.get(b.shim()).getConnection()) {
             c.setAutoCommit(false);   // branchRegister with the TC + xa start on the shim
             try {
-                KvSession<String, String> kv = KvSession.from(c);
-                for (int k : b.readKeys()) {
-                    kv.get(b.table(), String.valueOf(k));
-                }
-                for (int k : b.writeKeys()) {
-                    String key = String.valueOf(k);
-                    long value;
-                    if (config.rmw()) {
-                        String old = kv.get(b.table(), key);
-                        value = (old == null ? 0 : Long.parseLong(old)) + 1;
-                    } else {
-                        value = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
-                    }
-                    kv.put(b.table(), key, String.valueOf(value));
-                }
-                c.commit();   // xa end + xa prepare: the shim votes
+                executeBranch(c, b);
+                c.commit();   // only checks the XA state: end + prepare (the vote) happen in close()
                 return true;
             } catch (SQLException e) {
                 try {
@@ -401,6 +496,78 @@ public final class MicroBench implements AutoCloseable {
                 RootContext.unbind();
             }
         }
+    }
+
+    /**
+     * A branch's operations on its started XA connection, in the plan's order. With {@code
+     * thinkMeanUs}, the application pauses before every operation but the first and before the
+     * prepare, holding its locks meanwhile. With {@code getForUpdate}, the reads of keys the branch
+     * writes at that op or later are gets-for-update.
+     */
+    private void executeBranch(Connection c, Branch b) throws SQLException {
+        KvSession<String, String> kv = KvSession.from(c);
+        boolean[] forUpdate = config.getForUpdate() ? readsForUpdate(b.ops(), config.rmw())
+                : new boolean[b.ops().size()];
+        for (int i = 0; i < b.ops().size(); i++) {
+            Op op = b.ops().get(i);
+            if (i > 0) {
+                think();
+            }
+            String key = String.valueOf(op.key());
+            if (!op.write()) {
+                read(kv, b.table(), key, forUpdate[i]);
+                continue;
+            }
+            long value;
+            if (config.rmw()) {
+                String old = read(kv, b.table(), key, forUpdate[i]);
+                value = (old == null ? 0 : Long.parseLong(old)) + 1;
+            } else {
+                value = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+            }
+            kv.put(b.table(), key, String.valueOf(value));
+        }
+        think();
+    }
+
+    /** A read of the branch: a get-for-update if the plan marked it so, else a get. */
+    private static String read(KvSession<String, String> kv, String table, String key, boolean forUpdate)
+            throws SQLException {
+        return forUpdate ? kv.getForUpdate(table, key) : kv.get(table, key);
+    }
+
+    /**
+     * The planning pass of {@code getForUpdate}, before a branch runs: for every op, whether its read
+     * (if it reads) must be a get-for-update, i.e. whether the branch writes that key at this op or
+     * later. A read-modify-write's own read is one (its put follows); a pure read is one only if a
+     * later op writes its key; a read after the branch's last write of a key is a plain get (the key
+     * is already locked EXCLUSIVE then). A blind write (without {@code rmw}) reads nothing.
+     */
+    static boolean[] readsForUpdate(List<Op> ops, boolean rmw) {
+        boolean[] forUpdate = new boolean[ops.size()];
+        Set<Integer> writtenLater = new HashSet<>();
+        for (int i = ops.size() - 1; i >= 0; i--) {
+            Op op = ops.get(i);
+            if (op.write()) {
+                writtenLater.add(op.key());
+                forUpdate[i] = rmw;   // the read before its own put
+            } else {
+                forUpdate[i] = writtenLater.contains(op.key());
+            }
+        }
+        return forUpdate;
+    }
+
+    /** Pauses for one think time (none when {@code thinkMeanUs} is off). */
+    private void think() {
+        long nanos = config.drawThinkNanos();
+        if (nanos > 0) {
+            LockSupport.parkNanos(nanos);
+        }
+    }
+
+    private static long writes(List<Branch> plan) {
+        return plan.stream().mapToLong(b -> b.writeKeys().size()).sum();
     }
 
     private final class Worker implements Runnable {
@@ -435,7 +602,7 @@ public final class MicroBench implements AutoCloseable {
                 boolean measured = t1 >= measureStart && t1 < measureEnd;
                 switch (result) {
                     case COMMITTED -> {
-                        committedTotal.increment();
+                        committedWrites.add(writes(plan));
                         if (measured) {
                             committed++;
                             latenciesUs.add((t1 - t0) / 1000);
@@ -446,7 +613,7 @@ public final class MicroBench implements AutoCloseable {
                     case TIMED_OUT -> timedOut += measured ? 1 : 0;
                     case UNKNOWN -> {
                         // may or may not have committed: never retry it, and widen the audit's range
-                        unknownTotal.increment();
+                        unknownWrites.add(writes(plan));
                         unknown += measured ? 1 : 0;
                         plan = nextPlan();
                     }
@@ -464,8 +631,10 @@ public final class MicroBench implements AutoCloseable {
     /**
      * {@code COSHIM_TOKEN=... java ... MicroBench [--variant LABEL] [--shims host:port/db,...]
      * [--tc host:port] [--threads N] [--table-size N] [--branches N] [--reads N] [--writes N] [--skew X]
-     * [--rmw true|false] [--warmup-s S] [--measure-s S] [--txn-timeout-ms MS]
-     * [--parallel-branches true|false] [--csv FILE] [--label TEXT]}. Needs a running Seata TC and the
+     * [--ops-mean X] [--ops-sd X] [--ops-max N] [--think-mean-us X] [--think-sd-us X] [--dist hotspot|acta]
+     * [--rmw true|false] [--get-for-update true|false] [--warmup-s S] [--measure-s S] [--txn-timeout-ms MS]
+     * [--parallel-branches true|false] [--pipelined-branches true|false] [--csv FILE] [--label TEXT]}
+     * (see {@link BenchConfig} for each option and its default). Needs a running Seata TC and the
      * shim nodes ({@code CoShimNode}). The run is appended to {@code FILE} (default
      * {@code bench-results/<timestamp>-<variant>.csv}). Exit code 0 iff the run had no warning and the
      * audit passed.
