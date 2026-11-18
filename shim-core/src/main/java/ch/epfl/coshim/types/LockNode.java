@@ -1,6 +1,7 @@
 package ch.epfl.coshim.types;
 
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -16,6 +17,12 @@ public class LockNode<K, V> {
   private LockNode<K, V> next;
   private volatile LockNode<K, V> prev;
   private final Set<Transaction<K, V>> holders = ConcurrentHashMap.newKeySet();
+  /**
+   * The holders that may have read the key through this node: granted here (lock() got past its
+   * wait), or moved here by an upgrade after reading it as a reader. The others are still blocked in
+   * lock() and read nothing of the txns ahead: a cascade spares them.
+   */
+  private final Set<Transaction<K, V>> granted = new HashSet<>();
   private boolean upgraded;
 
   LockNode(K key, LockType.LockMode mode, Transaction<K, V> holder) {
@@ -63,6 +70,16 @@ public class LockNode<K, V> {
 
   void removeHolder(Transaction<K, V> transaction) {
     holders.remove(transaction);
+    granted.remove(transaction);
+  }
+
+  void markGranted(Transaction<K, V> transaction) {
+    granted.add(transaction);
+  }
+
+  /** The holder may have read the key through this node (see {@code granted}). */
+  boolean isGranted(Transaction<K, V> transaction) {
+    return granted.contains(transaction);
   }
 
   /** ∀ t in holders, t.status ∈ statuses. */

@@ -245,7 +245,7 @@ class SpeculativeCoShimTest {
     }
 
     @Test
-    void aVictimStillBlockedInLockIsCountedAsAWaitingMark() throws Exception {
+    void aVictimStillBlockedInLockIsSparedByTheCascade() throws Exception {
         shim.start("w");
         shim.put("w", "x", "1");
         shim.end("w");
@@ -257,13 +257,14 @@ class SpeculativeCoShimTest {
         Thread.sleep(100);
         assertFalse(blocked.isDone(), "b waits for a, still running");
         shim.abort("w");
-        ExecutionException e = assertThrows(ExecutionException.class, () -> blocked.get(1, TimeUnit.SECONDS));
-        assertTrue(e.getCause().getMessage().contains("[cause=cascade]"), e.getCause().getMessage());
         ShimStats st = shim.stats();
-        assertEquals(2, st.cascadeMarked(), st.speculationSummary());
-        assertEquals(1, st.cascadeMarkedWaiting(), "b read nothing: " + st.speculationSummary());
-        assertEquals(0, st.cascadeMarkedExecuted());
-        assertEquals(1, st.cascadeVictimsWithRoot(AbortCause.COORDINATOR), "only b aborted yet");
+        assertEquals(1, st.cascadeMarked(), "only a, b read nothing: " + st.speculationSummary());
+        assertEquals(0, st.cascadeMarkedWaiting(), st.speculationSummary());
+        Thread.sleep(100);
+        assertFalse(blocked.isDone(), "b still waits for a, doomed but not released yet");
+        shim.abort("a");
+        blocked.get(1, TimeUnit.SECONDS);   // b is granted once a is released, never aborted
+        assertEquals(1, st.cascadeVictimsWithRoot(AbortCause.COORDINATOR), "only a was a victim");
     }
 
     @Test

@@ -148,9 +148,13 @@ class Chain<K, V> {
       }
       // cases 2 and 3a: a new EXCLUSIVE node right behind p (at the end, or in front of the blind
       // writer `after`)
+      boolean read = node.isGranted(txn);   // it read k as a reader: a cascade must still reach it
       node.removeHolder(txn);
       LockNode<K, V> newNode = new LockNode<>(key, LockMode.EXCLUSIVE, txn);
       newNode.setUpgraded(true);
+      if (read) {
+        newNode.markGranted(txn);
+      }
       insertAfter(p, newNode);
       if (node.getHolders().isEmpty()) {   // only possible when p != node
         unlink(node);
@@ -264,6 +268,7 @@ class Chain<K, V> {
       }
       LockNode<K, V> pred = txn.getLock(key).node().getPrev();
       if (pred == null || pred.allHoldersIn(ready)) {
+        txn.getLock(key).node().markGranted(txn);
         if (bounded) {
           recordGrant(txn, pred);
         }
@@ -518,7 +523,9 @@ class Chain<K, V> {
   /**
    * abort_transaction()'s critical section on this key: if txn held it EXCLUSIVE, marks every holder
    * of the later nodes up to the next blind writer must_abort (mark_must_abort), and only then
-   * releases (cascade before splice).
+   * releases (cascade before splice). Only the holders granted on their node there (see {@link
+   * LockNode#isGranted}): one still blocked in lock() read nothing on this key, so it is spared,
+   * however it may be marked through another key it did read.
    *
    * <p>No cascade either if txn never reached executed (e.g. it was wounded, or aborted by the
    * coordinator while running): no successor got past its node, since none does before every holder
@@ -551,6 +558,12 @@ class Chain<K, V> {
           break;   // blind write: it does not depend on txn's value
         }
         for (Transaction<K, V> t : s.getHolders()) {
+          if (!s.isGranted(t)) {
+            // still blocked in lock() on this node: it read nothing of txn's (nor of a txn behind it
+            // here, which it would first have to wait for), so it is spared; it waits on and is
+            // woken up by the release
+            continue;
+          }
           granted.merge(t, s.isUpgraded() || !t.isWaitingOn(this), Boolean::logicalOr);
           Status before = t.markMustAbort(MARKABLE, txn.rootCause());
           if (MARKABLE.contains(before)) {

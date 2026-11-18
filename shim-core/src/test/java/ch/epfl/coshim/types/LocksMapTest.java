@@ -41,6 +41,11 @@ class LocksMapTest {
     assertNotNull(locks.enqueue("x", t, mode));
   }
 
+  /** As if t's lock() on x had got past its wait: t may have read the holders ahead. */
+  private static void granted(Transaction<String, String> t) {
+    t.getLock("x").node().markGranted(t);
+  }
+
   /** Moves t to status and wakes its waiters, like the shim does after every CAS. */
   private void set(Transaction<String, String> t, Status status) {
     set(locks, t, status);
@@ -697,6 +702,8 @@ class LocksMapTest {
     enqueue(p, LockMode.SHARED);
     enqueue(w, LockMode.EXCLUSIVE);
     enqueue(r, LockMode.SHARED);
+    granted(e);
+    granted(p);
     set(a, Status.EXECUTED);
     set(e, Status.EXECUTED);
     set(p, Status.PREPARED);
@@ -734,6 +741,7 @@ class LocksMapTest {
     Transaction<String, String> b = txn("b");
     enqueue(a, LockMode.EXCLUSIVE);
     enqueue(b, LockMode.SHARED);
+    granted(b);
     set(a, Status.EXECUTED);
     set(b, Status.EXECUTED);
 
