@@ -104,6 +104,22 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       boolean speculative,
       DeadlockPolicy deadlockPolicy,
       boolean prepareWaitDie) {
+    this(store, lockTimeout, tombstoneTtl, speculative, deadlockPolicy, prepareWaitDie, Duration.ZERO);
+  }
+
+  /**
+   * @param woundDelay wound-wait only: how long lock()/upgrade() waits for a younger running holder
+   *     before wounding it (see {@link LocksMap#LocksMap(boolean, DeadlockPolicy, java.util.function.Consumer,
+   *     boolean, Duration)}); zero: wound at once
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      boolean prepareWaitDie,
+      Duration woundDelay) {
     this.globalAges = prepareWaitDie;
     // a wound-wait victim is already must_abort: abort_transaction releases its locks, on the
     // wounder's thread, outside any latch
@@ -112,7 +128,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
             speculative,
             Objects.requireNonNull(deadlockPolicy),
             victim -> abortTransaction(victim, AbortCause.WOUNDED),
-            prepareWaitDie);
+            prepareWaitDie,
+            Objects.requireNonNull(woundDelay));
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
     this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);

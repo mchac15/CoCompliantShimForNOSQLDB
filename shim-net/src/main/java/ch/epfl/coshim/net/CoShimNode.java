@@ -38,6 +38,8 @@ import java.util.concurrent.TimeUnit;
  *                         a wait-for cycle only once one forms on this shim) | none (just wait until
  *                         lock_timeout: only for workloads that cannot deadlock, e.g. ordered
  *                         locking); default wait-die
+ *     --wound-delay-us    wound-wait only: how long lock() waits for a younger running holder before
+ *                         wounding it (it may execute meanwhile); default 0 (wound at once)
  *     --prepare-deadlock  cross-shim deadlock prevention in prepare(): none | wait-die (prepare() votes
  *                         NO instead of waiting for a younger txn; the ages then come from the Seata
  *                         global transaction id, the same on every shim); default none
@@ -61,7 +63,8 @@ public final class CoShimNode {
 
     /** The parsed command line. */
     record Options(int port, String shim, String[] databases, Duration lockTimeout, DeadlockPolicy deadlock,
-            boolean prepareWaitDie, long statsIntervalSeconds, Set<InetAddress> allowed, String store) {
+            boolean prepareWaitDie, long statsIntervalSeconds, Set<InetAddress> allowed, String store,
+            Duration woundDelay) {
 
         static Options parse(String[] args) throws Exception {
             int port = 7000;
@@ -75,6 +78,7 @@ public final class CoShimNode {
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
             String store = "memory";
+            long woundDelayUs = 0;
             if (args.length > 0 && args[0].startsWith("--")) {
                 for (int i = 0; i < args.length; i++) {
                     String flag = args[i];
@@ -92,6 +96,7 @@ public final class CoShimNode {
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
                         case "--store" -> store = value;
+                        case "--wound-delay-us" -> woundDelayUs = Long.parseLong(value);
                         default -> throw new IllegalArgumentException("unknown option " + flag);
                     }
                 }
@@ -104,7 +109,7 @@ public final class CoShimNode {
                 }
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
-                    prepareWaitDie, statsIntervalSeconds, allowed, store);
+                    prepareWaitDie, statsIntervalSeconds, allowed, store, Duration.ofNanos(woundDelayUs * 1000));
         }
 
         private static boolean parsePrepareDeadlock(String value) {
@@ -139,9 +144,9 @@ public final class CoShimNode {
         CoShim<TableKey<String>, String> newShim(KvStore<TableKey<String>, String> store) {
             return switch (shim) {
                 case "speculative" -> new SpeculativeCoShim<>(store, lockTimeout,
-                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie);
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie, woundDelay);
                 case "nonspeculative" -> new SpeculativeCoShim<>(store, lockTimeout,
-                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, deadlock, prepareWaitDie);
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, deadlock, prepareWaitDie, woundDelay);
                 case "nocc" -> new NoCcShim<>(store);
                 default -> throw new IllegalArgumentException("unknown shim " + shim);
             };
@@ -175,6 +180,7 @@ public final class CoShimNode {
                 options.allowed());
         System.out.println("coshim node (" + options.shim() + ", lock timeout " + options.lockTimeout().toMillis()
                 + " ms, " + options.deadlock().name().toLowerCase().replace('_', '-')
+                + (options.woundDelay().isZero() ? "" : " after " + options.woundDelay().toNanos() / 1000 + " us")
                 + (options.prepareWaitDie() ? ", prepare wait-die" : "") + ") on port " + server.getPort() + ", databases " + databases.keySet()
                 + ", store " + options.store()
                 + (options.allowed().isEmpty() ? "" : ", allowed clients " + options.allowed()));

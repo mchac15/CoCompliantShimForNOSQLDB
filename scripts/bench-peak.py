@@ -126,7 +126,8 @@ def measure(args, out, db, skew, system, threads):
         print(f"=== {db} skew {skew:g} {system}: {threads} threads x {args.reps}", flush=True)
         env = dict(os.environ, CSV=str(d / f"t{threads}.csv"), VARIANTS=variant(db, system),
                    LOCK_TIMEOUT_MS=str(args.lock_timeout_ms), SHIMS="2",
-                   STATS_INTERVAL_S=str(args.stats_interval_s), GC_LOGS="1", PREPARE_DEADLOCK=args.prepare_deadlock)
+                   STATS_INTERVAL_S=str(args.stats_interval_s), GC_LOGS="1", PREPARE_DEADLOCK=args.prepare_deadlock,
+                   WOUND_DELAY_US=str(args.wound_delay_us))
         cmd = [str(ROOT / "scripts" / "bench-compare.sh"), "--reps", str(args.reps), "--tc", args.tc,
                "--threads", str(threads),
                "--skew", f"{skew:g}", "--warmup-s", f"{args.warmup_s:g}", "--measure-s", f"{args.measure_s:g}",
@@ -274,7 +275,8 @@ def run(args):
             f"{' '.join(args.microbench)}\n"
             f"timeouts:  lock waits {args.lock_timeout_ms} ms (nodes and servers), TC {args.txn_timeout_ms} ms; "
             f"node stats every {args.stats_interval_s} s\n"
-            f"prepare:   cross-shim deadlock prevention {args.prepare_deadlock}\n")
+            f"prepare:   cross-shim deadlock prevention {args.prepare_deadlock}\n"
+            f"wound:     delay {args.wound_delay_us} us (wound-wait waits that long before wounding)\n")
     print(setup.read_text())
 
     started = start_servers(args)
@@ -824,6 +826,8 @@ def main():
     p.add_argument("--deadlock", default="wound-wait", choices=["wound-wait", "wait-die", "detect", "none"],
                    help="the shims' deadlock prevention in lock(); none only for workloads that cannot deadlock "
                         "(e.g. -- --randomness 0 with sequential branches)")
+    p.add_argument("--wound-delay-us", type=int, default=0,
+                   help="wound-wait: how long lock() waits for a younger running holder before wounding it")
     p.add_argument("--prepare-deadlock", default="none", choices=["none", "wait-die"],
                    help="the nodes' cross-shim deadlock prevention in prepare()")
     p.add_argument("--reuse-dbs", action="store_true", help="use servers already running, whatever their timeouts")

@@ -197,18 +197,22 @@ class Chain<K, V> {
    * </ul>
    *
    * @param deadlineNanos a {@link System#nanoTime()} deadline
+   * @param woundAtNanos wound-wait only: no wound before this {@link System#nanoTime()} instant (the
+   *     wound delay): until then txn waits for the younger running holders too, which may execute
+   *     meanwhile and then need not die; the wait wakes up at that instant to decide again
    * @param victims receives the txns marked on WOUND (only with WOUND_WAIT)
    */
   synchronized WaitResult awaitLockReady(
       Transaction<K, V> txn,
       Set<Status> ready,
       long deadlineNanos,
+      long woundAtNanos,
       DeadlockPolicy policy,
       List<Transaction<K, V>> victims) {
     txn.setWaitingOn(this);   // statistics only, see abortAndRelease
     txn.setBlockedOn(txn.getLock(key).node());   // before any check: see youngestOnCycle
     try {
-      return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
+      return awaitPredecessor(txn, ready, true, deadlineNanos, woundAtNanos, policy, victims);
     } finally {
       txn.setWaitingOn(null);
       txn.setBlockedOn(null);
@@ -259,6 +263,7 @@ class Chain<K, V> {
       Set<Status> ready,
       boolean bounded,
       long deadlineNanos,
+      long woundAtNanos,
       DeadlockPolicy policy,
       List<Transaction<K, V>> victims) {
     LockNode<K, V> searched = null;   // detection: the predecessor txn last searched behind
@@ -277,7 +282,8 @@ class Chain<K, V> {
       if (bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, ready)) {
         return WaitResult.DIE;
       }
-      if (bounded && policy == DeadlockPolicy.WOUND_WAIT && wound(txn, pred, ready, victims)) {
+      if (bounded && policy == DeadlockPolicy.WOUND_WAIT
+          && wound(txn, pred, ready, System.nanoTime() - woundAtNanos >= 0, victims)) {
         return WaitResult.WOUND;
       }
       if (bounded && policy == DeadlockPolicy.DETECT) {
@@ -289,9 +295,14 @@ class Chain<K, V> {
       }
       try {
         if (bounded) {
-          long remaining = deadlineNanos - System.nanoTime();
+          long now = System.nanoTime();
+          long remaining = deadlineNanos - now;
           if (remaining <= 0) {
             return WaitResult.TIMED_OUT;
+          }
+          if (policy == DeadlockPolicy.WOUND_WAIT && woundAtNanos - now > 0) {
+            // a running holder notifies nobody until it changes status: wake up when the delay ends
+            remaining = Math.min(remaining, woundAtNanos - now);
           }
           TimeUnit.NANOSECONDS.timedWait(this, remaining);
         } else {
@@ -312,6 +323,8 @@ class Chain<K, V> {
    * nobody else releases those until their own thread calls the shim again (e.g. during client think
    * time), and aborting them never cascades.
    *
+   * <p>With {@code mayWound} false (the wound delay has not passed yet) it only hands over.
+   *
    * <p>Statistics only: each victim is first checked for a wait-for path back to txn (a real
    * deadlock, which the wound breaks); see {@link Transaction#isWoundedInCycle}.
    *
@@ -321,8 +334,9 @@ class Chain<K, V> {
       Transaction<K, V> txn,
       LockNode<K, V> pred,
       Set<Status> ready,
+      boolean mayWound,
       List<Transaction<K, V>> victims) {
-    boolean blocked = false;
+    boolean blocked = !mayWound;
     for (Transaction<K, V> t : pred.getHolders()) {
       Status s = t.getStatus();
       if (!ready.contains(s)

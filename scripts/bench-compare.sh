@@ -32,7 +32,8 @@
 #           VARIANTS="speculative sonata-mysql sonata-pg" scripts/bench-compare.sh
 # Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), STATS_INTERVAL_S (0: the nodes log their
 #      counters at shutdown only; N: also every N s), PREPARE_DEADLOCK (none | wait-die: the nodes'
-#      --prepare-deadlock, default none), GC_LOGS (1: GC and safepoint logs of the nodes and of
+#      --prepare-deadlock, default none), WOUND_DELAY_US (the nodes' --wound-delay-us: wound-wait waits that
+#      long before wounding, default 0), GC_LOGS (1: GC and safepoint logs of the nodes and of
 #      MicroBench, next to the node logs; the shim variants only), DEADLOCK (wait-die | wound-wait | detect | none, default
 #      wait-die), VARIANTS ("speculative nonspeculative"),
 #      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o), and
@@ -160,7 +161,7 @@ for rep in $(seq 1 "$reps"); do
                 node_gc=("-Xlog:gc*,safepoint:file=$logs/rep$rep-$variant-s$s.gc:time,uptime")
             fi
             java ${node_gc[@]+"${node_gc[@]}"} -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "$shim" --databases "s$s" \
-                --lock-timeout-ms "$lock_timeout" --deadlock "$policy" --prepare-deadlock "${PREPARE_DEADLOCK:-none}" --stats-interval-s "${STATS_INTERVAL_S:-0}" --store "$store" \
+                --lock-timeout-ms "$lock_timeout" --deadlock "$policy" --prepare-deadlock "${PREPARE_DEADLOCK:-none}" --wound-delay-us "${WOUND_DELAY_US:-0}" --stats-interval-s "${STATS_INTERVAL_S:-0}" --store "$store" \
                 > "$logs/rep$rep-$variant-s$s.log" 2>&1 &
             nodes+=($!)
             until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do

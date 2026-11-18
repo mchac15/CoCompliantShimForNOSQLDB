@@ -98,6 +98,8 @@ public class LocksMap<K, V> {
   private final Consumer<Transaction<K, V>> woundHandler;
   /** prepare() dies instead of waiting for a younger txn (cross-shim deadlock prevention). */
   private final boolean prepareWaitDie;
+  /** Wound-wait: how long lock()/upgrade() waits for a younger running holder before wounding it. */
+  private final long woundDelayNanos;
 
   /** Outcome of prepare()'s wait for the predecessors to commit. */
   public static enum PrepareWait {
@@ -142,6 +144,22 @@ public class LocksMap<K, V> {
       DeadlockPolicy deadlockPolicy,
       Consumer<Transaction<K, V>> woundHandler,
       boolean prepareWaitDie) {
+    this(speculative, deadlockPolicy, woundHandler, prepareWaitDie, Duration.ZERO);
+  }
+
+  /**
+   * @param woundDelay wound-wait only: lock()/upgrade() waits that long for the younger running
+   *     holders ahead before wounding them (they may execute meanwhile, and then need not die); zero:
+   *     wound at once. A local deadlock still lasts at most this long: some edge of every cycle goes
+   *     from an older waiter to a younger holder, and that waiter wounds once the delay is over
+   */
+  public LocksMap(
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      Consumer<Transaction<K, V>> woundHandler,
+      boolean prepareWaitDie,
+      Duration woundDelay) {
+    this.woundDelayNanos = woundDelay.toNanos();
     this.prepareWaitDie = prepareWaitDie;
     this.speculative = speculative;
     this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
@@ -168,11 +186,13 @@ public class LocksMap<K, V> {
   }
 
   private LockResult lock(K key, Transaction<K, V> txn, LockMode mode, Duration timeout, boolean readsKey) {
-    long deadline = System.nanoTime() + timeout.toNanos();
+    long now = System.nanoTime();
+    long deadline = now + timeout.toNanos();
+    long woundAt = now + woundDelayNanos;   // once per lock(): a re-entered wait does not wait again
     LockType<K, V> held = txn.getLock(key);
     if (held == null) {
       Chain<K, V> chain = enqueue(key, txn, mode, readsKey);
-      return chain == null ? LockResult.MUST_ABORT : await(chain, txn, deadline);
+      return chain == null ? LockResult.MUST_ABORT : await(chain, txn, deadline, woundAt);
     }
     if (held.mode() == LockMode.EXCLUSIVE || mode == LockMode.SHARED) {
       return txn.isRunning() ? LockResult.ALREADY_HELD : LockResult.MUST_ABORT;
@@ -191,7 +211,7 @@ public class LocksMap<K, V> {
     return switch (result.get(0)) {
       case MUST_ABORT -> LockResult.MUST_ABORT;
       case UPGRADED -> LockResult.ACQUIRED;
-      case UPGRADED_MUST_WAIT -> await(chain, txn, deadline);
+      case UPGRADED_MUST_WAIT -> await(chain, txn, deadline, woundAt);
     };
   }
 
@@ -321,10 +341,10 @@ public class LocksMap<K, V> {
    * txn's own key included), and txn waits again with the same deadline until their nodes empty.
    * chain stays txn's chain meanwhile: txn's own node keeps it from being emptied and removed.
    */
-  private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline) {
+  private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline, long woundAt) {
     while (true) {
       List<Transaction<K, V>> victims = new ArrayList<>();
-      switch (chain.awaitLockReady(txn, lockReady, deadline, deadlockPolicy, victims)) {
+      switch (chain.awaitLockReady(txn, lockReady, deadline, woundAt, deadlockPolicy, victims)) {
         case READY -> {
           return LockResult.ACQUIRED;
         }
