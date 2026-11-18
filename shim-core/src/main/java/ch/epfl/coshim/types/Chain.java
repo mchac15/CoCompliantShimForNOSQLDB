@@ -2,8 +2,11 @@ package ch.epfl.coshim.types;
 
 import ch.epfl.coshim.types.LockType.LockMode;
 import ch.epfl.coshim.types.Transaction.Status;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -48,11 +51,15 @@ class Chain<K, V> {
     DOOMED,
     /** The deadline passed (or the thread was interrupted). */
     TIMED_OUT,
-    /** Deadlock prevention: txn would wait for a younger txn, so it aborts instead. */
+    /**
+     * Deadlock prevention: txn would wait for a younger txn, so it aborts instead. Detection: txn is
+     * the youngest member of a wait-for cycle.
+     */
     DIE,
     /**
-     * Wound-wait: txn marked the younger running holders ahead of it must_abort (the victims). The
-     * caller aborts them outside the latch, then waits again.
+     * Wound-wait: txn marked the younger running holders ahead of it must_abort (the victims).
+     * Detection: the victim is the youngest member of a wait-for cycle through txn. The caller aborts
+     * them outside the latch, then waits again.
      */
     WOUND
   }
@@ -180,6 +187,9 @@ class Chain<K, V> {
    *       ones may execute meanwhile and then need not die. Still no cycle: txn only stays blocked
    *       on older txns or on txns past started (which wait on no lock), and as soon as those are
    *       gone it wounds the younger ones it would otherwise wait for.
+   *   <li>detection: no age check; txn searches for a wait-for cycle through itself whenever it
+   *       starts waiting behind a predecessor node it has not searched behind yet, and only a cycle
+   *       aborts a txn (see {@link #detect}).
    * </ul>
    *
    * @param deadlineNanos a {@link System#nanoTime()} deadline
@@ -192,10 +202,12 @@ class Chain<K, V> {
       DeadlockPolicy policy,
       List<Transaction<K, V>> victims) {
     txn.setWaitingOn(this);   // statistics only, see abortAndRelease
+    txn.setBlockedOn(txn.getLock(key).node());   // before any check: see youngestOnCycle
     try {
       return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
     } finally {
       txn.setWaitingOn(null);
+      txn.setBlockedOn(null);
     }
   }
 
@@ -245,6 +257,7 @@ class Chain<K, V> {
       long deadlineNanos,
       DeadlockPolicy policy,
       List<Transaction<K, V>> victims) {
+    LockNode<K, V> searched = null;   // detection: the predecessor txn last searched behind
     while (true) {
       if (txn.isDoomed()) {
         return WaitResult.DOOMED;
@@ -261,6 +274,13 @@ class Chain<K, V> {
       }
       if (bounded && policy == DeadlockPolicy.WOUND_WAIT && wound(txn, pred, ready, victims)) {
         return WaitResult.WOUND;
+      }
+      if (bounded && policy == DeadlockPolicy.DETECT) {
+        WaitResult broken = detect(txn, pred, ready, pred != searched, victims);
+        searched = pred;
+        if (broken != null) {
+          return broken;
+        }
       }
       try {
         if (bounded) {
@@ -287,6 +307,9 @@ class Chain<K, V> {
    * nobody else releases those until their own thread calls the shim again (e.g. during client think
    * time), and aborting them never cascades.
    *
+   * <p>Statistics only: each victim is first checked for a wait-for path back to txn (a real
+   * deadlock, which the wound breaks); see {@link Transaction#isWoundedInCycle}.
+   *
    * @return true iff victims is non-empty: the caller must abort them before waiting again
    */
   private boolean wound(
@@ -304,13 +327,135 @@ class Chain<K, V> {
       }
     }
     for (Transaction<K, V> t : pred.getHolders()) {
-      if (!blocked && t.getTs() > txn.getTs() && t.wound()) {
+      if (!blocked && t.getTs() > txn.getTs() && t.wound(reaches(t, txn, ready))) {
         victims.add(t);
       } else if (t.getStatus() == Status.MUST_ABORT && !t.hasReachedExecuted()) {
         victims.add(t);
       }
     }
     return !victims.isEmpty();
+  }
+
+  /**
+   * Deadlock detection's step, under this monitor, before txn waits behind pred. If {@code search}
+   * (pred is new to txn: it just blocked, or a node ahead was spliced out or put in front of it),
+   * looks for a wait-for cycle through txn ({@link #youngestOnCycle}) and breaks it: txn dies if it
+   * is the cycle's youngest member, else that member is wounded (it is started: blocked in
+   * lock()/upgrade(), so it never executed and its abort cascades to nobody). A wound that fails
+   * (the victim is no longer started) leaves a member already on its way out: txn waits. Searching
+   * once per predecessor is enough: every new wait-for edge comes with a txn that starts waiting
+   * behind a new predecessor (a txn blocking, a splice, or an upgrade that puts its node in front of
+   * a blind writer and then waits itself), and that txn searches. Also hands over the holders a
+   * cascade doomed while they were running, as {@link #wound} does.
+   *
+   * @return null to wait, DIE, or WOUND with the victims
+   */
+  private WaitResult detect(
+      Transaction<K, V> txn,
+      LockNode<K, V> pred,
+      Set<Status> ready,
+      boolean search,
+      List<Transaction<K, V>> victims) {
+    if (search) {
+      Transaction<K, V> youngest = youngestOnCycle(txn, pred, ready);
+      if (youngest == txn) {
+        return WaitResult.DIE;
+      }
+      if (youngest != null && youngest.wound(true)) {
+        victims.add(youngest);
+      }
+    }
+    for (Transaction<K, V> t : pred.getHolders()) {
+      if (t.getStatus() == Status.MUST_ABORT && !t.hasReachedExecuted() && !victims.contains(t)) {
+        victims.add(t);
+      }
+    }
+    return victims.isEmpty() ? null : WaitResult.WOUND;
+  }
+
+  /**
+   * The wait-for graph's search, from txn, which waits for the holders of pred. A txn blocked behind
+   * a node ({@link Transaction#getBlockedOn}) waits for every holder of that node's predecessor not
+   * in {@code ready} and not leaving: those are its edges. Only this chain's monitor is held, so the
+   * other chains are read without their latch (volatile prev, concurrent holder sets). The search may
+   * then follow an edge that just disappeared (a phantom cycle: one needless abort, never a wrong
+   * one), but it never misses a cycle that txn closes: every other member published its blockedOn
+   * before its own search, and an edge of a cycle stays until a member aborts. Two members closing a
+   * cycle at once see each other's blockedOn (volatile), so at least one of them finds the cycle, and
+   * both pick the same victim.
+   *
+   * @return the youngest member (largest ts, then largest id) of a cycle through txn, null if none
+   */
+  private static <K, V> Transaction<K, V> youngestOnCycle(
+      Transaction<K, V> txn, LockNode<K, V> pred, Set<Status> ready) {
+    Map<Transaction<K, V>, Transaction<K, V>> parent = new HashMap<>();
+    Transaction<K, V> last = pathTo(txn, waitedFor(pred, ready), ready, parent);
+    if (last == null) {
+      return null;
+    }
+    Transaction<K, V> youngest = txn;
+    for (Transaction<K, V> t = last; t != txn; t = parent.get(t)) {
+      if (t.getTs() > youngest.getTs()
+          || t.getTs() == youngest.getTs() && t.getTransactionId().compareTo(youngest.getTransactionId()) > 0) {
+        youngest = t;
+      }
+    }
+    return youngest;
+  }
+
+  /** Statistics only: from, which txn waits for, waits (transitively) for txn: a wait-for cycle. */
+  private static <K, V> boolean reaches(Transaction<K, V> from, Transaction<K, V> txn, Set<Status> ready) {
+    return pathTo(txn, List.of(from), ready, new HashMap<>()) != null;
+  }
+
+  /**
+   * Depth-first search of the wait-for graph (see {@link #youngestOnCycle}) from {@code starts} to
+   * {@code target}.
+   *
+   * @param parent receives, for every txn reached, the one it was reached from ({@code target} for
+   *     the starts): the path back from the result to target
+   * @return the txn with an edge to target, null if target is unreachable
+   */
+  private static <K, V> Transaction<K, V> pathTo(
+      Transaction<K, V> target,
+      List<Transaction<K, V>> starts,
+      Set<Status> ready,
+      Map<Transaction<K, V>, Transaction<K, V>> parent) {
+    Deque<Transaction<K, V>> stack = new ArrayDeque<>();
+    for (Transaction<K, V> t : starts) {
+      if (t != target && parent.putIfAbsent(t, target) == null) {
+        stack.push(t);
+      }
+    }
+    while (!stack.isEmpty()) {
+      Transaction<K, V> u = stack.pop();
+      LockNode<K, V> node = u.getBlockedOn();
+      LockNode<K, V> pred = node == null ? null : node.getPrev();
+      if (pred == null) {
+        continue;   // u is running (or granted): it waits for nobody
+      }
+      for (Transaction<K, V> t : waitedFor(pred, ready)) {
+        if (t == target) {
+          return u;
+        }
+        if (parent.putIfAbsent(t, u) == null) {
+          stack.push(t);
+        }
+      }
+    }
+    return null;
+  }
+
+  /** The holders of node a txn blocked behind it still waits for: not in ready, not leaving. */
+  private static <K, V> List<Transaction<K, V>> waitedFor(LockNode<K, V> node, Set<Status> ready) {
+    List<Transaction<K, V>> out = new ArrayList<>();
+    for (Transaction<K, V> t : node.getHolders()) {
+      Status s = t.getStatus();
+      if (!ready.contains(s) && !LEAVING.contains(s)) {
+        out.add(t);
+      }
+    }
+    return out;
   }
 
   /** Statistics only: the uncommitted txns ahead of txn's node, and on how many nodes. */

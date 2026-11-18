@@ -30,8 +30,16 @@ public class Transaction<K, V> {
    * write buffer: no successor gets past its node before it reaches the speculation point.
    */
   private boolean reachedExecuted;
-  /** Doomed by wound-wait ({@link #wound()}), not by a cascade: statistics only. */
+  /** Doomed by wound-wait ({@link #wound}), not by a cascade: statistics only. */
   private boolean wounded;
+  /** Statistics only: when wounded, it was on a wait-for cycle with its wounder (a real deadlock). */
+  private boolean woundedInCycle;
+  /**
+   * The node this txn is blocked behind inside lock()/upgrade() (its own node, whose predecessor it
+   * waits for), null otherwise: the wait-for edges the deadlock detection follows. Published before
+   * the txn checks its wait predicate, read by other threads without any latch.
+   */
+  private volatile LockNode<K, V> blockedOn;
   /**
    * Statistics only (a {@code ShimStats.AbortCause}; this package does not depend on core): why the
    * txn aborted, and the cause of the abort at the root of its cascade tree (its own cause unless a
@@ -172,23 +180,38 @@ public class Transaction<K, V> {
   }
 
   /**
-   * Wound-wait's mark: started → must_abort, so the txn can no longer reach executed (nor vote).
+   * Wound-wait's (and deadlock detection's) mark: started → must_abort, so the txn can no longer reach executed (nor vote).
    * The caller then runs abort_transaction on it outside any latch.
    *
+   * @param inCycle statistics only: the txn is on a wait-for cycle with its wounder
    * @return false if it was not started (nothing changed): someone else already doomed it, or it
    *     executed and no longer blocks a lock() wait
    */
-  synchronized boolean wound() {
+  synchronized boolean wound(boolean inCycle) {
     if (status != Status.STARTED) {
       return false;
     }
     status = Status.MUST_ABORT;
     wounded = true;
+    woundedInCycle = inCycle;
     return true;
   }
 
   public synchronized boolean isWounded() {
     return wounded;
+  }
+
+  /** Wounded while on a wait-for cycle with its wounder: the wound broke a real deadlock. */
+  public synchronized boolean isWoundedInCycle() {
+    return woundedInCycle;
+  }
+
+  LockNode<K, V> getBlockedOn() {
+    return blockedOn;
+  }
+
+  void setBlockedOn(LockNode<K, V> node) {
+    blockedOn = node;
   }
 
   /**

@@ -65,7 +65,10 @@ public class LocksMap<K, V> {
     MUST_ABORT,
     /** lock_timeout expired while waiting (assumed deadlock): abort it. */
     TIMED_OUT,
-    /** Deadlock prevention: it would have waited for a younger txn: abort it. */
+    /**
+     * Deadlock prevention: it would have waited for a younger txn; or detection: it is the youngest
+     * member of a wait-for cycle. Abort it.
+     */
     DIE
   }
 
@@ -88,7 +91,10 @@ public class LocksMap<K, V> {
   private final Set<Status> lockReady;
   private final boolean speculative;
   private final DeadlockPolicy deadlockPolicy;
-  /** abort_transaction of a wound-wait victim (already must_abort), run outside any latch. */
+  /**
+   * abort_transaction of a wound-wait (or deadlock detection) victim, already must_abort, run outside
+   * any latch.
+   */
   private final Consumer<Transaction<K, V>> woundHandler;
   /** prepare() dies instead of waiting for a younger txn (cross-shim deadlock prevention). */
   private final boolean prepareWaitDie;
