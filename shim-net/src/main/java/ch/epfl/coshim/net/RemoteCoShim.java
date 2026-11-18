@@ -72,6 +72,14 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
     }
 
     @Override
+    public V getForUpdate(String txnId, K key) {
+        return call(Protocol.GET_FOR_UPDATE, txnId, key, null, in -> {
+            byte[] bytes = Protocol.readBytes(in);
+            return bytes == null ? null : valueCodec.decode(bytes);
+        });
+    }
+
+    @Override
     public void put(String txnId, K key, V value) {
         call(Protocol.PUT, txnId, key, value, in -> null);
     }
@@ -111,7 +119,7 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
         try {
             c.out.writeByte(op);
             c.out.writeUTF(txnId);
-            if (op == Protocol.GET || op == Protocol.PUT) {
+            if (op == Protocol.GET || op == Protocol.GET_FOR_UPDATE || op == Protocol.PUT) {
                 Protocol.writeBytes(c.out, keyCodec.encode(key));
             }
             if (op == Protocol.PUT) {

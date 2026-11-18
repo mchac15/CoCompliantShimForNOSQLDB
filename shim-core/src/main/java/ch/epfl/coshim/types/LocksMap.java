@@ -89,6 +89,18 @@ public class LocksMap<K, V> {
   private final DeadlockPolicy deadlockPolicy;
   /** abort_transaction of a wound-wait victim (already must_abort), run outside any latch. */
   private final Consumer<Transaction<K, V>> woundHandler;
+  /** prepare() dies instead of waiting for a younger txn (cross-shim deadlock prevention). */
+  private final boolean prepareWaitDie;
+
+  /** Outcome of prepare()'s wait for the predecessors to commit. */
+  public static enum PrepareWait {
+    /** Every predecessor committed: txn may vote YES. */
+    READY,
+    /** txn was aborted or doomed meanwhile (or its locks are gone): vote NO. */
+    MUST_ABORT,
+    /** Wait-die: txn would have waited for a younger txn: vote NO. */
+    DIE
+  }
 
   /** The speculative lock table of pseudo.txt. */
   public LocksMap() {
@@ -111,6 +123,19 @@ public class LocksMap<K, V> {
    */
   public LocksMap(
       boolean speculative, DeadlockPolicy deadlockPolicy, Consumer<Transaction<K, V>> woundHandler) {
+    this(speculative, deadlockPolicy, woundHandler, false);
+  }
+
+  /**
+   * @param prepareWaitDie prepare() votes NO instead of waiting for a younger txn (see {@link
+   *     #awaitPredecessorsCommitted}); needs ages that are the same on every shim
+   */
+  public LocksMap(
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      Consumer<Transaction<K, V>> woundHandler,
+      boolean prepareWaitDie) {
+    this.prepareWaitDie = prepareWaitDie;
     this.speculative = speculative;
     this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
     this.deadlockPolicy = deadlockPolicy;
@@ -123,10 +148,23 @@ public class LocksMap<K, V> {
    * MUST_ABORT / TIMED_OUT the caller runs abort_transaction(txn).
    */
   public LockResult lock(K key, Transaction<K, V> txn, LockMode mode, Duration timeout) {
+    return lock(key, txn, mode, timeout, false);
+  }
+
+  /**
+   * get-for-update's lock(): EXCLUSIVE, its new node marked as one whose holder read the key (see
+   * {@link Chain#acquire}). A txn that already holds k SHARED upgrades as usual; one that already
+   * holds it EXCLUSIVE gets ALREADY_HELD (it reads its own write, or what it read before).
+   */
+  public LockResult lockForUpdate(K key, Transaction<K, V> txn, Duration timeout) {
+    return lock(key, txn, LockMode.EXCLUSIVE, timeout, true);
+  }
+
+  private LockResult lock(K key, Transaction<K, V> txn, LockMode mode, Duration timeout, boolean readsKey) {
     long deadline = System.nanoTime() + timeout.toNanos();
     LockType<K, V> held = txn.getLock(key);
     if (held == null) {
-      Chain<K, V> chain = enqueue(key, txn, mode);
+      Chain<K, V> chain = enqueue(key, txn, mode, readsKey);
       return chain == null ? LockResult.MUST_ABORT : await(chain, txn, deadline);
     }
     if (held.mode() == LockMode.EXCLUSIVE || mode == LockMode.SHARED) {
@@ -164,15 +202,36 @@ public class LocksMap<K, V> {
    * @return true if every predecessor resolved, false if txn got aborted / doomed meanwhile
    */
   public boolean awaitPredecessorsResolved(Transaction<K, V> txn) {
+    return awaitPredecessorsCommitted(txn) == PrepareWait.READY;
+  }
+
+  /**
+   * prepare()'s wait, key by key, until every predecessor holder committed. With prepareWaitDie,
+   * DIE instead of waiting for a younger txn: with speculation, two shims can order the same two
+   * txns oppositely (when their branches run at the same time), and each one's prepare then waits
+   * for the other's commit, which needs the other's vote: a cycle nothing else breaks. Waits that
+   * only go from younger to older txns, by ages every shim agrees on, cannot form one.
+   */
+  public PrepareWait awaitPredecessorsCommitted(Transaction<K, V> txn) {
+    DeadlockPolicy policy = prepareWaitDie ? DeadlockPolicy.WAIT_DIE : DeadlockPolicy.NONE;
     for (K key : txn.frozenLocks().keySet()) {
       Chain<K, V> chain = locksMap.get(key);
       // no chain: txn's locks were released by a foreign abort_transaction, as in lock()
-      if (chain == null
-          || chain.awaitPredecessor(txn, RESOLVED, false, 0, deadlockPolicy, null) != Chain.WaitResult.READY) {
-        return false;
+      if (chain == null) {
+        return PrepareWait.MUST_ABORT;
+      }
+      switch (chain.awaitPredecessor(txn, RESOLVED, false, 0, policy, null)) {
+        case READY -> {
+        }
+        case DIE -> {
+          return PrepareWait.DIE;
+        }
+        default -> {
+          return PrepareWait.MUST_ABORT;
+        }
       }
     }
-    return true;
+    return PrepareWait.READY;
   }
 
   /**
@@ -228,10 +287,15 @@ public class LocksMap<K, V> {
 
   /** lock()'s critical section without the wait: the chain txn was appended to, or null. */
   Chain<K, V> enqueue(K key, Transaction<K, V> txn, LockMode mode) {
+    return enqueue(key, txn, mode, false);
+  }
+
+  /** @param readsKey get-for-update: see {@link Chain#acquire} */
+  Chain<K, V> enqueue(K key, Transaction<K, V> txn, LockMode mode, boolean readsKey) {
     boolean[] acquired = {false};
     Chain<K, V> chain = locksMap.compute(key, (k, c) -> {
       Chain<K, V> target = c != null ? c : new Chain<>(k);
-      acquired[0] = target.acquire(txn, mode);
+      acquired[0] = target.acquire(txn, mode, readsKey);
       return acquired[0] ? target : c;   // not running: leave the map as it was
     });
     return acquired[0] ? chain : null;

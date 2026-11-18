@@ -12,8 +12,8 @@ import java.io.IOException;
  *   handshake   client: int MAGIC, int VERSION, UTF token, UTF database
  *               server: byte HELLO_OK | HELLO_DENIED   (wrong token, unknown database, not allowed)
  *   request     byte op, UTF txnId, [bytes key], [bytes value]
- *   response    byte OK      + payload (GET: bytes value, START: boolean, END/PREPARE: byte result)
- *               byte ABORTED + UTF message      (get/put: the shim aborted the txn)
+ *   response    byte OK      + payload (GET, GET_FOR_UPDATE: bytes value, START: boolean, END/PREPARE: byte result)
+ *               byte ABORTED + UTF message      (get/put/get-for-update: the shim aborted the txn)
  *               byte ERROR   + UTF message      (unexpected failure on the node)
  *   bytes       int length (-1 = null) + data
  * </pre>
@@ -21,7 +21,7 @@ import java.io.IOException;
 final class Protocol {
 
     static final int MAGIC = 0xC05A1A;
-    static final int VERSION = 2;
+    static final int VERSION = 3;   // 3: GET_FOR_UPDATE
 
     static final byte HELLO_OK = 0;
     static final byte HELLO_DENIED = 1;
@@ -33,6 +33,7 @@ final class Protocol {
     static final byte PREPARE = 5;
     static final byte COMMIT = 6;
     static final byte ABORT = 7;
+    static final byte GET_FOR_UPDATE = 8;   // a get that locks EXCLUSIVE (CoShim.getForUpdate)
 
     static final byte OK = 0;
     static final byte ABORTED = 1;

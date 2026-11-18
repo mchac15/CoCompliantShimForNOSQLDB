@@ -156,7 +156,7 @@ public class CoShimServer<K, V> implements AutoCloseable {
         String txnId = in.readUTF();
         K key = null;
         V value = null;
-        if (op == Protocol.GET || op == Protocol.PUT) {
+        if (op == Protocol.GET || op == Protocol.GET_FOR_UPDATE || op == Protocol.PUT) {
             key = keyCodec.decode(Protocol.readBytes(in));
         }
         if (op == Protocol.PUT) {
@@ -171,6 +171,11 @@ public class CoShimServer<K, V> implements AutoCloseable {
                 }
                 case Protocol.GET -> {
                     V result = shim.get(txnId, key);
+                    out.writeByte(Protocol.OK);
+                    Protocol.writeBytes(out, result == null ? null : valueCodec.encode(result));
+                }
+                case Protocol.GET_FOR_UPDATE -> {
+                    V result = shim.getForUpdate(txnId, key);
                     out.writeByte(Protocol.OK);
                     Protocol.writeBytes(out, result == null ? null : valueCodec.encode(result));
                 }

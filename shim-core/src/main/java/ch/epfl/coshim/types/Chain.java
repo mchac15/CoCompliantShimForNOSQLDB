@@ -4,6 +4,7 @@ import ch.epfl.coshim.types.LockType.LockMode;
 import ch.epfl.coshim.types.Transaction.Status;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -23,6 +24,12 @@ class Chain<K, V> {
   private static final Set<Status> MARKABLE = EnumSet.of(Status.STARTED, Status.EXECUTED);
   /** Holders already on their way out of the chain: they never stop a wound from unblocking. */
   private static final Set<Status> LEAVING = EnumSet.of(Status.MUST_ABORT, Status.ABORTED);
+  /**
+   * The predecessor holders prepare()'s wait-die never dies for: committed (the wait is over), committing
+   * (decided, it commits without waiting for anyone), or leaving (it is released without waiting).
+   */
+  private static final Set<Status> PREPARE_NO_CYCLE =
+      EnumSet.of(Status.COMMITTED, Status.COMMITTING, Status.MUST_ABORT, Status.ABORTED);
 
   static enum UpgradeResult {
     /** txn is no longer started, or read-modify-write against read-modify-write: txn aborts. */
@@ -78,9 +85,12 @@ class Chain<K, V> {
    * abort_transaction may have released its locks meanwhile, or end() ran), joins the last node if
    * both are SHARED or appends a new node, and records it in txn.locks_acquired.
    *
+   * @param readsKey txn takes an EXCLUSIVE lock to read k before writing it (get-for-update). Its
+   *     node is marked upgraded, as one upgrade() made: its holder read k, so it is not a blind write
+   *     (the cascade must not stop at it, and an upgrade must not move another txn in front of it)
    * @return false if txn is no longer started (nothing was changed): it must abort
    */
-  synchronized boolean acquire(Transaction<K, V> txn, LockMode mode) {
+  synchronized boolean acquire(Transaction<K, V> txn, LockMode mode, boolean readsKey) {
     synchronized (txn) {
       if (!txn.isRunning()) {
         return false;
@@ -91,6 +101,7 @@ class Chain<K, V> {
         target = lastNode;
       } else {
         target = new LockNode<>(key, mode, txn);
+        target.setUpgraded(readsKey && mode == LockMode.EXCLUSIVE);
         append(target);
       }
       txn.putLock(key, new LockType<>(mode, target));
@@ -128,9 +139,13 @@ class Chain<K, V> {
       }
       // cases 2 and 3a: a new EXCLUSIVE node right behind p (at the end, or in front of the blind
       // writer `after`)
+      boolean read = node.isGranted(txn);   // it read k as a reader: a cascade must still reach it
       node.removeHolder(txn);
       LockNode<K, V> newNode = new LockNode<>(key, LockMode.EXCLUSIVE, txn);
       newNode.setUpgraded(true);
+      if (read) {
+        newNode.markGranted(txn);
+      }
       insertAfter(p, newNode);
       if (node.getHolders().isEmpty()) {   // only possible when p != node
         unlink(node);
@@ -148,10 +163,10 @@ class Chain<K, V> {
    * replaced while waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn
    * waits until it is spliced out (the cascade marks the dependents before that).
    *
-   * <p>Deadlock prevention, in the bounded (execution phase) wait only, so that every wait-for edge
-   * goes from a younger txn to an older one and no cycle can form. Chains are FIFO, so the common
-   * case (younger behind older) just waits. prepare() is unbounded and never dies nor wounds: its
-   * waits are left to the coordinator.
+   * <p>Deadlock prevention, so that every wait-for edge goes from a younger txn to an older one and
+   * no cycle can form. Chains are FIFO, so the common case (younger behind older) just waits.
+   * prepare() is unbounded and never wounds; with wait-die it dies as described below, else its waits
+   * are left to the coordinator.
    *
    * <ul>
    *   <li>wait-die: a txn that would wait for a younger one returns DIE instead.
@@ -170,7 +185,16 @@ class Chain<K, V> {
    *       on older txns or on txns past started (which wait on no lock), and as soon as those are
    *       gone it wounds the younger ones it would otherwise wait for.
    *   <li>none: just wait, until the deadline.
+   *   <li>prepare()'s wait-die (unbounded, policy WAIT_DIE): DIE as soon as a predecessor holder txn
+   *       would wait for is younger than txn (it may be executed or prepared, which nobody can wound,
+   *       and its commit may wait for txn's vote on another shim: the cross-shim cycle). Every wait
+   *       of prepare() then goes from a younger txn to an older one, on every shim alike since the
+   *       ages are global, so no cycle of prepare waits can form. Holders that commit or leave
+   *       without waiting for anyone (PREPARE_NO_CYCLE) are waited for.
    * </ul>
+   *
+   * <p>On READY txn is granted on its node (see {@link LockNode#isGranted}): from then on it may read
+   * the holders ahead, so a cascade from them must reach it.
    *
    * @param deadlineNanos a {@link System#nanoTime()} deadline, used only if {@code bounded}
    * @param victims receives the txns marked on WOUND (only with WOUND_WAIT)
@@ -188,9 +212,13 @@ class Chain<K, V> {
       }
       LockNode<K, V> pred = txn.getLock(key).node().getPrev();
       if (pred == null || pred.allHoldersIn(ready)) {
+        txn.getLock(key).node().markGranted(txn);
         return WaitResult.READY;
       }
       if (bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, ready)) {
+        return WaitResult.DIE;
+      }
+      if (!bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, PREPARE_NO_CYCLE)) {
         return WaitResult.DIE;
       }
       if (bounded && policy == DeadlockPolicy.WOUND_WAIT && wound(txn, pred, ready, victims)) {
@@ -250,10 +278,13 @@ class Chain<K, V> {
   /**
    * get()'s critical section, for a txn that holds key: DOOMED if txn is aborted / must_abort (a
    * foreign abort_transaction may have spliced its node out since lock() returned); else the value
-   * txn already read (read_buffer); else the write of the nearest EXCLUSIVE node at or before txn's
-   * own node; else a null value (no predecessor version: read the store, a committed writer applied
-   * its buffer before being spliced out). Reading that holder's buffer is safe: lock() only returned
-   * once it was executed, so its buffer is final.
+   * txn already read (read_buffer); else the write of the nearest EXCLUSIVE node before txn's own
+   * node whose holder wrote key (txn's own node is never a predecessor version: if it is EXCLUSIVE,
+   * txn holds it and its own write was already looked up by get(), e.g. a get-for-update before the
+   * put; and a get-for-update holder that did not write key is skipped); else a null value (no
+   * predecessor version: read the store, a committed writer applied its buffer before being spliced
+   * out). Reading that holder's buffer is safe: lock() only returned once it was executed, so its
+   * buffer is final.
    */
   synchronized LocksMap.ReadResult<V> read(Transaction<K, V> txn) {
     if (txn.isDoomed()) {
@@ -262,12 +293,18 @@ class Chain<K, V> {
     if (txn.getReadSet().containsKey(key)) {
       return LocksMap.ReadResult.of(txn.getReadSet().get(key));
     }
-    LockNode<K, V> n = txn.getLock(key).node();
-    while (n != null && n.getMode() != LockMode.EXCLUSIVE) {
-      n = n.getPrev();
+    // the nearest EXCLUSIVE node before txn's own one whose holder wrote key: an EXCLUSIVE node has
+    // exactly one holder, and a get-for-update holder that never wrote key holds no version of it
+    // (its successors read what it read). Holders ahead are executed: their buffers are final
+    for (LockNode<K, V> n = txn.getLock(key).node().getPrev(); n != null; n = n.getPrev()) {
+      if (n.getMode() == LockMode.EXCLUSIVE) {
+        Map<K, V> writes = n.getHolders().iterator().next().getWriteSet();
+        if (writes.containsKey(key)) {
+          return LocksMap.ReadResult.of(writes.get(key));
+        }
+      }
     }
-    // an EXCLUSIVE node has exactly one holder
-    return LocksMap.ReadResult.of(n == null ? null : n.getHolders().iterator().next().getWriteSet().get(key));
+    return LocksMap.ReadResult.of(null);
   }
 
   /**
@@ -282,7 +319,9 @@ class Chain<K, V> {
   /**
    * abort_transaction()'s critical section on this key: if txn held it EXCLUSIVE, marks every holder
    * of the later nodes up to the next blind writer must_abort (mark_must_abort), and only then
-   * releases (cascade before splice).
+   * releases (cascade before splice). Only the holders granted on their node there (see {@link
+   * LockNode#isGranted}): one still blocked in lock() read nothing on this key, so it is spared,
+   * however it may be marked through another key it did read.
    *
    * <p>No cascade either if txn never reached executed (e.g. it was wounded, or aborted by the
    * coordinator while running): no successor got past its node, since none does before every holder
@@ -311,6 +350,12 @@ class Chain<K, V> {
           break;   // blind write: it does not depend on txn's value
         }
         for (Transaction<K, V> t : s.getHolders()) {
+          if (!s.isGranted(t)) {
+            // still blocked in lock() on this node: it read nothing of txn's (nor of a txn behind it
+            // here, which it would first have to wait for), so it is spared; it waits on and is
+            // woken up by the release
+            continue;
+          }
           Status before = t.compareAndSwapStatus(MARKABLE, Status.MUST_ABORT);
           if (MARKABLE.contains(before)) {
             marked.add(t);

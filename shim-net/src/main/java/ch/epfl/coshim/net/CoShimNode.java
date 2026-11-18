@@ -24,7 +24,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <pre>
  *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
- *       [--lock-timeout-ms T] [--deadlock P] [--stats-interval-s I] [--allow HOST ...]
+ *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--stats-interval-s I] [--allow HOST ...]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | nocc (no concurrency
@@ -34,7 +34,10 @@ import java.util.concurrent.TimeUnit;
  *     --deadlock          deadlock prevention of speculative/nonspeculative: wait-die (an older txn
  *                         dies instead of waiting for a younger one) | wound-wait (it aborts the
  *                         younger running one instead) | none (just wait until lock_timeout: only for
- *                         workloads that cannot deadlock, e.g. ordered locking); default wait-die
+ *                         workloads that cannot deadlock, e.g. ordered locking); default wound-wait
+ *     --prepare-deadlock  cross-shim deadlock prevention in prepare(): wait-die (prepare() votes NO
+ *                         instead of waiting for a younger txn; the ages then come from the Seata
+ *                         global transaction id, the same on every shim) | none; default wait-die
  *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
  *     --allow             a client address allowed to connect (e.g. an RM host), repeatable; default:
  *                         any authenticated client
@@ -51,7 +54,7 @@ public final class CoShimNode {
 
     /** The parsed command line. */
     record Options(int port, String shim, String[] databases, Duration lockTimeout, DeadlockPolicy deadlock,
-            long statsIntervalSeconds,
+            boolean prepareWaitDie, long statsIntervalSeconds,
             Set<InetAddress> allowed) {
 
         static Options parse(String[] args) throws Exception {
@@ -61,7 +64,8 @@ public final class CoShimNode {
             // name. With no argument it hosts a single database called "default".
             String databases = "default";
             long lockTimeoutMs = 200;
-            DeadlockPolicy deadlock = DeadlockPolicy.WAIT_DIE;
+            DeadlockPolicy deadlock = DeadlockPolicy.WOUND_WAIT;
+            boolean prepareWaitDie = true;
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
             if (args.length > 0 && args[0].startsWith("--")) {
@@ -77,6 +81,7 @@ public final class CoShimNode {
                         case "--databases" -> databases = value;
                         case "--lock-timeout-ms" -> lockTimeoutMs = Long.parseLong(value);
                         case "--deadlock" -> deadlock = parseDeadlock(value);
+                        case "--prepare-deadlock" -> prepareWaitDie = parsePrepareDeadlock(value);
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
                         default -> throw new IllegalArgumentException("unknown option " + flag);
@@ -91,7 +96,15 @@ public final class CoShimNode {
                 }
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
-                    statsIntervalSeconds, allowed);
+                    prepareWaitDie, statsIntervalSeconds, allowed);
+        }
+
+        private static boolean parsePrepareDeadlock(String value) {
+            return switch (value) {
+                case "none" -> false;
+                case "wait-die" -> true;
+                default -> throw new IllegalArgumentException("unknown prepare deadlock policy " + value);
+            };
         }
 
         private static DeadlockPolicy parseDeadlock(String value) {
@@ -106,9 +119,9 @@ public final class CoShimNode {
         CoShim<TableKey<String>, String> newShim(KvStore<TableKey<String>, String> store) {
             return switch (shim) {
                 case "speculative" -> new SpeculativeCoShim<>(store, lockTimeout,
-                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock);
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie);
                 case "nonspeculative" -> new SpeculativeCoShim<>(store, lockTimeout,
-                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, deadlock);
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, deadlock, prepareWaitDie);
                 case "nocc" -> new NoCcShim<>(store);
                 default -> throw new IllegalArgumentException("unknown shim " + shim);
             };
@@ -132,7 +145,8 @@ public final class CoShimNode {
                 databases, new TableKeyCodec<>(Codec.UTF8), Codec.UTF8, new InetSocketAddress(options.port()), token,
                 options.allowed());
         System.out.println("coshim node (" + options.shim() + ", lock timeout " + options.lockTimeout().toMillis()
-                + " ms, " + options.deadlock().name().toLowerCase().replace('_', '-') + ") on port " + server.getPort() + ", databases " + databases.keySet()
+                + " ms, " + options.deadlock().name().toLowerCase().replace('_', '-')
+                + (options.prepareWaitDie() ? ", prepare wait-die" : "") + ") on port " + server.getPort() + ", databases " + databases.keySet()
                 + (options.allowed().isEmpty() ? "" : ", allowed clients " + options.allowed()));
 
         Runnable printStats = () -> databases.forEach((name, shim) -> {
