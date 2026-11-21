@@ -4,11 +4,13 @@ import ch.epfl.coshim.types.LockType.LockMode;
 import ch.epfl.coshim.types.Transaction.Status;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 
 /**
@@ -92,6 +94,24 @@ public class LocksMap<K, V> {
   /** prepare() dies instead of waiting for a younger txn (cross-shim deadlock prevention). */
   private final boolean prepareWaitDie;
 
+  /**
+   * How an adaptive lock() wait that had uncommitted writers to speculate on was granted (see {@link
+   * AdaptiveSpeculation}); waits that end in an abort are not counted.
+   */
+  public static enum AdaptiveGrant {
+    /** Speculated as soon as the predecessors were executed: the risk was low enough. */
+    SPECULATED,
+    /** Waited past that point for writers ahead to commit, then went on (fewer or none left). */
+    DEFERRED,
+    /** Speculated despite the risk: one of the writers was younger (deadlock prevention). */
+    FORCED
+  }
+
+  /** Null: no per-key cap on speculation. */
+  private final AdaptiveSpeculation adaptive;
+  private final Map<AdaptiveGrant, LongAdder> adaptiveGrants = new EnumMap<>(AdaptiveGrant.class);
+  private final Consumer<AdaptiveGrant> onAdaptiveGrant = g -> adaptiveGrants.get(g).increment();
+
   /** Outcome of prepare()'s wait for the predecessors to commit. */
   public static enum PrepareWait {
     /** Every predecessor committed: txn may vote YES. */
@@ -135,6 +155,26 @@ public class LocksMap<K, V> {
       DeadlockPolicy deadlockPolicy,
       Consumer<Transaction<K, V>> woundHandler,
       boolean prepareWaitDie) {
+    this(speculative, deadlockPolicy, woundHandler, prepareWaitDie, null);
+  }
+
+  /**
+   * @param adaptive per-key cap on speculation (see {@link AdaptiveSpeculation}); null: lock()
+   *     always speculates. Needs {@code speculative}
+   */
+  public LocksMap(
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      Consumer<Transaction<K, V>> woundHandler,
+      boolean prepareWaitDie,
+      AdaptiveSpeculation adaptive) {
+    if (adaptive != null && !speculative) {
+      throw new IllegalArgumentException("adaptive speculation needs a speculative lock table");
+    }
+    this.adaptive = adaptive;
+    for (AdaptiveGrant g : AdaptiveGrant.values()) {
+      adaptiveGrants.put(g, new LongAdder());
+    }
     this.prepareWaitDie = prepareWaitDie;
     this.speculative = speculative;
     this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
@@ -144,7 +184,8 @@ public class LocksMap<K, V> {
 
   /**
    * lock(k, mode, txn) and upgrade(k, txn): takes the lock, then waits (at most {@code timeout})
-   * until every holder of its predecessor is at least executed (committed if not speculative). On
+   * until every holder of its predecessor is at least executed (committed if not speculative; with
+   * adaptive speculation, possibly until some writers ahead committed, see {@link Chain}). On
    * MUST_ABORT / TIMED_OUT the caller runs abort_transaction(txn).
    */
   public LockResult lock(K key, Transaction<K, V> txn, LockMode mode, Duration timeout) {
@@ -281,6 +322,15 @@ public class LocksMap<K, V> {
     }
   }
 
+  /** How many adaptive lock() waits were granted that way (all 0 without adaptive speculation). */
+  public long adaptiveGrants(AdaptiveGrant grant) {
+    return adaptiveGrants.get(grant).sum();
+  }
+
+  public boolean isAdaptive() {
+    return adaptive != null;
+  }
+
   public boolean containsKey(K key) {
     return locksMap.containsKey(key);
   }
@@ -294,7 +344,7 @@ public class LocksMap<K, V> {
   Chain<K, V> enqueue(K key, Transaction<K, V> txn, LockMode mode, boolean readsKey) {
     boolean[] acquired = {false};
     Chain<K, V> chain = locksMap.compute(key, (k, c) -> {
-      Chain<K, V> target = c != null ? c : new Chain<>(k);
+      Chain<K, V> target = c != null ? c : new Chain<>(k, adaptive, onAdaptiveGrant);
       acquired[0] = target.acquire(txn, mode, readsKey);
       return acquired[0] ? target : c;   // not running: leave the map as it was
     });

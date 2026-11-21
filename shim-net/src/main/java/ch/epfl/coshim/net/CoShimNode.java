@@ -6,6 +6,7 @@ import ch.epfl.coshim.core.SpeculativeCoShim;
 import ch.epfl.coshim.store.InMemoryKvStore;
 import ch.epfl.coshim.store.KvStore;
 import ch.epfl.coshim.store.TableKey;
+import ch.epfl.coshim.types.AdaptiveSpeculation;
 import ch.epfl.coshim.types.DeadlockPolicy;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -25,10 +26,17 @@ import java.util.concurrent.TimeUnit;
  * <pre>
  *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
  *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--stats-interval-s I] [--allow HOST ...]
+ *       [--spec-tau-ms T] [--spec-theta X] [--spec-prior-mean M] [--spec-prior-weight W]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
- *                         for the predecessors to commit, no cascades) | nocc (no concurrency
+ *                         for the predecessors to commit, no cascades) | adaptive (speculative, but per
+ *                         key only while it pays: see AdaptiveSpeculation) | nocc (no concurrency
  *                         control); default nocc
+ *     --spec-tau-ms       adaptive: decay time constant of a key's abort evidence; default 100
+ *     --spec-theta        adaptive: speculate iff P(none of the d uncommitted writers ahead aborts)
+ *                         is at least this; default 0.5
+ *     --spec-prior-mean   adaptive: assumed abort rate of a key without evidence; default 0.02
+ *     --spec-prior-weight adaptive: how many outcomes that assumption is worth; default 10
  *     --databases         comma-separated database names; default "default"
  *     --lock-timeout-ms   lock_timeout of speculative/nonspeculative; default 200
  *     --deadlock          deadlock prevention of speculative/nonspeculative: wait-die (an older txn
@@ -55,7 +63,7 @@ public final class CoShimNode {
     /** The parsed command line. */
     record Options(int port, String shim, String[] databases, Duration lockTimeout, DeadlockPolicy deadlock,
             boolean prepareWaitDie, long statsIntervalSeconds,
-            Set<InetAddress> allowed) {
+            Set<InetAddress> allowed, AdaptiveSpeculation adaptive) {
 
         static Options parse(String[] args) throws Exception {
             int port = 7000;
@@ -68,6 +76,11 @@ public final class CoShimNode {
             boolean prepareWaitDie = true;
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
+            AdaptiveSpeculation spec = AdaptiveSpeculation.DEFAULT;
+            long specTauMs = spec.tau().toMillis();
+            double specTheta = spec.theta();
+            double specPriorMean = spec.priorMean();
+            double specPriorWeight = spec.priorWeight();
             if (args.length > 0 && args[0].startsWith("--")) {
                 for (int i = 0; i < args.length; i++) {
                     String flag = args[i];
@@ -84,6 +97,10 @@ public final class CoShimNode {
                         case "--prepare-deadlock" -> prepareWaitDie = parsePrepareDeadlock(value);
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
+                        case "--spec-tau-ms" -> specTauMs = Long.parseLong(value);
+                        case "--spec-theta" -> specTheta = Double.parseDouble(value);
+                        case "--spec-prior-mean" -> specPriorMean = Double.parseDouble(value);
+                        case "--spec-prior-weight" -> specPriorWeight = Double.parseDouble(value);
                         default -> throw new IllegalArgumentException("unknown option " + flag);
                     }
                 }
@@ -96,7 +113,8 @@ public final class CoShimNode {
                 }
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
-                    prepareWaitDie, statsIntervalSeconds, allowed);
+                    prepareWaitDie, statsIntervalSeconds, allowed,
+                    new AdaptiveSpeculation(Duration.ofMillis(specTauMs), specTheta, specPriorMean, specPriorWeight));
         }
 
         private static boolean parsePrepareDeadlock(String value) {
@@ -122,6 +140,8 @@ public final class CoShimNode {
                         SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie);
                 case "nonspeculative" -> new SpeculativeCoShim<>(store, lockTimeout,
                         SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, deadlock, prepareWaitDie);
+                case "adaptive" -> new SpeculativeCoShim<>(store, lockTimeout,
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie, adaptive);
                 case "nocc" -> new NoCcShim<>(store);
                 default -> throw new IllegalArgumentException("unknown shim " + shim);
             };
@@ -146,7 +166,8 @@ public final class CoShimNode {
                 options.allowed());
         System.out.println("coshim node (" + options.shim() + ", lock timeout " + options.lockTimeout().toMillis()
                 + " ms, " + options.deadlock().name().toLowerCase().replace('_', '-')
-                + (options.prepareWaitDie() ? ", prepare wait-die" : "") + ") on port " + server.getPort() + ", databases " + databases.keySet()
+                + (options.prepareWaitDie() ? ", prepare wait-die" : "")
+                + (options.shim().equals("adaptive") ? ", " + options.adaptive() : "") + ") on port " + server.getPort() + ", databases " + databases.keySet()
                 + (options.allowed().isEmpty() ? "" : ", allowed clients " + options.allowed()));
 
         Runnable printStats = () -> databases.forEach((name, shim) -> {

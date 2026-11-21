@@ -2,6 +2,7 @@ package ch.epfl.coshim.core;
 
 import ch.epfl.coshim.core.ShimStats.AbortCause;
 import ch.epfl.coshim.store.KvStore;
+import ch.epfl.coshim.types.AdaptiveSpeculation;
 import ch.epfl.coshim.types.DeadlockPolicy;
 import ch.epfl.coshim.types.LockType;
 import ch.epfl.coshim.types.LocksMap;
@@ -27,6 +28,10 @@ import java.util.regex.Pattern;
  * <p>With {@code speculative = false} it is the non-speculative baseline: plain strict 2PL, where
  * lock() waits until the predecessors committed instead of executed. Same code otherwise, so a
  * benchmark of the two isolates what speculation buys (shorter lock waits) and costs (cascades).
+ *
+ * <p>With an {@link AdaptiveSpeculation} it speculates per key only while that pays: on a key whose
+ * writers often abort, behind a long queue of uncommitted ones, lock() waits for some of them to
+ * commit instead.
  */
 public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   /** Above Seata's default 60 s global transaction timeout (pseudo.txt tombstone_ttl). */
@@ -47,7 +52,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   private final Duration lockTimeout;
   private final Duration tombstoneTtl;
   private final LocksMap<K, V> locksMap;
-  private final ShimStats stats = new ShimStats();
+  private final ShimStats stats;
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
   /** Hands out txn ages at start(): a later start() is younger. */
   private final AtomicLong timestampGenerator = new AtomicLong();
@@ -106,6 +111,21 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       boolean speculative,
       DeadlockPolicy deadlockPolicy,
       boolean prepareWaitDie) {
+    this(store, lockTimeout, tombstoneTtl, speculative, deadlockPolicy, prepareWaitDie, null);
+  }
+
+  /**
+   * @param adaptive per-key cap on speculation (see {@link AdaptiveSpeculation}); null: always
+   *     speculate (if {@code speculative}). Needs {@code speculative}
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      boolean prepareWaitDie,
+      AdaptiveSpeculation adaptive) {
     this.globalAges = prepareWaitDie;
     // a wound-wait victim is already must_abort: abort_transaction releases its locks, on the
     // wounder's thread, outside any latch
@@ -114,7 +134,9 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
             speculative,
             Objects.requireNonNull(deadlockPolicy),
             victim -> abortTransaction(victim, AbortCause.WOUNDED),
-            prepareWaitDie);
+            prepareWaitDie,
+            adaptive);
+    this.stats = new ShimStats(adaptive != null ? locksMap::adaptiveGrants : null);
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
     this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);

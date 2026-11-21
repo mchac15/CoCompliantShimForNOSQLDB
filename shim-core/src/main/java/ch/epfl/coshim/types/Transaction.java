@@ -30,6 +30,12 @@ public class Transaction<K, V> {
   private boolean reachedExecuted;
   /** Doomed by wound-wait ({@link #wound()}), not by a cascade. */
   private boolean wounded;
+  /**
+   * The key whose cascade doomed this txn, null if none (guarded by the monitor). Its abort is then
+   * not new evidence on that key for {@link AdaptiveSpeculation}: the writer that started the
+   * cascade already counted.
+   */
+  private K cascadeOrigin;
 
   /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
   public Transaction(String transactionId, Status status, Long expiresAtMillis) {
@@ -155,6 +161,15 @@ public class Transaction<K, V> {
 
   public synchronized boolean isWounded() {
     return wounded;
+  }
+
+  /** Set by the cascade that just marked this txn must_abort, under that key's chain monitor. */
+  synchronized void setCascadeOrigin(K key) {
+    cascadeOrigin = key;
+  }
+
+  synchronized K getCascadeOrigin() {
+    return cascadeOrigin;
   }
 
   /** Was ever executed: only then can a successor have read its write buffer. */
