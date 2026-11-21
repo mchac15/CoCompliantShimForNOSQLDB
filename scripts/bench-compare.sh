@@ -5,8 +5,8 @@
 #   scripts/bench-compare.sh [--reps N] [MicroBench options...]
 #
 # Variants:
-#   speculative, nonspeculative, nocc  the shim: SHIMS shim nodes (CoShimNode, one database each, on
-#                                      ports NODE_PORT, NODE_PORT+1, ...), started and stopped for
+#   speculative, nonspeculative,       the shim: SHIMS shim nodes (CoShimNode, one database each, on
+#   adaptive, nocc                     ports NODE_PORT, NODE_PORT+1, ...), started and stopped for
 #                                      each run; each node's log, with its final commit/abort
 #                                      counters, is kept next to the CSV
 #   speculative-mysql, speculative-pg, the shim on MySQL / PostgreSQL: as above, but each node stores
@@ -33,7 +33,8 @@
 #      counters at shutdown only; N: also every N s), PREPARE_DEADLOCK (none | wait-die: the nodes'
 #      --prepare-deadlock, default none), GC_LOGS (1: GC and safepoint logs of the nodes and of
 #      MicroBench, next to the node logs; the shim variants only), DEADLOCK (wait-die | wound-wait, default
-#      wait-die), VARIANTS ("speculative nonspeculative"),
+#      wait-die), VARIANTS ("speculative nonspeculative"), ADAPTIVE_ARGS (extra CoShimNode options of the
+#      adaptive variants only, e.g. "--spec-theta 0.7 --spec-tau-ms 100"; default: CoShimNode's),
 #      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o), and
 #      scripts/bench-dbs.sh's MYSQL_PORT, PG_PORT, ...
 # Exit code 1 if any run printed a warning or failed its audit.
@@ -144,6 +145,8 @@ for rep in $(seq 1 "$reps"); do
         shim="${shim%-pg}"              # -> speculative
         policy="$deadlock"
         [[ $variant != *@* ]] || policy="${variant#*@}"
+        adaptive_args=()
+        [[ $shim != adaptive ]] || read -r -a adaptive_args <<< "${ADAPTIVE_ARGS:-}"
         for ((s = 0; s < shims; s++)); do
             port=$((base_port + s))
             store=memory
@@ -160,6 +163,7 @@ for rep in $(seq 1 "$reps"); do
             fi
             java ${node_gc[@]+"${node_gc[@]}"} -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "$shim" --databases "s$s" \
                 --lock-timeout-ms "$lock_timeout" --deadlock "$policy" --prepare-deadlock "${PREPARE_DEADLOCK:-none}" --stats-interval-s "${STATS_INTERVAL_S:-0}" --store "$store" \
+                ${adaptive_args[@]+"${adaptive_args[@]}"} \
                 > "$logs/rep$rep-$variant-s$s.log" 2>&1 &
             nodes+=($!)
             until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do

@@ -1,11 +1,13 @@
 package ch.epfl.coshim.core;
 
+import ch.epfl.coshim.types.LocksMap.AdaptiveGrant;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.ToLongFunction;
 
 /**
  * Counters of a shim's commits and aborts, the aborts by cause: what explains a benchmark result
@@ -78,8 +80,15 @@ public final class ShimStats {
   private final Map<AbortCause, LongAdder> lostUs = new EnumMap<>(AbortCause.class);
   /** Running sums of (depth, saved µs) over the commits, for their Pearson correlation. */
   private double n, sx, sy, sxx, syy, sxy;
+  /** The lock table's adaptive speculation counters, null without adaptive speculation. */
+  private final ToLongFunction<AdaptiveGrant> adaptiveGrants;
 
   ShimStats() {
+    this(null);
+  }
+
+  ShimStats(ToLongFunction<AdaptiveGrant> adaptiveGrants) {
+    this.adaptiveGrants = adaptiveGrants;
     for (AbortCause cause : AbortCause.values()) {
       aborts.put(cause, new LongAdder());
       lostUs.put(cause, new LongAdder());
@@ -406,6 +415,16 @@ public final class ShimStats {
     for (AbortCause cause : AbortCause.values()) {
       sb.append(' ').append(cause.name().toLowerCase()).append('=').append(aborts(cause));
     }
+    if (adaptiveGrants != null) {
+      for (AdaptiveGrant grant : AdaptiveGrant.values()) {
+        sb.append(" adaptive_").append(grant.name().toLowerCase()).append('=').append(adaptiveGrants(grant));
+      }
+    }
     return sb.toString();
+  }
+
+  /** How many adaptive lock() waits were granted that way (0 without adaptive speculation). */
+  public long adaptiveGrants(AdaptiveGrant grant) {
+    return adaptiveGrants == null ? 0 : adaptiveGrants.applyAsLong(grant);
   }
 }
