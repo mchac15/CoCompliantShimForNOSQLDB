@@ -25,6 +25,8 @@ import csv, glob, os, sys
 from collections import defaultdict
 
 out = sys.argv[1]
+if not os.path.exists(os.path.join(out, "summary.csv")):
+    sys.exit(f"no summary.csv in {out}: no cell ran")
 rows = list(csv.DictReader(open(os.path.join(out, "summary.csv"))))
 GRANTS = ("adaptive_speculated", "adaptive_deferred", "adaptive_forced", "adaptive_abandoned")
 
