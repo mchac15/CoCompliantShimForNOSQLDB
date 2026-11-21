@@ -64,6 +64,18 @@ public class Transaction<K, V> {
   private long lockWaitNanos;
   /** When prepare() voted YES, in {@link System#nanoTime()}; 0 before. */
   private long votedAtNanos;
+  /**
+   * The key whose cascade doomed this txn, null if none (guarded by the monitor). Its abort is then
+   * not new evidence on that key for {@link AdaptiveSpeculation}: the writer that started the
+   * cascade already counted.
+   */
+  private K cascadeOrigin;
+  /**
+   * The chain on which adaptive speculation deferred this txn inside lock() (past the speculation
+   * point, still blocked), null otherwise. Set and read only under that chain's monitor: a cascade
+   * there spares it, since it has read nothing on that key.
+   */
+  private Object deferredOn;
 
   /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
   public Transaction(String transactionId, Status status, Long expiresAtMillis) {
@@ -228,6 +240,25 @@ public class Transaction<K, V> {
   /** Callers hold the monitor of {@code chain}. */
   boolean isWaitingOn(Object chain) {
     return waitingOn == chain;
+  }
+
+  /** Set by the cascade that just marked this txn must_abort, under that key's chain monitor. */
+  synchronized void setCascadeOrigin(K key) {
+    cascadeOrigin = key;
+  }
+
+  synchronized K getCascadeOrigin() {
+    return cascadeOrigin;
+  }
+
+  /** Callers hold the monitor of {@code chain} (or of the chain it was deferred on, to clear it). */
+  void setDeferredOn(Object chain) {
+    deferredOn = chain;
+  }
+
+  /** Callers hold the monitor of {@code chain}. */
+  boolean isDeferredOn(Object chain) {
+    return deferredOn == chain;
   }
 
   /** Was ever executed: only then can a successor have read its write buffer. */

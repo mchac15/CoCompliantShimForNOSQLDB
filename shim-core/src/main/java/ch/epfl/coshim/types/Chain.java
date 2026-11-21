@@ -6,8 +6,10 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * The chain of one key (one per key, in {@link LocksMap}): generations of holders, doubly linked,
@@ -61,9 +63,27 @@ class Chain<K, V> {
   private LockNode<K, V> head;
   /** The last node of the chain (pseudo.txt's chain.last_node()), kept to append in O(1). */
   private LockNode<K, V> lastNode;
+  /** Null: lock() speculates whenever its predecessors are executed (or never, see LocksMap). */
+  private final AdaptiveSpeculation adaptive;
+  /** Told how each adaptive lock() wait that had writers to speculate on was granted. */
+  private final Consumer<LocksMap.AdaptiveGrant> onAdaptiveGrant;
+  // adaptive speculation's evidence on this key, decayed as of lastOutcomeNanos: the outcomes of
+  // its writers that reached executed, and how many of them aborted. Lost with the chain when it
+  // empties: the key is not contended then, and starts again from the prior
+  private double decayedAborts;
+  private double decayedOutcomes;
+  private long lastOutcomeNanos;
 
   Chain(K key) {
+    this(key, null, null);
+  }
+
+  /** @param adaptive null: no per-key cap on speculation */
+  Chain(K key, AdaptiveSpeculation adaptive, Consumer<LocksMap.AdaptiveGrant> onAdaptiveGrant) {
     this.key = key;
+    this.adaptive = adaptive;
+    this.onAdaptiveGrant = adaptive != null ? Objects.requireNonNull(onAdaptiveGrant) : null;
+    this.lastOutcomeNanos = System.nanoTime();   // nanoTime may be negative: never decay from 0
   }
 
   synchronized LockNode<K, V> getHead() {
@@ -182,6 +202,12 @@ class Chain<K, V> {
    *       gone it wounds the younger ones it would otherwise wait for.
    * </ul>
    *
+   * <p>With adaptive speculation, reaching {@code ready} is not always enough: see {@link
+   * #maySpeculate}. While it says no, txn is deferred: it keeps waiting here, and decides again on
+   * every wake-up (a writer ahead committing wakes it up, and makes d smaller). The deadlock checks
+   * do not fire meanwhile, since every holder of pred is in {@code ready}. A cascade spares a
+   * deferred txn (see {@link #abortAndRelease}): it has read nothing on this key yet.
+   *
    * @param deadlineNanos a {@link System#nanoTime()} deadline
    * @param victims receives the txns marked on WOUND (only with WOUND_WAIT)
    */
@@ -196,6 +222,7 @@ class Chain<K, V> {
       return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
     } finally {
       txn.setWaitingOn(null);
+      txn.setDeferredOn(null);
     }
   }
 
@@ -245,16 +272,23 @@ class Chain<K, V> {
       long deadlineNanos,
       DeadlockPolicy policy,
       List<Transaction<K, V>> victims) {
+    boolean deferred = false;
     while (true) {
       if (txn.isDoomed()) {
         return WaitResult.DOOMED;
       }
       LockNode<K, V> pred = txn.getLock(key).node().getPrev();
       if (pred == null || pred.allHoldersIn(ready)) {
-        if (bounded) {
-          recordGrant(txn, pred);
+        if (bounded && pred != null && adaptive != null && !maySpeculate(txn, pred, deferred)) {
+          deferred = true;
+          txn.setDeferredOn(this);
+        } else {
+          if (bounded) {
+            txn.setDeferredOn(null);   // granted: from now on a cascade from the holders ahead reaches it
+            recordGrant(txn, pred);
+          }
+          return WaitResult.READY;
         }
-        return WaitResult.READY;
       }
       if (bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, ready)) {
         return WaitResult.DIE;
@@ -331,6 +365,71 @@ class Chain<K, V> {
   }
 
   /**
+   * Adaptive speculation's decision, under this monitor, once every holder of pred reached the
+   * speculation point: may txn read them now? Walks the writers ahead of txn back to the first blind
+   * writer (an abort ahead of that one cascades no further, see {@link #abortAndRelease}) and counts
+   * in d those not committing or committed: each of them may still abort and doom txn. txn
+   * speculates iff d = 0, or the key's evidence says that none of the d is likely to abort ({@link
+   * AdaptiveSpeculation#allows}), or one of them is younger than txn.
+   *
+   * <p>That last case keeps the deadlock prevention intact. Waiting for a writer to commit is a wait
+   * the purely speculative shim never has in lock(), and a younger writer past started may itself
+   * wait, in prepare() on another shim, for txn's branch there: a cycle. So txn only waits for the
+   * commit of older txns, the same direction as every other wait (and as prepare()'s wait-die). A
+   * doomed writer leaves without waiting for anyone, so it is waited for.
+   *
+   * @param deferred txn already waited past the speculation point (only for the counters)
+   */
+  private boolean maySpeculate(Transaction<K, V> txn, LockNode<K, V> pred, boolean deferred) {
+    int d = 0;
+    boolean younger = false;
+    for (LockNode<K, V> n = pred; n != null; n = n.getPrev()) {
+      if (n.getMode() != LockMode.EXCLUSIVE) {
+        continue;   // a reader's abort cascades to nobody
+      }
+      for (Transaction<K, V> w : n.getHolders()) {
+        Status s = w.getStatus();
+        if (s != Status.COMMITTING && s != Status.COMMITTED) {
+          d++;
+          younger |= !LEAVING.contains(s) && w.getTs() > txn.getTs();
+        }
+      }
+      if (!n.isUpgraded()) {
+        break;   // blind writer
+      }
+    }
+    if (d == 0) {
+      if (deferred) {
+        onAdaptiveGrant.accept(LocksMap.AdaptiveGrant.DEFERRED);
+      }
+      return true;   // nothing uncommitted to speculate on (any more)
+    }
+    double w = adaptive.decay(System.nanoTime() - lastOutcomeNanos);
+    if (adaptive.allows(w * decayedAborts, w * decayedOutcomes, d)) {
+      onAdaptiveGrant.accept(deferred ? LocksMap.AdaptiveGrant.DEFERRED : LocksMap.AdaptiveGrant.SPECULATED);
+      return true;
+    }
+    if (younger) {
+      onAdaptiveGrant.accept(LocksMap.AdaptiveGrant.FORCED);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Adaptive speculation's evidence, under this monitor: a writer of this key that reached executed
+   * resolved, aborted or not. Recorded whether or not anyone speculated on it, so that a key that
+   * stopped speculating keeps learning.
+   */
+  private void recordOutcome(boolean aborted) {
+    long now = System.nanoTime();
+    double w = adaptive.decay(now - lastOutcomeNanos);
+    decayedAborts = w * decayedAborts + (aborted ? 1 : 0);
+    decayedOutcomes = w * decayedOutcomes + 1;
+    lastOutcomeNanos = now;
+  }
+
+  /**
    * get()'s critical section, for a txn that holds key: DOOMED if txn is aborted / must_abort (a
    * foreign abort_transaction may have spliced its node out since lock() returned); else the value
    * txn already read (read_buffer); else the write of the nearest EXCLUSIVE node before txn's own
@@ -367,6 +466,9 @@ class Chain<K, V> {
    * @return true iff the chain is now empty: the caller removes it from locks_map
    */
   synchronized boolean release(Transaction<K, V> txn, LockNode<K, V> node) {
+    if (adaptive != null && node.getMode() == LockMode.EXCLUSIVE) {
+      recordOutcome(false);
+    }
     return releaseLocked(txn, node);
   }
 
@@ -385,6 +487,15 @@ class Chain<K, V> {
    * is still waiting in lock() (or holds a node behind such a waiter), so none has read txn's
    * buffer. They are only woken up by the release.
    *
+   * <p>With adaptive speculation, a writer that reached executed counts as an abort on this key,
+   * unless a cascade on this same key doomed it: the writer that started that cascade already
+   * counted, and the whole tail it dooms is one failure, not d independent ones. And the cascade
+   * spares a holder that adaptive speculation deferred on this key (still blocked in lock() past the
+   * speculation point, see {@link #awaitPredecessor}): it has read nothing here, so nothing of txn's,
+   * and it waits on and is woken up by the release; sparing it is what deferring buys. Not on an
+   * upgraded node, whose holder may have read the key as a reader before. Without adaptive
+   * speculation nobody is deferred, so the cascade is unchanged.
+   *
    * @param cascade false for the non-speculative baseline: release only
    * @param marked receives every txn this call moved to must_abort (to wake them up)
    * @param doomedFinished receives those of them that were executed (the caller aborts them)
@@ -400,6 +511,12 @@ class Chain<K, V> {
       List<Transaction<K, V>> marked,
       List<Transaction<K, V>> doomedFinished,
       Map<Transaction<K, V>, Boolean> granted) {
+    if (adaptive != null
+        && held.mode() == LockMode.EXCLUSIVE
+        && txn.hasReachedExecuted()
+        && !key.equals(txn.getCascadeOrigin())) {
+      recordOutcome(true);
+    }
     if (cascade && held.mode() == LockMode.EXCLUSIVE && txn.hasReachedExecuted()) {
       for (LockNode<K, V> s = held.node().getNext(); s != null; s = s.getNext()) {
         if (s.getMode() == LockMode.EXCLUSIVE && !s.isUpgraded()) {
@@ -407,8 +524,12 @@ class Chain<K, V> {
         }
         for (Transaction<K, V> t : s.getHolders()) {
           granted.merge(t, s.isUpgraded() || !t.isWaitingOn(this), Boolean::logicalOr);
+          if (!s.isUpgraded() && t.isDeferredOn(this)) {
+            continue;   // deferred by adaptive speculation: it read nothing here (see above)
+          }
           Status before = t.markMustAbort(MARKABLE, txn.rootCause());
           if (MARKABLE.contains(before)) {
+            t.setCascadeOrigin(key);
             marked.add(t);
             if (before == Status.EXECUTED) {
               doomedFinished.add(t);
