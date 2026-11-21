@@ -8,7 +8,9 @@
 #   scripts/bench-adaptive-pilot.sh --summarize DIR
 #
 # Workload: 4 branches, pipelined, 5 reads + 5 rmw writes each (10 ops), get-for-update on, think time
-# N(10 ms, 5 ms) before every op but the first and before the commit, on MySQL.
+# N(10 ms, 5 ms) before every op but the first and before the commit, on MySQL. The shim nodes run
+# prepare() wait-die (--prepare-deadlock wait-die): without it, two branches that two shims order
+# oppositely deadlock in prepare() until the TC's timeout.
 #
 # Output, in DIR = bench-results/adaptive-pilot-<timestamp>/:
 #   baseline/                     bench-final.sh's folder of the speculative and non-speculative runs
@@ -18,7 +20,8 @@
 #                                 deferred / forced, summed over nodes and reps)
 #
 # Env: THREADS (200), SKEW (0.95), REPS (1), THETAS ("0.3 0.5 0.7 0.9"), TAUS_MS ("500 2000"),
-#      PRIOR_MEAN (0.05), PRIOR_WEIGHT (3), OUT, and bench-final.sh's WARMUP_S, MEASURE_S,
+#      PRIOR_MEAN (0.05), PRIOR_WEIGHT (3), PREPARE_DEADLOCK (wait-die | none, default wait-die), OUT,
+#      and bench-final.sh's WARMUP_S, MEASURE_S,
 #      LOCK_TIMEOUT_MS, TXN_TIMEOUT_MS, SHIMS, ... The MySQL servers are started once if not running
 #      (and stopped at the end then); servers already running are reused as they are.
 set -euo pipefail
@@ -52,7 +55,9 @@ if not rows:
 print(f"# Adaptive speculation pilot: {out}\n")
 setup = glob.glob(os.path.join(out, "baseline", "setup.txt")) or glob.glob(os.path.join(out, "*", "setup.txt"))
 if setup:
-    print("    " + open(setup[0]).read().replace("\n", "\n    ").rstrip() + "\n")
+    print("    " + open(setup[0]).read().replace("\n", "\n    ").rstrip())
+pd = os.path.join(out, "prepare-deadlock.txt")
+print("    " + (open(pd).read().strip() if os.path.exists(pd) else "prepare deadlock: ?") + "\n")
 print("Node counters summed over nodes and reps (warm-up included): cascade = aborts by cascade; "
       "adaptive = how the adaptive lock waits that had uncommitted writers ahead were granted: "
       "spec(ulated at once), def(erred: waited for writers to commit first), forced (a writer ahead was "
@@ -91,7 +96,9 @@ taus_ms="${TAUS_MS:-500 2000}"
 prior_mean="${PRIOR_MEAN:-0.05}"
 prior_weight="${PRIOR_WEIGHT:-3}"
 out="${OUT:-$root/bench-results/adaptive-pilot-$(date +%Y%m%d-%H%M%S)}"
+export PREPARE_DEADLOCK="${PREPARE_DEADLOCK:-wait-die}"   # read by bench-compare.sh for the nodes
 mkdir -p "$out"
+echo "prepare deadlock: $PREPARE_DEADLOCK" > "$out/prepare-deadlock.txt"
 
 workload=(--ops-mean 0 --reads 5 --writes 5 --branches 4 --rmw true --get-for-update true
     --pipelined-branches true --think-mean-us 10000 --think-sd-us 5000)
