@@ -22,6 +22,12 @@
 # and speculation has nothing to overlap (50 threads, skew 0.9: +1-2 % tps without, +10-11 % with).
 # Extra options are passed on and override these.
 #
+# The per-key adaptive speculation cap is one more shim variant: e.g.
+#   VARIANTS="speculative-mysql@wound-wait nonspeculative-mysql@wound-wait adaptive-mysql@wound-wait" \
+#   ADAPTIVE_ARGS="--spec-theta 0.5 --spec-tau-ms 100" scripts/bench-final.sh
+# (ADAPTIVE_ARGS: see scripts/bench-compare.sh; the node logs' stats lines then end with the
+# adaptive_speculated / adaptive_deferred / adaptive_forced grant counts).
+#
 # Output, in DIR = bench-results/final-<timestamp>/:
 #   t<T>-skew<S>.csv, txns-t<T>-skew<S>.csv, t<T>-skew<S>-nodes/   the runs, their txns, node logs
 #   summary.md, summary.csv   per threads, skew and variant: throughput (mean over reps, min-max);
