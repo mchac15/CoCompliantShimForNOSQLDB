@@ -97,7 +97,7 @@ public class LocksMap<K, V> {
 
   /**
    * How an adaptive lock() wait that had uncommitted writers to speculate on was granted (see {@link
-   * AdaptiveSpeculation}); waits that end in an abort are not counted.
+   * AdaptiveSpeculation}), or, for a deferred one, that it ended without a grant (ABANDONED).
    */
   public static enum AdaptiveGrant {
     /** Speculated as soon as the predecessors were executed: the risk was low enough. */
@@ -105,7 +105,12 @@ public class LocksMap<K, V> {
     /** Waited past that point for writers ahead to commit, then went on (fewer or none left). */
     DEFERRED,
     /** Speculated despite the risk: one of the writers was younger (deadlock prevention). */
-    FORCED
+    FORCED,
+    /**
+     * Deferred, then the wait ended without a grant: txn was doomed meanwhile (a cascade through
+     * another key, a wound, a coordinator abort) or timed out.
+     */
+    ABANDONED
   }
 
   /** Null: no per-key cap on speculation. */

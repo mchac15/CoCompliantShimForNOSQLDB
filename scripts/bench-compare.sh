@@ -13,6 +13,8 @@
 #   nonspeculative-mysql, ...          its database sI in SQL database sI on server I of the Sonata
 #                                      variants (same servers, same settings, same tables and keys,
 #                                      same statements; see SqlKvStore), refilled at node start
+#   adaptive-th<X>[-tau<T>]-mysql, ... the adaptive shim with --spec-theta X (and --spec-tau-ms T), on
+#                                      top of ADAPTIVE_ARGS: several cap configurations in one sweep
 #   <shim variant>@wait-die,           a shim variant with that deadlock policy instead of DEADLOCK's
 #   <shim variant>@wound-wait          (e.g. speculative-pg@wound-wait); the label keeps the suffix
 #   sonata-mysql, sonata-pg            Sonata: SHIMS MySQL / PostgreSQL servers (scripts/bench-dbs.sh:
@@ -146,7 +148,14 @@ for rep in $(seq 1 "$reps"); do
         policy="$deadlock"
         [[ $variant != *@* ]] || policy="${variant#*@}"
         adaptive_args=()
-        [[ $shim != adaptive ]] || read -r -a adaptive_args <<< "${ADAPTIVE_ARGS:-}"
+        if [[ $shim =~ ^adaptive-th([0-9.]+)(-tau([0-9]+))?$ ]]; then   # adaptive-th0.9-tau2000
+            read -r -a adaptive_args <<< "${ADAPTIVE_ARGS:-}"
+            adaptive_args+=(--spec-theta "${BASH_REMATCH[1]}")
+            [[ -z ${BASH_REMATCH[3]} ]] || adaptive_args+=(--spec-tau-ms "${BASH_REMATCH[3]}")
+            shim=adaptive
+        elif [[ $shim == adaptive ]]; then
+            read -r -a adaptive_args <<< "${ADAPTIVE_ARGS:-}"
+        fi
         for ((s = 0; s < shims; s++)); do
             port=$((base_port + s))
             store=memory

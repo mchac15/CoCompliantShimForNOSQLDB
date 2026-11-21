@@ -218,10 +218,16 @@ class Chain<K, V> {
       DeadlockPolicy policy,
       List<Transaction<K, V>> victims) {
     txn.setWaitingOn(this);   // statistics only, see abortAndRelease
+    WaitResult result = null;
     try {
-      return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
+      result = awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
+      return result;
     } finally {
       txn.setWaitingOn(null);
+      if (txn.isDeferredOn(this) && result != WaitResult.WOUND) {
+        // deferred, and the wait ended without a grant (WOUND: the caller waits again)
+        onAdaptiveGrant.accept(LocksMap.AdaptiveGrant.ABANDONED);
+      }
       txn.setDeferredOn(null);
     }
   }
