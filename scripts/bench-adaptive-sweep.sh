@@ -42,7 +42,9 @@ base = lambda v: v.split("-mysql")[0].split("-pg")[0]
 print(f"# Adaptive speculation sweep: {out}\n")
 setup = os.path.join(out, "setup.txt")
 if os.path.exists(setup):
-    print("    " + open(setup).read().replace("\n", "\n    ").rstrip() + "\n")
+    print("    " + open(setup).read().replace("\n", "\n    ").rstrip())
+extra = os.path.join(out, "adaptive-setup.txt")
+print("    " + (open(extra).read().strip() if os.path.exists(extra) else "prepare deadlock: ?") + "\n")
 
 # peaks: max tps over the thread counts, per skew and variant
 by_skew = defaultdict(dict)
