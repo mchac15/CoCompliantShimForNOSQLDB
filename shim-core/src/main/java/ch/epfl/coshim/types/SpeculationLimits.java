@@ -28,6 +28,11 @@ public record SpeculationLimits(int maxDepth, int maxFanout) {
     return maxDepth == NO_LIMIT && maxFanout == NO_LIMIT;
   }
 
+  /** Neither cap is 0: some speculation is allowed (0 makes it the non-speculative baseline). */
+  boolean allowsSpeculation() {
+    return maxDepth > 0 && maxFanout > 0;
+  }
+
   boolean limitsFanout() {
     return maxFanout != NO_LIMIT;
   }

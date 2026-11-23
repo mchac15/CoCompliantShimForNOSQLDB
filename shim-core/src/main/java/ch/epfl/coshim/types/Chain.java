@@ -201,7 +201,16 @@ class Chain<K, V> {
    * commit or abort that can make it fit wakes it up here). Such a wait is the baseline's: txn now
    * waits for txns that executed to commit, and their commits wait on prepare()/2PC, so the deadlock
    * prevention treats them as waited for, as when not speculative: wait-die dies if one of the txns
-   * it waits for (the ones that must commit, or the full one) is younger, wound-wait waits.
+   * it waits for (the ones that must commit, or the full one) is younger.
+   *
+   * <p>With wound-wait (or none), such a txn is granted anyway, past the caps, instead of waiting for
+   * a younger txn's commit. That younger txn is past started, so it cannot be wounded, and its commit
+   * may wait, in prepare() on another shim, for this txn's branch there: a cross-shim cycle that only
+   * lock_timeout breaks (the whole shim then stalls until it expires: seen with a fanout cap of 1).
+   * Waiting only for older txns' commits keeps every wait for a commit going from a younger txn to an
+   * older one, the direction of prepare()'s wait-die. A grant taken this way still counts the txn as a
+   * dependent (the fanout counts stay exact) and is counted as forced. Not with a cap of 0, which
+   * disables speculation: that one keeps the non-speculative baseline's waits.
    *
    * @param deadlineNanos a {@link System#nanoTime()} deadline
    * @param limits the caps on speculative grants
@@ -277,6 +286,15 @@ class Chain<K, V> {
         if (pred == null || pred.allHoldersIn(ready)) {
           List<Transaction<K, V>> b = new ArrayList<>();
           Refusal r = bounded ? admit(txn, limits, b) : null;
+          if (r != null && policy != DeadlockPolicy.WAIT_DIE && limits.allowsSpeculation() && hasYounger(txn, b)) {
+            // the refused grant would wait for a younger txn to commit: taken anyway (see awaitLockReady)
+            if (limits.limitsFanout()) {
+              txn.forceSpecDependencies(riskyAhead(txn.getLock(key).node()));
+            } else {
+              txn.forceSpecDependencies(List.of());   // counts the forced grant only
+            }
+            r = null;
+          }
           if (r == null) {
             txn.getLock(key).node().markGranted(txn);
             if (bounded) {

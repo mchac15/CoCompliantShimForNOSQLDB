@@ -72,6 +72,7 @@ public class Transaction<K, V> {
   private int limitedByDepth;
   private int limitedByFanout;
   private long limitedWaitNanos;
+  private int limitForced;
 
   /** @param expiresAtMillis null for a live txn, the absolute expiry time for a tombstone */
   public Transaction(String transactionId, Status status, Long expiresAtMillis) {
@@ -260,6 +261,28 @@ public class Transaction<K, V> {
       added.add(t);
     }
     return true;
+  }
+
+  /**
+   * A grant the limits refused but that is taken anyway (see {@link Chain#awaitLockReady}): counts
+   * this txn as a dependent of every txn of {@code on} it does not depend on yet, past the cap, so
+   * that their counts stay exact. Under the caller's chain monitor, as {@link #addSpecDependencies}.
+   */
+  synchronized void forceSpecDependencies(List<Transaction<K, V>> on) {
+    limitForced++;
+    if (status != Status.STARTED) {
+      return;
+    }
+    for (Transaction<K, V> t : on) {
+      if (dependsOn.add(t)) {
+        t.specDependents.incrementAndGet();
+      }
+    }
+  }
+
+  /** Statistics only: grants the limits refused but that were taken anyway (deadlock prevention). */
+  public synchronized int limitForced() {
+    return limitForced;
   }
 
   private boolean tryAddSpecDependent(int max) {
