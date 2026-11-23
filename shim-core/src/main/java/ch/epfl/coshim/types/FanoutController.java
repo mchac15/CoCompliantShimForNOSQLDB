@@ -8,11 +8,17 @@ import java.util.concurrent.atomic.LongAdder;
 
 /**
  * An adaptive fanout cap: a hill-climb of the fractional cap F on the shim's commit rate. Every
- * {@code period} it compares the commits of the period that just ended with those of the one before:
+ * {@code period} it compares the commit rate of the period that just ended with that of the one before
+ * (each measured after {@code settle}: the txns in flight at a change still ran under the old F):
  * if they fell by more than {@code eps}, the last step hurt and the direction reverses; otherwise it
  * keeps going. Then F moves one step, x (1 + step) up or / (1 + step) down, within [min, max] (at a
  * bound it turns around). The best static cap falls with the load (skew 0.99: 4 or more at 100
  * threads, 1 at 1000), so F should follow it.
+ *
+ * <p>The defaults are slow on purpose: with 1 s periods, +-15 % steps and a 2 % margin, the noise of a
+ * second's commit count (about +-6 % on the difference of two windows) exceeded the effect of a step
+ * (3-4 %), F random-walked (25-50 % of the steps reversed) and ended about the reverse of the best
+ * static caps (skew 0.95). Now 5 s periods (1 s of them settling), x 1.4 steps and a 5 % margin.
  *
  * <p>F is fractional: a writer's cap is drawn once, when a txn first asks to depend on it, as floor(F)
  * plus 1 with probability frac(F) (see {@link Transaction#specCap}): x.y dependents on average.
@@ -29,17 +35,25 @@ public final class FanoutController {
    * @param step a step's relative size: F x (1 + step) or F / (1 + step)
    * @param eps a drop of the commit rate counts only if larger than this share (noise)
    * @param period how often it steps
+   * @param settle the commits of a period's first {@code settle} are not counted (they still ran
+   *     under the previous F); shorter than the period
    */
-  public record Config(double start, double min, double max, double step, double eps, Duration period) {
-    public static final Config DEFAULT = new Config(4, 0.25, 8, 0.15, 0.02, Duration.ofSeconds(1));
+  public record Config(
+      double start, double min, double max, double step, double eps, Duration period, Duration settle) {
+    public static final Config DEFAULT =
+        new Config(4, 0.25, 8, 0.4, 0.05, Duration.ofSeconds(5), Duration.ofSeconds(1));
 
     public Config {
       Objects.requireNonNull(period);
+      Objects.requireNonNull(settle);
       if (!(min > 0 && min <= start && start <= max)) {
         throw new IllegalArgumentException("need 0 < min <= start <= max: " + min + ", " + start + ", " + max);
       }
       if (!(step > 0) || !(eps >= 0) || period.isNegative() || period.isZero()) {
         throw new IllegalArgumentException("step must be > 0, eps >= 0, period > 0");
+      }
+      if (settle.isNegative() || settle.compareTo(period) >= 0) {
+        throw new IllegalArgumentException("need 0 <= settle < period: " + settle + ", " + period);
       }
     }
   }
@@ -67,7 +81,9 @@ public final class FanoutController {
       long t0 = System.nanoTime();
       while (true) {
         try {
-          Thread.sleep(config.period().toMillis());
+          Thread.sleep(config.settle().toMillis());
+          commits.reset();   // what committed while settling still ran under the previous F
+          Thread.sleep(config.period().minus(config.settle()).toMillis());
         } catch (InterruptedException e) {
           return;
         }
@@ -97,7 +113,7 @@ public final class FanoutController {
 
   /** One hill-climb step; returns its log text. */
   String step() {
-    double rate = commits.sumThenReset() / (config.period().toNanos() / 1e9);
+    double rate = commits.sumThenReset() / (config.period().minus(config.settle()).toNanos() / 1e9);
     boolean reversed = lastRate >= 0 && rate < lastRate * (1 - config.eps());
     if (reversed) {
       direction = -direction;   // the last step made it worse: go back
@@ -115,7 +131,8 @@ public final class FanoutController {
 
   @Override
   public String toString() {
-    return String.format(Locale.ROOT, "auto (F %.2f in %.2f..%.2f, step %.2f, eps %.2f, every %d ms)",
-        config.start(), config.min(), config.max(), config.step(), config.eps(), config.period().toMillis());
+    return String.format(Locale.ROOT, "auto (F %.2f in %.2f..%.2f, step %.2f, eps %.2f, every %d ms, settle %d ms)",
+        config.start(), config.min(), config.max(), config.step(), config.eps(), config.period().toMillis(),
+        config.settle().toMillis());
   }
 }

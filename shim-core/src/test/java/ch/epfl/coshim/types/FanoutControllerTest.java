@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Test;
 class FanoutControllerTest {
 
   private static FanoutController controller(double start) {
-    return new FanoutController(new FanoutController.Config(start, 0.25, 8, 0.25, 0.02, Duration.ofSeconds(1)));
+    return new FanoutController(new FanoutController.Config(start, 0.25, 8, 0.25, 0.02, Duration.ofSeconds(1), Duration.ZERO));
   }
 
   private static void commits(FanoutController c, int n) {
