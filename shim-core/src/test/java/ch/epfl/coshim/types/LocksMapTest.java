@@ -914,6 +914,39 @@ class LocksMapTest {
   }
 
   @Test
+  void woundWaitTakesARefusedGrantRatherThanWaitForAYoungerTxnsCommit() {
+    // o (oldest) asks behind w (younger, executed, full): waiting for w's commit could close a
+    // cross-shim cycle through prepare(), so o is granted past the cap, at once, and counted
+    LocksMap<String, String> locks = limited(NONE, 1, DeadlockPolicy.WOUND_WAIT);
+    Transaction<String, String> o = txn("o", 1);
+    Transaction<String, String> w = txn("w", 2);
+    Transaction<String, String> r = txn("r", 3);
+    locks.lock("x", w, LockMode.EXCLUSIVE, LONG);
+    set(locks, w, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", r, LockMode.SHARED, LONG));
+    assertEquals(1, w.specDependents());
+
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", o, LockMode.SHARED, Duration.ofMillis(100)));
+    assertEquals(1, o.limitForced());
+    assertEquals(2, w.specDependents(), "a forced grant still counts as a dependent");
+  }
+
+  @Test
+  void woundWaitStillHoldsBackARefusedGrantBehindAnOlderTxn() {
+    LocksMap<String, String> locks = limited(NONE, 1, DeadlockPolicy.WOUND_WAIT);
+    Transaction<String, String> w = txn("w", 1);
+    Transaction<String, String> r = txn("r", 2);
+    Transaction<String, String> y = txn("y", 3);
+    locks.lock("x", w, LockMode.EXCLUSIVE, LONG);
+    set(locks, w, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", r, LockMode.SHARED, LONG));
+
+    assertEquals(LockResult.TIMED_OUT, locks.lock("x", y, LockMode.SHARED, Duration.ofMillis(100)));
+    assertEquals(0, y.limitForced());
+    assertEquals(1, w.specDependents());
+  }
+
+  @Test
   void aRefusedFanoutCountsNothing() {
     // X(a) <- X(b, rmw: depends on a) <- S(r): r depends on b and a, and a is full
     LocksMap<String, String> locks = limited(NONE, 1);

@@ -80,6 +80,8 @@ public final class ShimStats {
   private final LongAdder refusedDepth = new LongAdder();
   private final LongAdder refusedFanout = new LongAdder();
   private final LongAdder refusedWaitUs = new LongAdder();
+  /** Refused grants taken anyway, not to wait for a younger txn's commit (deadlock prevention). */
+  private final LongAdder refusedForced = new LongAdder();
   /** Running sums of (depth, saved µs) over the commits, for their Pearson correlation. */
   private double n, sx, sy, sxx, syy, sxy;
 
@@ -264,8 +266,10 @@ public final class ShimStats {
    * A resolved txn's lock calls the speculation limits held back (once per txn, at commit or abort).
    *
    * @param waitNanos from each one's first refusal to the end of its wait
+   * @param forced its refused grants taken anyway (see Chain#awaitLockReady)
    */
-  void limited(int byDepth, int byFanout, long waitNanos) {
+  void limited(int byDepth, int byFanout, long waitNanos, int forced) {
+    refusedForced.add(forced);
     refusedDepth.add(byDepth);
     refusedFanout.add(byFanout);
     refusedWaitUs.add(TimeUnit.NANOSECONDS.toMicros(waitNanos));
@@ -379,8 +383,9 @@ public final class ShimStats {
         committedLifetimeUs.sum(), committedLockWaitUs.sum(), committedPrepareWaitUs.sum(), committedPostVoteUs.sum(),
         abortedLockWaitUs.sum(), abortedPrepareWaitUs.sum()));
     sb.append(String.format(Locale.ROOT,
-        " spec_refused_depth_total=%d spec_refused_fanout_total=%d spec_refused_wait_us_total=%d",
-        refusedDepth.sum(), refusedFanout.sum(), refusedWaitUs.sum()));
+        " spec_refused_depth_total=%d spec_refused_fanout_total=%d spec_refused_wait_us_total=%d"
+            + " spec_refused_forced_total=%d",
+        refusedDepth.sum(), refusedFanout.sum(), refusedWaitUs.sum(), refusedForced.sum()));
     for (AbortCause cause : AbortCause.values()) {
       sb.append(" lost_").append(cause.name().toLowerCase()).append("_us_total=").append(lostUs(cause));
     }
