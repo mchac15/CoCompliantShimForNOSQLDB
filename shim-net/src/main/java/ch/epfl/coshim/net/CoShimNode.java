@@ -2,6 +2,7 @@ package ch.epfl.coshim.net;
 
 import ch.epfl.coshim.core.CoShim;
 import ch.epfl.coshim.core.NoCcShim;
+import ch.epfl.coshim.core.SpeculationAdmission;
 import ch.epfl.coshim.core.SpeculativeCoShim;
 import ch.epfl.coshim.store.KvStore;
 import ch.epfl.coshim.store.TableKey;
@@ -25,11 +26,21 @@ import java.util.concurrent.TimeUnit;
  * <pre>
  *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
  *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--stats-interval-s I] [--allow HOST ...]
- *       [--store memory|URL]
+ *       [--store memory|URL] [--adm-r-max X|auto] [--adm-tau-ms T] [--adm-probe P] [--adm-hysteresis H]
+ *       [--adm-prior-mean M] [--adm-prior-weight W]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
- *                         for the predecessors to commit, no cascades) | nocc (no concurrency
- *                         control); default nocc
+ *                         for the predecessors to commit, no cascades) | admission (speculative, but
+ *                         each txn speculates or not as SpeculationAdmission decides at its start)
+ *                         | nocc (no concurrency control); default nocc
+ *     --adm-r-max         admission: speculation goes off once the share of speculating txns that
+ *                         cascades abort exceeds this (plus the hysteresis); auto (default): the
+ *                         measured break-even saved / (saved + lost)
+ *     --adm-tau-ms        admission: decay time constant of that share; default 1000
+ *     --adm-probe         admission: share of txns that speculate while it is off; default 0.05
+ *     --adm-hysteresis    admission: half-width of the band around the threshold; default 0.02
+ *     --adm-prior-mean    admission: the share assumed without evidence; default 0.05
+ *     --adm-prior-weight  admission: how many outcomes that assumption is worth; default 3
  *     --databases         comma-separated database names; default "default"
  *     --lock-timeout-ms   lock_timeout of speculative/nonspeculative; default 200
  *     --deadlock          deadlock prevention of speculative/nonspeculative: wait-die (an older txn
@@ -59,7 +70,8 @@ public final class CoShimNode {
 
     /** The parsed command line. */
     record Options(int port, String shim, String[] databases, Duration lockTimeout, DeadlockPolicy deadlock,
-            boolean prepareWaitDie, long statsIntervalSeconds, Set<InetAddress> allowed, String store) {
+            boolean prepareWaitDie, long statsIntervalSeconds, Set<InetAddress> allowed, String store,
+            SpeculationAdmission.Config admission) {
 
         static Options parse(String[] args) throws Exception {
             int port = 7000;
@@ -73,6 +85,13 @@ public final class CoShimNode {
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
             String store = "memory";
+            SpeculationAdmission.Config adm = SpeculationAdmission.Config.DEFAULT;
+            double admRMax = adm.rMax();
+            long admTauMs = adm.tau().toMillis();
+            double admProbe = adm.probe();
+            double admHysteresis = adm.hysteresis();
+            double admPriorMean = adm.priorMean();
+            double admPriorWeight = adm.priorWeight();
             if (args.length > 0 && args[0].startsWith("--")) {
                 for (int i = 0; i < args.length; i++) {
                     String flag = args[i];
@@ -90,6 +109,12 @@ public final class CoShimNode {
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
                         case "--store" -> store = value;
+                        case "--adm-r-max" -> admRMax = value.equals("auto") ? Double.NaN : Double.parseDouble(value);
+                        case "--adm-tau-ms" -> admTauMs = Long.parseLong(value);
+                        case "--adm-probe" -> admProbe = Double.parseDouble(value);
+                        case "--adm-hysteresis" -> admHysteresis = Double.parseDouble(value);
+                        case "--adm-prior-mean" -> admPriorMean = Double.parseDouble(value);
+                        case "--adm-prior-weight" -> admPriorWeight = Double.parseDouble(value);
                         default -> throw new IllegalArgumentException("unknown option " + flag);
                     }
                 }
@@ -102,7 +127,9 @@ public final class CoShimNode {
                 }
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
-                    prepareWaitDie, statsIntervalSeconds, allowed, store);
+                    prepareWaitDie, statsIntervalSeconds, allowed, store,
+                    new SpeculationAdmission.Config(Duration.ofMillis(admTauMs), admRMax, admProbe, admHysteresis,
+                            admPriorMean, admPriorWeight));
         }
 
         private static boolean parsePrepareDeadlock(String value) {
@@ -139,6 +166,8 @@ public final class CoShimNode {
                         SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie);
                 case "nonspeculative" -> new SpeculativeCoShim<>(store, lockTimeout,
                         SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, false, deadlock, prepareWaitDie);
+                case "admission" -> new SpeculativeCoShim<>(store, lockTimeout,
+                        SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, deadlock, prepareWaitDie, admission);
                 case "nocc" -> new NoCcShim<>(store);
                 default -> throw new IllegalArgumentException("unknown shim " + shim);
             };
@@ -172,7 +201,8 @@ public final class CoShimNode {
                 options.allowed());
         System.out.println("coshim node (" + options.shim() + ", lock timeout " + options.lockTimeout().toMillis()
                 + " ms, " + options.deadlock().name().toLowerCase().replace('_', '-')
-                + (options.prepareWaitDie() ? ", prepare wait-die" : "") + ") on port " + server.getPort() + ", databases " + databases.keySet()
+                + (options.prepareWaitDie() ? ", prepare wait-die" : "")
+                + (options.shim().equals("admission") ? ", " + options.admission() : "") + ") on port " + server.getPort() + ", databases " + databases.keySet()
                 + ", store " + options.store()
                 + (options.allowed().isEmpty() ? "" : ", allowed clients " + options.allowed()));
 
@@ -180,6 +210,9 @@ public final class CoShimNode {
             if (shim instanceof SpeculativeCoShim<?, ?> speculative) {
                 System.out.println("stats " + name + ": " + speculative.stats());
                 System.out.println("speculation " + name + ": " + speculative.stats().speculationSummary());
+                if (speculative.admissionSummary() != null) {
+                    System.out.println("admission " + name + ": " + speculative.admissionSummary());
+                }
             }
         });
         Runtime.getRuntime().addShutdownHook(new Thread(printStats, "coshim-stats-final"));

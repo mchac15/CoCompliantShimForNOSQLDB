@@ -26,6 +26,9 @@ class Chain<K, V> {
   private static final Set<Status> MARKABLE = EnumSet.of(Status.STARTED, Status.EXECUTED);
   /** Holders already on their way out of the chain: they never stop a wound from unblocking. */
   private static final Set<Status> LEAVING = EnumSet.of(Status.MUST_ABORT, Status.ABORTED);
+  /** The speculation point: a holder this far no longer changes its write buffer. */
+  private static final Set<Status> EXECUTED_OR_LATER =
+      EnumSet.of(Status.EXECUTED, Status.PREPARED, Status.COMMITTING, Status.COMMITTED);
   /**
    * The predecessor holders prepare()'s wait-die never dies for: committed (the wait is over), committing
    * (decided, it commits without waiting for anyone), or leaving (it is released without waiting).
@@ -191,9 +194,28 @@ class Chain<K, V> {
       long deadlineNanos,
       DeadlockPolicy policy,
       List<Transaction<K, V>> victims) {
-    txn.setWaitingOn(this);   // statistics only, see abortAndRelease
+    return awaitLockReady(txn, ready, deadlineNanos, policy, victims, false);
+  }
+
+  /**
+   * @param commitWait speculation admission put txn in non-speculative mode: {@code ready} is
+   *     committed, but txn is granted anyway (speculatively, counted as forced) once every holder of
+   *     its predecessor reached the speculation point and one of them is younger than txn and may
+   *     still wait for someone. Otherwise txn would wait for a younger txn to commit, an edge the
+   *     purely speculative shim never has in lock(): that younger txn may wait, in prepare() on
+   *     another shim, for txn's branch there. With this, every wait for a commit goes from a younger
+   *     txn to an older one, like prepare()'s wait-die, so none closes a cycle.
+   */
+  synchronized WaitResult awaitLockReady(
+      Transaction<K, V> txn,
+      Set<Status> ready,
+      long deadlineNanos,
+      DeadlockPolicy policy,
+      List<Transaction<K, V>> victims,
+      boolean commitWait) {
+    txn.setWaitingOn(this);   // statistics, and the cascade's sparing of commit-waiters (abortAndRelease)
     try {
-      return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims);
+      return awaitPredecessor(txn, ready, true, deadlineNanos, policy, victims, commitWait);
     } finally {
       txn.setWaitingOn(null);
     }
@@ -244,7 +266,8 @@ class Chain<K, V> {
       boolean bounded,
       long deadlineNanos,
       DeadlockPolicy policy,
-      List<Transaction<K, V>> victims) {
+      List<Transaction<K, V>> victims,
+      boolean commitWait) {
     while (true) {
       if (txn.isDoomed()) {
         return WaitResult.DOOMED;
@@ -254,6 +277,13 @@ class Chain<K, V> {
         if (bounded) {
           recordGrant(txn, pred);
         }
+        return WaitResult.READY;
+      }
+      if (commitWait
+          && pred.allHoldersIn(EXECUTED_OR_LATER)
+          && pred.hasYoungerHolderNotIn(txn, PREPARE_NO_CYCLE)) {
+        txn.forcedGrant();   // see awaitLockReady
+        recordGrant(txn, pred);
         return WaitResult.READY;
       }
       if (bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, ready)) {
@@ -388,6 +418,12 @@ class Chain<K, V> {
    * @param cascade false for the non-speculative baseline: release only
    * @param marked receives every txn this call moved to must_abort (to wake them up)
    * @param doomedFinished receives those of them that were executed (the caller aborts them)
+   * <p>Speculation admission: the cascade spares a non-speculative txn still blocked in lock() on
+   * this key (commit-waiting, see {@link #awaitLockReady}): it has read nothing here, so nothing of
+   * txn's, and it waits on and is woken up by the release; that immunity is what not speculating
+   * buys. Not on an upgraded node, whose holder may have read the key as a reader before. Every txn
+   * is speculative without admission, so the cascade is then unchanged.
+   *
    * @param granted statistics only: for every holder met behind txn's node, whether it was met at
    *     least once on a node it had been granted (or upgraded to, having read the key): false means it
    *     was still blocked in lock() there, and had read nothing on that key
@@ -407,6 +443,9 @@ class Chain<K, V> {
         }
         for (Transaction<K, V> t : s.getHolders()) {
           granted.merge(t, s.isUpgraded() || !t.isWaitingOn(this), Boolean::logicalOr);
+          if (!t.isSpeculative() && !s.isUpgraded() && t.isWaitingOn(this)) {
+            continue;   // a commit-waiter: it read nothing here (see above)
+          }
           Status before = t.markMustAbort(MARKABLE, txn.rootCause());
           if (MARKABLE.contains(before)) {
             marked.add(t);
