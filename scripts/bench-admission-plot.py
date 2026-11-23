@@ -3,7 +3,8 @@
 speculative and non-speculative shims against admission / adaptive variants), from its summary.csv.
 
     scripts/bench-admission-plot.py DIR       # writes DIR/latency-throughput.png, DIR/throughput-threads.png
-                                              # and, with more than two cap configurations, DIR/peak-gain.png
+                                              # and, with more than two cap configurations, DIR/peak-gain.png;
+                                              # with at most 6 cells, DIR/tps-by-variant.png
 
 Small multiples: columns are skews, rows are the committed txns' latency p50 and p99 (first attempt's
 begin to commit, retries included, think time excluded; seconds, log scale), x is the throughput. Each
@@ -12,7 +13,9 @@ labelled at its ends. Color is the system (speculative, non-speculative, the can
 or the per-key adaptive cap); the candidate
 configurations share their color and differ by marker and dash. A label that would overlap one
 already drawn in its panel is left out. throughput-threads.png: the same lines as throughput against thread count,
-one panel per skew (where a system collapses under load).
+one panel per skew (where a system collapses under load). tps-by-variant.png (small sweeps, e.g. a
+pilot over a few cells): one panel per (threads, skew) cell, every variant's throughput as a
+horizontal bar, value at its end; the baselines in their colors, the candidates in theirs.
 
 With more than two cap configurations, those two figures show two of them: the best mean peak gain
 (over the skews), and of the others the highest mean throughput at the highest thread count (the
@@ -34,6 +37,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.ticker import FuncFormatter  # noqa: E402
+
+# a log axis in plain numbers (0.2, 1, 6) rather than powers of ten
+PLAIN = FuncFormatter(lambda y, _: f"{y:g}")
 
 # categorical slots 1-3 of the reference palette (validated all-pairs; slot 3 is below 3:1 on the
 # surface, so every line also has its own marker, a legend and an end label)
@@ -96,6 +103,9 @@ def plot(out):
         ts = [float(r["tps"]) for r in rows if r["variant"] == v and int(r["threads"]) == top]
         return sum(ts) / len(ts) if ts else -1
 
+    cells = sorted({(int(r["threads"]), r["skew"]) for r in rows}, key=lambda c: (float(c[1]), c[0]))
+    if len(cells) <= 6:
+        plot_bars(out, rows, cells, variants, {v: style(v, adaptive) for v in variants})
     if len(adaptive) > 2:
         if all(cap(v) for v in adaptive):   # a theta x tau grid of the per-key cap
             plot_gains(out, adaptive, skews, gain)
@@ -108,7 +118,7 @@ def plot(out):
 
     plt.rcParams.update({"font.size": 9, "axes.edgecolor": GRID, "axes.labelcolor": INK_MUTED,
                          "xtick.color": INK_MUTED, "ytick.color": INK_MUTED, "text.color": INK})
-    fig, axes = plt.subplots(len(ROWS), len(skews), figsize=(4.2 * len(skews), 3.4 * len(ROWS)),
+    fig, axes = plt.subplots(len(ROWS), len(skews), figsize=(max(4.2 * len(skews), 9), 3.4 * len(ROWS)),
                              sharey="row", squeeze=False, facecolor=SURFACE)
     candidates = []   # (axes, thread count, x, y, ha): placed once the layout is final
     for col, skew in enumerate(skews):
@@ -116,6 +126,8 @@ def plot(out):
             ax = axes[row][col]
             ax.set_facecolor(SURFACE)
             ax.set_yscale("log")
+            ax.yaxis.set_major_formatter(PLAIN)
+            ax.yaxis.set_minor_formatter(PLAIN)
             ax.grid(True, color=GRID, linewidth=0.6)
             ax.set_axisbelow(True)
             for spine in ("top", "right"):
@@ -142,7 +154,7 @@ def plot(out):
     handles = [Line2D([], [], color=styles[v]["color"], linestyle=styles[v]["linestyle"], linewidth=2,
                       marker=styles[v]["marker"], markersize=6, markeredgecolor=SURFACE, label=styles[v]["name"])
                for v in variants]
-    fig.legend(handles=handles, loc="upper center", ncol=len(handles), frameon=False,
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles) if len(skews) > 1 else (len(handles) + 1) // 2, frameon=False,
                bbox_to_anchor=(0.5, 1.0), fontsize=9)
     fig.text(0.5, 0.005, "Each line runs through the thread counts in increasing order; its end points are labelled "
              f"with their thread count. {workload(out)}tps: mean over the reps; latencies pooled.",
@@ -163,7 +175,7 @@ def plot(out):
     fig.savefig(target, dpi=150, facecolor=SURFACE)
     print(target)
 
-    fig, axes = plt.subplots(1, len(skews), figsize=(4.2 * len(skews), 3.4), squeeze=False, facecolor=SURFACE)
+    fig, axes = plt.subplots(1, len(skews), figsize=(max(4.2 * len(skews), 9), 3.4), squeeze=False, facecolor=SURFACE)
     for col, skew in enumerate(skews):
         ax = axes[0][col]
         ax.set_facecolor(SURFACE)
@@ -181,10 +193,42 @@ def plot(out):
         ax.set_xlabel("Threads")
         if col == 0:
             ax.set_ylabel("Throughput (committed txn/s)")
-    fig.legend(handles=handles, loc="upper center", ncol=len(handles), frameon=False,
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles) if len(skews) > 1 else (len(handles) + 1) // 2, frameon=False,
                bbox_to_anchor=(0.5, 1.0), fontsize=9)
     fig.tight_layout(rect=(0, 0, 1, 0.88))
     target = out / "throughput-threads.png"
+    fig.savefig(target, dpi=150, facecolor=SURFACE)
+    print(target)
+
+
+def plot_bars(out, rows, cells, variants, styles):
+    tps = {(int(r["threads"]), r["skew"], r["variant"]): float(r["tps"]) for r in rows}
+    fig, axes = plt.subplots(1, len(cells), figsize=(4.6 * len(cells), 0.42 * len(variants) + 1.6),
+                             squeeze=False, sharey=True, facecolor=SURFACE)
+    top = max(tps.values())
+    for col, (t, skew) in enumerate(cells):
+        ax = axes[0][col]
+        ax.set_facecolor(SURFACE)
+        for y, v in enumerate(variants):
+            x = tps.get((t, skew, v))
+            if x is None:
+                continue
+            ax.barh(y, x, height=0.62, color=styles[v]["color"])
+            ax.text(x + top * 0.01, y, f"{x:.0f}", va="center", fontsize=8, color=INK)
+        ax.set_yticks(range(len(variants)), [styles[v]["name"] for v in variants])
+        ax.invert_yaxis()
+        ax.set_xlim(0, top * 1.12)
+        ax.grid(True, axis="x", color=GRID, linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis="y", length=0)
+        for spine in ("top", "right", "left"):
+            ax.spines[spine].set_visible(False)
+        ax.set_title(f"{t} threads, skew {skew}", color=INK, fontsize=10)
+        ax.set_xlabel("Throughput (committed txn/s)")
+    fig.text(0.5, 0.005, workload(out) + "tps: mean over the reps.", ha="center", va="bottom", fontsize=7,
+             color=INK_MUTED, wrap=True)
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    target = out / "tps-by-variant.png"
     fig.savefig(target, dpi=150, facecolor=SURFACE)
     print(target)
 

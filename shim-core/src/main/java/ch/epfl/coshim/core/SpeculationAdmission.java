@@ -209,9 +209,11 @@ public final class SpeculationAdmission {
     return saved + lost <= 0 ? 1 : saved / (saved + lost);
   }
 
-  /** One line, key=value, for the node log. */
+  /**
+   * One line, key=value, for the node log. r and r* as of the last update (not decayed to now): the
+   * node logs it at shutdown too, after the load stopped, when they would only show the prior.
+   */
   public synchronized String summary() {
-    decayTo(System.nanoTime());
     StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
         "on=%d r=%.4f r_star=%.4f saved_us_mean=%.0f lost_us_mean=%.0f admitted_speculative=%d"
             + " admitted_probe=%d admitted_nonspeculative=%d forced_grants=%d switches=%d",
