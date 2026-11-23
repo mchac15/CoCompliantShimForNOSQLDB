@@ -27,6 +27,7 @@ Needs matplotlib (python -m venv .venv && .venv/bin/pip install matplotlib).
 """
 
 import csv
+import math
 import re
 import sys
 from pathlib import Path
@@ -41,6 +42,9 @@ from matplotlib.ticker import FuncFormatter  # noqa: E402
 
 # a log axis in plain numbers (0.2, 1, 6) rather than powers of ten
 PLAIN = FuncFormatter(lambda y, _: f"{y:g}")
+# minor ticks: only the 2x and 5x ones are labelled, so they never crowd
+PLAIN_MINOR = FuncFormatter(
+    lambda y, _: f"{y:g}" if y > 0 and round(y / 10 ** math.floor(math.log10(y))) in (2, 5) else "")
 
 # categorical slots 1-3 of the reference palette (validated all-pairs; slot 3 is below 3:1 on the
 # surface, so every line also has its own marker, a legend and an end label)
@@ -127,7 +131,7 @@ def plot(out):
             ax.set_facecolor(SURFACE)
             ax.set_yscale("log")
             ax.yaxis.set_major_formatter(PLAIN)
-            ax.yaxis.set_minor_formatter(PLAIN)
+            ax.yaxis.set_minor_formatter(PLAIN_MINOR)
             ax.grid(True, color=GRID, linewidth=0.6)
             ax.set_axisbelow(True)
             for spine in ("top", "right"):
