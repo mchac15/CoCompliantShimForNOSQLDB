@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -56,6 +57,16 @@ public class Transaction<K, V> {
   private int maxDepth;
   private int cascadeFanout;
   private int waitingMarks;
+  /**
+   * Speculation admission: whether lock() may grant this txn while the txns ahead are only executed
+   * (speculative mode, the default), or waits until they committed. Decided once, at start().
+   */
+  private volatile boolean speculative = true;
+  /** Grants a non-speculative txn took speculatively anyway, to keep commit-waits young -> old. */
+  private int forcedGrants;
+  /** The distinct uncommitted txns its grants depended on; dropped with the grants, counted on. */
+  private final Set<Transaction<?, ?>> dependencies = Collections.newSetFromMap(new IdentityHashMap<>());
+  private int dependencyCount;
   /** When this txn was created, in {@link System#nanoTime()}. */
   private final long createdAtNanos = System.nanoTime();
   /** How long prepare() waited for its predecessors to commit. */
@@ -243,7 +254,32 @@ public class Transaction<K, V> {
     maxDepth = Math.max(maxDepth, depth);
     if (!pending.isEmpty()) {
       grants.add(new Grant(System.nanoTime(), pending));
+      dependencies.addAll(pending);
+      dependencyCount = dependencies.size();
     }
+  }
+
+  /** Speculation admission's decision for this txn (see {@link #isSpeculative()}). */
+  public void setSpeculative(boolean speculative) {
+    this.speculative = speculative;
+  }
+
+  /** May lock() grant it on executed (not yet committed) predecessors? */
+  public boolean isSpeculative() {
+    return speculative;
+  }
+
+  synchronized void forcedGrant() {
+    forcedGrants++;
+  }
+
+  public synchronized int forcedGrants() {
+    return forcedGrants;
+  }
+
+  /** How many distinct uncommitted txns its grants depended on (still counted once resolved). */
+  public synchronized int dependencyCount() {
+    return dependencyCount;
   }
 
   /** The deepest dependency chain ahead of the txn at any of its lock grants (0: never speculated). */
@@ -282,6 +318,7 @@ public class Transaction<K, V> {
   public synchronized void markResolved() {
     resolvedAtNanos = System.nanoTime();
     grants.clear();
+    dependencies.clear();
   }
 
   public long createdAtNanos() {

@@ -13,6 +13,9 @@
 #   nonspeculative-mysql, ...          its database sI in SQL database sI on server I of the Sonata
 #                                      variants (same servers, same settings, same tables and keys,
 #                                      same statements; see SqlKvStore), refilled at node start
+#   admission-auto[-tau<T>], ...       the speculation admission shim (CoShimNode --shim admission) with
+#   admission-r<X>[-tau<T>]            --adm-r-max auto / X (and --adm-tau-ms T), on top of ADMISSION_ARGS:
+#                                      several admission configurations in one sweep (also -mysql/-pg)
 #   <shim variant>@wait-die,           a shim variant with that deadlock policy instead of DEADLOCK's
 #   <shim variant>@wound-wait          (e.g. speculative-pg@wound-wait); the label keeps the suffix
 #   sonata-mysql, sonata-pg            Sonata: SHIMS MySQL / PostgreSQL servers (scripts/bench-dbs.sh:
@@ -33,7 +36,8 @@
 #      counters at shutdown only; N: also every N s), PREPARE_DEADLOCK (none | wait-die: the nodes'
 #      --prepare-deadlock, default none), GC_LOGS (1: GC and safepoint logs of the nodes and of
 #      MicroBench, next to the node logs; the shim variants only), DEADLOCK (wait-die | wound-wait, default
-#      wait-die), VARIANTS ("speculative nonspeculative"),
+#      wait-die), VARIANTS ("speculative nonspeculative"), ADMISSION_ARGS (extra CoShimNode options of
+#      the admission variants only, e.g. "--adm-probe 0.1"; default: CoShimNode's),
 #      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o), and
 #      scripts/bench-dbs.sh's MYSQL_PORT, PG_PORT, ...
 # Exit code 1 if any run printed a warning or failed its audit.
@@ -144,6 +148,15 @@ for rep in $(seq 1 "$reps"); do
         shim="${shim%-pg}"              # -> speculative
         policy="$deadlock"
         [[ $variant != *@* ]] || policy="${variant#*@}"
+        admission_args=()
+        if [[ $shim =~ ^admission-(auto|r([0-9.]+))(-tau([0-9]+))?$ ]]; then   # admission-r0.15-tau1000
+            read -r -a admission_args <<< "${ADMISSION_ARGS:-}"
+            admission_args+=(--adm-r-max "${BASH_REMATCH[2]:-auto}")
+            [[ -z ${BASH_REMATCH[4]} ]] || admission_args+=(--adm-tau-ms "${BASH_REMATCH[4]}")
+            shim=admission
+        elif [[ $shim == admission ]]; then
+            read -r -a admission_args <<< "${ADMISSION_ARGS:-}"
+        fi
         for ((s = 0; s < shims; s++)); do
             port=$((base_port + s))
             store=memory
@@ -160,6 +173,7 @@ for rep in $(seq 1 "$reps"); do
             fi
             java ${node_gc[@]+"${node_gc[@]}"} -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "$shim" --databases "s$s" \
                 --lock-timeout-ms "$lock_timeout" --deadlock "$policy" --prepare-deadlock "${PREPARE_DEADLOCK:-none}" --stats-interval-s "${STATS_INTERVAL_S:-0}" --store "$store" \
+                ${admission_args[@]+"${admission_args[@]}"} \
                 > "$logs/rep$rep-$variant-s$s.log" 2>&1 &
             nodes+=($!)
             until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do

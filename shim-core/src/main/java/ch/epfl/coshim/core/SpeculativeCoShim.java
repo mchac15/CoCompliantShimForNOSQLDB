@@ -27,6 +27,10 @@ import java.util.regex.Pattern;
  * <p>With {@code speculative = false} it is the non-speculative baseline: plain strict 2PL, where
  * lock() waits until the predecessors committed instead of executed. Same code otherwise, so a
  * benchmark of the two isolates what speculation buys (shorter lock waits) and costs (cascades).
+ *
+ * <p>With a {@link SpeculationAdmission} it decides per txn, at start(), whether that txn
+ * speculates, from how often speculating txns have been cascade-aborted lately: speculating where it
+ * pays, and not where cascades would make it collapse.
  */
 public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   /** Above Seata's default 60 s global transaction timeout (pseudo.txt tombstone_ttl). */
@@ -48,6 +52,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   private final Duration tombstoneTtl;
   private final LocksMap<K, V> locksMap;
   private final ShimStats stats = new ShimStats();
+  /** Null: every txn speculates (if speculative). */
+  private final SpeculationAdmission admission;
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
   /** Hands out txn ages at start(): a later start() is younger. */
   private final AtomicLong timestampGenerator = new AtomicLong();
@@ -104,6 +110,22 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       boolean speculative,
       DeadlockPolicy deadlockPolicy,
       boolean prepareWaitDie) {
+    this(store, lockTimeout, tombstoneTtl, speculative, deadlockPolicy, prepareWaitDie, null);
+  }
+
+  /**
+   * @param admission per-txn speculation (see {@link SpeculationAdmission}); null: every txn
+   *     speculates. Needs {@code speculative}
+   */
+  public SpeculativeCoShim(
+      KvStore<K, V> store,
+      Duration lockTimeout,
+      Duration tombstoneTtl,
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      boolean prepareWaitDie,
+      SpeculationAdmission.Config admission) {
+    this.admission = admission != null ? new SpeculationAdmission(admission) : null;
     this.globalAges = prepareWaitDie;
     // a wound-wait victim is already must_abort: abort_transaction releases its locks, on the
     // wounder's thread, outside any latch
@@ -112,7 +134,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
             speculative,
             Objects.requireNonNull(deadlockPolicy),
             victim -> abortTransaction(victim, AbortCause.WOUNDED),
-            prepareWaitDie);
+            prepareWaitDie,
+            admission != null);
     this.store = Objects.requireNonNull(store);
     this.lockTimeout = Objects.requireNonNull(lockTimeout);
     this.tombstoneTtl = Objects.requireNonNull(tombstoneTtl);
@@ -166,6 +189,9 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   @Override
   public Outcome start(String txnId) {
     Transaction<K, V> txn = new Transaction<>(txnId, Status.STARTED, null, globalAge(txnId));
+    if (admission != null) {
+      txn.setSpeculative(admission.admit());   // before any lock: decided once per txn
+    }
     if (transactionsMap.putIfAbsent(txnId, txn) != null) {
       return Outcome.FAILED; // already registered or tombstone
     }
@@ -314,6 +340,12 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
     stats.committed(txn.maxDepth(), grants, saved, txn.prepareWaitNanos());
+    if (admission != null) {
+      if (txn.maxDepth() > 0) {   // it speculated
+        admission.speculatedCommitted(saved, txn.dependencyCount());
+      }
+      admission.forcedGrants(txn.forcedGrants());
+    }
     long now = System.nanoTime();
     stats.committedBudget(now - txn.createdAtNanos(), txn.lockWaitNanos(), txn.prepareWaitNanos(),
         now - txn.votedAtNanos());
@@ -349,6 +381,11 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   /** Commit and abort counters, by abort cause. */
   public ShimStats stats() {
     return stats;
+  }
+
+  /** Speculation admission's state and counters (one key=value line), or null without admission. */
+  public String admissionSummary() {
+    return admission == null ? null : admission.summary();
   }
 
   private static AbortCause lockFailure(LockResult res) {
@@ -398,6 +435,14 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     stats.cascadeMarks(txn.cascadeFanout(), doomed.size(), txn.waitingMarks());
     if (finalCause == AbortCause.CASCADE) {
       stats.cascadeVictim(root, lifetime);
+    }
+    if (admission != null) {
+      // maxDepth outlives markResolved: > 0 iff it speculated. Other causes are not counted: they
+      // abort with or without speculation
+      if (finalCause == AbortCause.CASCADE && txn.maxDepth() > 0) {
+        admission.speculatedCascaded(lifetime, txn.dependencyCount());
+      }
+      admission.forcedGrants(txn.forcedGrants());
     }
     transactionsMap.remove(txn.getTransactionId(), txn);
     int victims = txn.cascadeFanout();

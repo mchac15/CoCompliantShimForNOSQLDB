@@ -92,6 +92,12 @@ public class LocksMap<K, V> {
   private final Consumer<Transaction<K, V>> woundHandler;
   /** prepare() dies instead of waiting for a younger txn (cross-shim deadlock prevention). */
   private final boolean prepareWaitDie;
+  /**
+   * Speculation admission: each txn speculates or not as its {@link Transaction#isSpeculative()}
+   * says; a non-speculative one waits in lock() until its predecessors committed (see {@link
+   * Chain#awaitLockReady}). Needs {@code speculative}.
+   */
+  private final boolean admission;
 
   /** Outcome of prepare()'s wait for the predecessors to commit. */
   public static enum PrepareWait {
@@ -136,6 +142,20 @@ public class LocksMap<K, V> {
       DeadlockPolicy deadlockPolicy,
       Consumer<Transaction<K, V>> woundHandler,
       boolean prepareWaitDie) {
+    this(speculative, deadlockPolicy, woundHandler, prepareWaitDie, false);
+  }
+
+  /** @param admission per-txn speculation (see {@link #admission}); needs {@code speculative} */
+  public LocksMap(
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      Consumer<Transaction<K, V>> woundHandler,
+      boolean prepareWaitDie,
+      boolean admission) {
+    if (admission && !speculative) {
+      throw new IllegalArgumentException("speculation admission needs a speculative lock table");
+    }
+    this.admission = admission;
     this.prepareWaitDie = prepareWaitDie;
     this.speculative = speculative;
     this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
@@ -145,7 +165,8 @@ public class LocksMap<K, V> {
 
   /**
    * lock(k, mode, txn) and upgrade(k, txn): takes the lock, then waits (at most {@code timeout})
-   * until every holder of its predecessor is at least executed (committed if not speculative). On
+   * until every holder of its predecessor is at least executed (committed if not speculative, or for
+   * a txn speculation admission made non-speculative). On
    * MUST_ABORT / TIMED_OUT the caller runs abort_transaction(txn).
    */
   public LockResult lock(K key, Transaction<K, V> txn, LockMode mode, Duration timeout) {
@@ -318,7 +339,9 @@ public class LocksMap<K, V> {
   private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline) {
     while (true) {
       List<Transaction<K, V>> victims = new ArrayList<>();
-      switch (chain.awaitLockReady(txn, lockReady, deadline, deadlockPolicy, victims)) {
+      boolean commitWait = admission && !txn.isSpeculative();
+      switch (chain.awaitLockReady(txn, commitWait ? RESOLVED : lockReady, deadline, deadlockPolicy, victims,
+          commitWait)) {
         case READY -> {
           return LockResult.ACQUIRED;
         }
