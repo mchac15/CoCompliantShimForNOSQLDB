@@ -12,8 +12,9 @@ configurations share their color and differ by marker and dash. A label that wou
 already drawn in its panel is left out. throughput-threads.png: the same lines as throughput against thread count,
 one panel per skew (where a system collapses under load).
 
-With more than two cap configurations, those two figures show the two with the best mean peak gain
-(over the skews), and peak-gain.png has them all: per skew, a theta x tau grid of each configuration's
+With more than two cap configurations, those two figures show two of them: the best mean peak gain
+(over the skews), and of the others the highest mean throughput at the highest thread count (the
+one that resists a collapse best); peak-gain.png has them all: per skew, a theta x tau grid of each configuration's
 peak throughput (best thread count) relative to the better of the two baselines' peaks (diverging:
 blue better, red worse, gray no change; blank: not run).
 
@@ -80,9 +81,16 @@ def plot(out):
         gs = [g for g in (gain(v, s) for s in skews) if g is not None]
         return sum(gs) / len(gs) if gs else -1
 
+    def tps_at_max_threads(v):
+        top = max(int(r["threads"]) for r in rows)
+        ts = [float(r["tps"]) for r in rows if r["variant"] == v and int(r["threads"]) == top]
+        return sum(ts) / len(ts) if ts else -1
+
     if len(adaptive) > 2:
         plot_gains(out, adaptive, skews, gain)
-        shown = sorted(adaptive, key=mean_gain, reverse=True)[:2]
+        # the trade-off: the best one at the peak, and of the others the best one under the highest load
+        best_peak = max(adaptive, key=mean_gain)
+        shown = [best_peak, max((v for v in adaptive if v != best_peak), key=tps_at_max_threads)]
         variants = baselines + [v for v in adaptive if v in shown]
         adaptive = [v for v in adaptive if v in shown]
     styles = {v: style(v, adaptive) for v in variants}
