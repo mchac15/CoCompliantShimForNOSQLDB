@@ -13,12 +13,16 @@
 # the databases, like the shim's in-memory store, do not pay for durability:
 #   MySQL: innodb_flush_log_at_trx_commit=0, sync_binlog=0, innodb_flush_method=nosync
 #   PG:    fsync=off, synchronous_commit=off, full_page_writes=off
+# FSYNC=1 starts them durable instead, with the servers' defaults (MySQL innodb_flush_log_at_trx_commit=1,
+# sync_binlog=1, the default flush method; PG fsync, synchronous_commit and full_page_writes on): every
+# commit, and every XA / 2PC prepare, then waits for its log flush.
 # Memory sizes are scaled down to fit one machine (Acta's are 32G buffer pool / 32GB shared_buffers
 # per server); set them back with the variables below on a large machine.
 #
 # Env: MYSQL_PORT (3306), PG_PORT (5432), MYSQL_IMAGE (mysql:8.4), POSTGRES_IMAGE (postgres:16),
 #      MYSQL_BUFFER_POOL (2G), PG_SHARED_BUFFERS (2GB), PG_SHM_SIZE (4g),
-#      MYSQL_LOCK_WAIT_TIMEOUT_S (60), PG_LOCK_TIMEOUT (60s): how long a lock wait lasts on the servers.
+#      MYSQL_LOCK_WAIT_TIMEOUT_S (60), PG_LOCK_TIMEOUT (60s): how long a lock wait lasts on the servers,
+#      FSYNC (0; 1: durable, see above).
 set -euo pipefail
 
 cmd="${1:-}"
@@ -58,6 +62,8 @@ clear_stale_endpoint() {
 
 start_mysql() {
     local i="$1" port=$((base_port + $1))
+    local durability=(--innodb-flush-log-at-trx-commit=0 --sync-binlog=0 --innodb-flush-method=nosync)
+    [[ ${FSYNC:-0} != 1 ]] || durability=(--innodb-flush-log-at-trx-commit=1 --sync-binlog=1)
     clear_stale_endpoint "$i"
     docker run -d --rm --name "$(name "$i")" --network host \
         -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=acta \
@@ -68,11 +74,13 @@ start_mysql() {
         --innodb-use-native-aio=OFF \
         --innodb-buffer-pool-size="${MYSQL_BUFFER_POOL:-2G}" \
         --innodb-redo-log-capacity=4G \
-        --innodb-flush-log-at-trx-commit=0 --sync-binlog=0 --innodb-flush-method=nosync > /dev/null
+        "${durability[@]}" > /dev/null
 }
 
 start_postgres() {
     local i="$1" port=$((base_port + $1))
+    local durability=(-c fsync=off -c synchronous_commit=off -c full_page_writes=off)
+    [[ ${FSYNC:-0} != 1 ]] || durability=(-c fsync=on -c synchronous_commit=on -c full_page_writes=on)
     clear_stale_endpoint "$i"
     docker run -d --rm --name "$(name "$i")" --network host --shm-size="${PG_SHM_SIZE:-4g}" \
         -e POSTGRES_USER=acta -e POSTGRES_DB=acta -e POSTGRES_HOST_AUTH_METHOD=trust \
@@ -90,7 +98,7 @@ start_postgres() {
         -c max_wal_size=8GB \
         -c checkpoint_timeout=15min \
         -c checkpoint_completion_target=0.9 \
-        -c fsync=off -c synchronous_commit=off -c full_page_writes=off > /dev/null
+        "${durability[@]}" > /dev/null
 }
 
 ready() {

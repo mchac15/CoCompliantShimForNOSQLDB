@@ -217,7 +217,7 @@ if [[ ! -f "$out/setup.txt" ]]; then
         echo "threads:   $threads_list   skews: $skews   reps: $reps   participants: $shims"
         echo "options:   --warmup-s ${WARMUP_S:-10} --measure-s ${MEASURE_S:-30} --txn-timeout-ms $txn_timeout ${workload[*]} $*"
         echo "timeouts:  lock waits $lock_timeout ms (shim nodes; servers ${db_lock_timeout_s} s), TC $txn_timeout ms"
-        echo "servers:   scripts/bench-dbs.sh (MySQL ${MYSQL_IMAGE:-mysql:8.4}, PG ${POSTGRES_IMAGE:-postgres:16}, fsync off)"
+        echo "servers:   scripts/bench-dbs.sh (MySQL ${MYSQL_IMAGE:-mysql:8.4}, PG ${POSTGRES_IMAGE:-postgres:16}, fsync $([[ ${FSYNC:-0} == 1 ]] && echo on || echo off))"
     } > "$out/setup.txt"
 fi
 cat "$out/setup.txt"
