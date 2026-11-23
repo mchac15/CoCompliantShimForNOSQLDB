@@ -356,7 +356,7 @@ class Chain<K, V> {
     }
     if (!risky.isEmpty()
         && limits.limitsFanout()
-        && !txn.addSpecDependencies(risky, limits.maxFanout(), blockers)) {
+        && !txn.addSpecDependencies(risky, limits, blockers)) {
       return Refusal.FANOUT;
     }
     return null;

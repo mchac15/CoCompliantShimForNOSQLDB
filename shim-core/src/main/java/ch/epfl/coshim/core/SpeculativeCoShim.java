@@ -6,6 +6,7 @@ import ch.epfl.coshim.types.DeadlockPolicy;
 import ch.epfl.coshim.types.LockType;
 import ch.epfl.coshim.types.LocksMap;
 import ch.epfl.coshim.types.LocksMap.LockResult;
+import ch.epfl.coshim.types.FanoutController;
 import ch.epfl.coshim.types.SpeculationLimits;
 import ch.epfl.coshim.types.Transaction;
 import ch.epfl.coshim.types.Transaction.Status;
@@ -48,6 +49,10 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   private final Duration lockTimeout;
   private final Duration tombstoneTtl;
   private final LocksMap<K, V> locksMap;
+  /** Names the shims' fanout controllers in the log. */
+  private static final AtomicLong SHIM_IDS = new AtomicLong();
+  /** The adaptive fanout cap's controller, this shim's own; null without one. */
+  private final FanoutController fanout;
   private final ShimStats stats = new ShimStats();
   private final Map<String, Transaction<K, V>> transactionsMap = new ConcurrentHashMap<>();
   /** Hands out txn ages at start(): a later start() is younger. */
@@ -122,6 +127,11 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       DeadlockPolicy deadlockPolicy,
       boolean prepareWaitDie,
       SpeculationLimits limits) {
+    limits = limits.forShim();   // an adaptive fanout cap gets a controller of its own
+    this.fanout = limits.fanout();
+    if (fanout != null) {
+      fanout.start("s" + SHIM_IDS.incrementAndGet());
+    }
     this.globalAges = prepareWaitDie;
     // a wound-wait victim is already must_abort: abort_transaction releases its locks, on the
     // wounder's thread, outside any latch
@@ -334,6 +344,9 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     txn.setStatus(Status.COMMITTED);
     transactionsMap.remove(txnId, txn);
     stats.committed(txn.maxDepth(), grants, saved, txn.prepareWaitNanos());
+    if (fanout != null) {
+      fanout.committed();
+    }
     stats.limited(txn.limitedByDepth(), txn.limitedByFanout(), txn.limitedWaitNanos(), txn.limitForced());
     long now = System.nanoTime();
     stats.committedBudget(now - txn.createdAtNanos(), txn.lockWaitNanos(), txn.prepareWaitNanos(),

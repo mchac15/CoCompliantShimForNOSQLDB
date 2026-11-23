@@ -7,6 +7,7 @@ import ch.epfl.coshim.store.KvStore;
 import ch.epfl.coshim.store.TableKey;
 import ch.epfl.coshim.store.sql.KvStores;
 import ch.epfl.coshim.types.DeadlockPolicy;
+import ch.epfl.coshim.types.FanoutController;
 import ch.epfl.coshim.types.SpeculationLimits;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -27,6 +28,8 @@ import java.util.concurrent.TimeUnit;
  *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
  *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--spec-max-depth D] [--spec-max-fanout F]
  *       [--stats-interval-s I] [--allow HOST ...] [--store memory|URL]
+ *       [--spec-fanout-start F] [--spec-fanout-min F] [--spec-fanout-max F] [--spec-fanout-step S]
+ *       [--spec-fanout-eps E] [--spec-fanout-period-ms T]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | nocc (no concurrency
@@ -44,7 +47,11 @@ import java.util.concurrent.TimeUnit;
  *                         lock grant on its key, or the grant waits for them to commit (0: no
  *                         speculation); default none (no cap)
  *     --spec-max-fanout   speculative only: at most F running txns depending speculatively on one
- *                         txn, or the grant waits; default none (no cap)
+ *                         txn, or the grant waits; auto: an adaptive fractional cap, hill-climbed on
+ *                         the shim's commit rate (see FanoutController, the --spec-fanout-* options
+ *                         below; one "fanout" log line per step); default none (no cap)
+ *     --spec-fanout-*     auto's start (4), min (0.25), max (8), step (0.15: F x 1.15 or / 1.15),
+ *                         eps (0.02: a drop of the commit rate counts above 2 %), period-ms (1000)
  *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
  *     --allow             a client address allowed to connect (e.g. an RM host), repeatable; default:
  *                         any authenticated client
@@ -79,6 +86,10 @@ public final class CoShimNode {
             boolean prepareWaitDie = false;
             int maxDepth = SpeculationLimits.NO_LIMIT;
             int maxFanout = SpeculationLimits.NO_LIMIT;
+            boolean autoFanout = false;
+            FanoutController.Config fc = FanoutController.Config.DEFAULT;
+            double fStart = fc.start(), fMin = fc.min(), fMax = fc.max(), fStep = fc.step(), fEps = fc.eps();
+            long fPeriodMs = fc.period().toMillis();
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
             String store = "memory";
@@ -97,7 +108,16 @@ public final class CoShimNode {
                         case "--deadlock" -> deadlock = parseDeadlock(value);
                         case "--prepare-deadlock" -> prepareWaitDie = parsePrepareDeadlock(value);
                         case "--spec-max-depth" -> maxDepth = parseLimit(value);
-                        case "--spec-max-fanout" -> maxFanout = parseLimit(value);
+                        case "--spec-max-fanout" -> {
+                            autoFanout = value.equals("auto");
+                            maxFanout = autoFanout ? SpeculationLimits.NO_LIMIT : parseLimit(value);
+                        }
+                        case "--spec-fanout-start" -> fStart = Double.parseDouble(value);
+                        case "--spec-fanout-min" -> fMin = Double.parseDouble(value);
+                        case "--spec-fanout-max" -> fMax = Double.parseDouble(value);
+                        case "--spec-fanout-step" -> fStep = Double.parseDouble(value);
+                        case "--spec-fanout-eps" -> fEps = Double.parseDouble(value);
+                        case "--spec-fanout-period-ms" -> fPeriodMs = Long.parseLong(value);
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
                         case "--store" -> store = value;
@@ -113,7 +133,12 @@ public final class CoShimNode {
                 }
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
-                    prepareWaitDie, new SpeculationLimits(maxDepth, maxFanout), statsIntervalSeconds, allowed, store);
+                    prepareWaitDie,
+                    new SpeculationLimits(maxDepth, maxFanout, autoFanout
+                            ? new FanoutController(new FanoutController.Config(fStart, fMin, fMax, fStep, fEps,
+                                    Duration.ofMillis(fPeriodMs)))
+                            : null),
+                    statsIntervalSeconds, allowed, store);
         }
 
         /** A speculation limit: a non-negative count, or none. */

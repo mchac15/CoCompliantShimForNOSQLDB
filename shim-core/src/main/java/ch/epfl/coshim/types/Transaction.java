@@ -49,6 +49,8 @@ public class Transaction<K, V> {
   private final Set<Transaction<K, V>> dependsOn = new HashSet<>();
   /** Speculation limiter (fanout): the running txns counted in their {@code dependsOn}. */
   private final AtomicInteger specDependents = new AtomicInteger();
+  /** Adaptive fanout cap: this txn's own cap as a writer, drawn once (-1: not yet). */
+  private final AtomicInteger specCap = new AtomicInteger(-1);
 
   /** A lock granted while the txns ahead on its chain were not all committed yet (speculation). */
   private record Grant(long atNanos, List<? extends Transaction<?, ?>> pending) {}
@@ -239,7 +241,7 @@ public class Transaction<K, V> {
    *     longer started (nothing recorded: it is doomed, its wait loop sees it)
    */
   synchronized boolean addSpecDependencies(
-      List<Transaction<K, V>> on, int max, List<Transaction<K, V>> full) {
+      List<Transaction<K, V>> on, SpeculationLimits limits, List<Transaction<K, V>> full) {
     if (status != Status.STARTED) {
       return true;
     }
@@ -248,7 +250,7 @@ public class Transaction<K, V> {
       if (dependsOn.contains(t)) {
         continue;
       }
-      if (!t.tryAddSpecDependent(max)) {
+      if (!t.tryAddSpecDependent(limits.fanoutCap(t))) {
         // no wake-up for the decrements: a txn refused meanwhile on t retries at t's next change
         for (Transaction<K, V> a : added) {
           a.specDependents.decrementAndGet();
@@ -283,6 +285,20 @@ public class Transaction<K, V> {
   /** Statistics only: grants the limits refused but that were taken anyway (deadlock prevention). */
   public synchronized int limitForced() {
     return limitForced;
+  }
+
+  /**
+   * This txn's cap as a writer under an adaptive fanout cap: drawn from the controller's current
+   * fractional value the first time it is asked, then fixed (a refused dependent re-checks on every
+   * wake-up, and would otherwise get through by drawing again).
+   */
+  int specCap(FanoutController controller) {
+    int cap = specCap.get();
+    if (cap < 0) {
+      specCap.compareAndSet(-1, controller.drawCap());
+      cap = specCap.get();
+    }
+    return cap;
   }
 
   private boolean tryAddSpecDependent(int max) {
