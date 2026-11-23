@@ -8,6 +8,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A txn of pseudo.txt. Its monitor ({@code synchronized (txn)}) guards {@code status} and {@code
@@ -67,6 +68,12 @@ public class Transaction<K, V> {
   /** The distinct uncommitted txns its grants depended on; dropped with the grants, counted on. */
   private final Set<Transaction<?, ?>> dependencies = Collections.newSetFromMap(new IdentityHashMap<>());
   private int dependencyCount;
+  /**
+   * Speculation admission's reach of a commit: the distinct txns granted a lock behind this one while
+   * it was uncommitted (its early finish let them through earlier). Atomic: incremented by those
+   * txns under their own monitor, never this one's.
+   */
+  private final AtomicInteger dependents = new AtomicInteger();
   /** When this txn was created, in {@link System#nanoTime()}. */
   private final long createdAtNanos = System.nanoTime();
   /** How long prepare() waited for its predecessors to commit. */
@@ -254,7 +261,11 @@ public class Transaction<K, V> {
     maxDepth = Math.max(maxDepth, depth);
     if (!pending.isEmpty()) {
       grants.add(new Grant(System.nanoTime(), pending));
-      dependencies.addAll(pending);
+      for (Transaction<?, ?> t : pending) {
+        if (dependencies.add(t)) {
+          t.dependents.incrementAndGet();   // once per (this txn, t)
+        }
+      }
       dependencyCount = dependencies.size();
     }
   }
@@ -280,6 +291,11 @@ public class Transaction<K, V> {
   /** How many distinct uncommitted txns its grants depended on (still counted once resolved). */
   public synchronized int dependencyCount() {
     return dependencyCount;
+  }
+
+  /** How many distinct txns were granted a lock behind this one while it was uncommitted. */
+  public int dependents() {
+    return dependents.get();
   }
 
   /** The deepest dependency chain ahead of the txn at any of its lock grants (0: never speculated). */

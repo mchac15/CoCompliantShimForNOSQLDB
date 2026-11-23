@@ -69,10 +69,12 @@ def style(variant, adaptive_order):
         return dict(color=ORANGE, marker="s", linestyle="-", name="Non-speculative")
     m = cap(variant)
     marker, dash = ADAPTIVE_STYLES[adaptive_order.index(variant) % len(ADAPTIVE_STYLES)]
-    a = re.fullmatch(r"admission-(auto|r([0-9.]+))(?:-tau(\d+))?", system)
+    a = re.fullmatch(r"admission-(auto|r([0-9.]+))(?:-tau(\d+))?(?:-w([0-9.]+))?(?:-reach(\d+))?", system)
     if a:
         name = ("Admission r*=saved/(saved+lost)" if a.group(1) == "auto" else f"Admission r*={a.group(2)}") \
-            + (f", τ={int(a.group(3)) / 1000:g} s" if a.group(3) else "")
+            + (f", τ={int(a.group(3)) / 1000:g} s" if a.group(3) else "") \
+            + ("" if a.group(4) is None else ", switch" if float(a.group(4)) == 0 else f", ramp ±{a.group(4)}") \
+            + ("" if a.group(5) is None else ", no reach" if a.group(5) == "0" else f", reach ≤{a.group(5)}")
     elif m:
         name = f"Adaptive θ={m.group(1)}" + (f", τ={int(m.group(2)) / 1000:g} s" if m.group(2) else "")
     else:

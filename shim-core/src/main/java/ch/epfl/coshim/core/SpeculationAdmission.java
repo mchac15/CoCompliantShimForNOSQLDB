@@ -21,13 +21,18 @@ import java.util.concurrent.atomic.LongAdder;
  * aborted for another cause (wounded, timed out, prepare wait-die, a coordinator abort) are not
  * counted: they abort with or without speculation.
  *
- * <p>A txn speculates iff speculation is on: off once {@code r > r* + hysteresis}, on again once
- * {@code r < r* - hysteresis}. While it is off, a share {@code probe} of the txns speculates anyway,
- * so that {@code r} keeps measuring what speculating costs now (with no speculating txn it could
- * never come back on). The threshold {@code r*} is fixed ({@code rMax}), or with {@code rMax} NaN
- * set by the measured costs: speculating pays while {@code (1 - r) * saved > r * lost}, i.e. {@code
- * r* = saved / (saved + lost)}, with {@code saved} the mean lock wait a speculative commit avoided
- * and {@code lost} the mean lifetime of a cascade-aborted speculating txn (both decayed as r).
+ * <p>Graded, not on/off: a txn speculates with probability {@code p}, {@code pMax} while {@code r <=
+ * r* - width}, {@code pMin} once {@code r >= r* + width}, and linear in between; {@code pMin > 0}
+ * keeps some txns speculating so that {@code r} keeps measuring what speculating costs now. {@code
+ * width = 0} is a hard switch at {@code r*}.
+ *
+ * <p>The threshold {@code r*} is fixed ({@code rMax}), or with {@code rMax} NaN set by the measured
+ * costs: speculating pays while {@code (1 - r) * saved > r * lost}, i.e. {@code r* = saved / (saved +
+ * lost)}, with {@code saved} the mean lock wait a speculative commit avoided and {@code lost} the
+ * mean lifetime of a cascade-aborted speculating txn (both decayed as r). Each outcome is weighted by
+ * its reach, capped at {@code reachCap} (0: no weighting): a speculative commit's saved time by (1 +
+ * the txns granted behind it while it was uncommitted, which its early finish let through earlier),
+ * a cascaded one's lifetime by (1 + the txns its own abort doomed directly).
  *
  * <p>Statistics only: the outcomes are also kept cumulatively by {@code k}, the number of distinct
  * uncommitted txns the branch depended on (1, 2, 3+), to see whether a per-grant budget on k would
@@ -40,14 +45,24 @@ public final class SpeculationAdmission {
   /**
    * @param tau time constant of the decay: an outcome {@code tau} old weighs 1/e of a new one
    * @param rMax the fixed threshold r*, in (0, 1); NaN: r* = saved / (saved + lost)
-   * @param probe share of the txns that speculate while speculation is off, in [0, 1]
-   * @param hysteresis half-width of the band around r* in which the decision does not change
+   * @param pMin the share of txns that speculate once r >= r* + width, in [0, pMax]
+   * @param pMax the share of txns that speculate while r <= r* - width, in [pMin, 1]
+   * @param width half-width of the ramp from pMax to pMin around r*, in [0, 0.5); 0: a hard switch
+   * @param reachCap the cap on an outcome's reach (dependents / fan-out); 0: outcomes are not weighted
    * @param priorMean r of a shim without evidence, in [0, 1]
    * @param priorWeight how many outcomes that assumption is worth, > 0
    */
   public record Config(
-      Duration tau, double rMax, double probe, double hysteresis, double priorMean, double priorWeight) {
-    public static final Config DEFAULT = new Config(Duration.ofSeconds(1), Double.NaN, 0.05, 0.02, 0.05, 3);
+      Duration tau,
+      double rMax,
+      double pMin,
+      double pMax,
+      double width,
+      int reachCap,
+      double priorMean,
+      double priorWeight) {
+    public static final Config DEFAULT =
+        new Config(Duration.ofSeconds(1), Double.NaN, 0.05, 1, 0.1, 10, 0.05, 3);
 
     public Config {
       Objects.requireNonNull(tau);
@@ -57,11 +72,14 @@ public final class SpeculationAdmission {
       if (!Double.isNaN(rMax) && !(rMax > 0 && rMax < 1)) {
         throw new IllegalArgumentException("rMax must be in (0, 1), or NaN for the measured threshold: " + rMax);
       }
-      if (!(probe >= 0 && probe <= 1)) {
-        throw new IllegalArgumentException("probe must be in [0, 1]: " + probe);
+      if (!(pMin >= 0 && pMin <= pMax && pMax <= 1)) {
+        throw new IllegalArgumentException("need 0 <= pMin <= pMax <= 1: " + pMin + ", " + pMax);
       }
-      if (!(hysteresis >= 0 && hysteresis < 0.5)) {
-        throw new IllegalArgumentException("hysteresis must be in [0, 0.5): " + hysteresis);
+      if (!(width >= 0 && width < 0.5)) {
+        throw new IllegalArgumentException("width must be in [0, 0.5): " + width);
+      }
+      if (reachCap < 0) {
+        throw new IllegalArgumentException("reachCap must be >= 0: " + reachCap);
       }
       if (!(priorMean >= 0 && priorMean <= 1)) {
         throw new IllegalArgumentException("priorMean must be in [0, 1]: " + priorMean);
@@ -78,9 +96,10 @@ public final class SpeculationAdmission {
 
     @Override
     public String toString() {
-      return String.format(Locale.ROOT, "admission[r*=%s, tau=%d ms, probe=%.2f, hysteresis=%.3f, prior=%.3f x %.1f]",
+      return String.format(Locale.ROOT,
+          "admission[r*=%s, tau=%d ms, p=%.2f..%.2f over r* +- %.3f, reach cap %d, prior=%.3f x %.1f]",
           measuredThreshold() ? "saved/(saved+lost)" : String.format(Locale.ROOT, "%.3f", rMax),
-          tau.toMillis(), probe, hysteresis, priorMean, priorWeight);
+          tau.toMillis(), pMin, pMax, width, reachCap, priorMean, priorWeight);
     }
   }
 
@@ -91,18 +110,18 @@ public final class SpeculationAdmission {
   // decayed as of lastNanos, under this monitor
   private double outcomes;
   private double cascaded;
-  private double savedSum;
+  private double savedSum;      // weighted by the reach
   private double savedCount;
-  private double lostSum;
+  private double lostSum;       // weighted by the reach
   private double lostCount;
+  private double dependentsSum; // statistics: the reach of the commits and of the cascades
+  private double fanoutSum;
   private long lastNanos = System.nanoTime();
-  private boolean on = true;
+  private double lastP = 1;
   // statistics
-  private final LongAdder speculating = new LongAdder();
-  private final LongAdder probes = new LongAdder();
+  private final LongAdder speculative = new LongAdder();
   private final LongAdder nonSpeculative = new LongAdder();
   private final LongAdder forcedGrants = new LongAdder();
-  private final LongAdder switches = new LongAdder();
   private final LongAdder[] outcomesByK = adders();
   private final LongAdder[] cascadedByK = adders();
 
@@ -116,39 +135,45 @@ public final class SpeculationAdmission {
   }
 
   /** start(): may this txn speculate? */
-  public synchronized boolean admit() {
-    decayTo(System.nanoTime());
+  public boolean admit() {
+    double p;
+    synchronized (this) {
+      decayTo(System.nanoTime());
+      p = share();
+      lastP = p;
+    }
+    boolean speculate = p >= 1 || (p > 0 && ThreadLocalRandom.current().nextDouble() < p);
+    (speculate ? speculative : nonSpeculative).increment();
+    return speculate;
+  }
+
+  /** The share of txns that speculate now: the ramp from pMax to pMin around r*. */
+  private double share() {
     double r = r();
     double threshold = threshold();
-    boolean was = on;
-    if (on && r > threshold + config.hysteresis()) {
-      on = false;
-    } else if (!on && r < threshold - config.hysteresis()) {
-      on = true;
+    double w = config.width();
+    if (w == 0) {
+      return r <= threshold ? config.pMax() : config.pMin();
     }
-    if (on != was) {
-      switches.increment();
-    }
-    if (on) {
-      speculating.increment();
-      return true;
-    }
-    if (config.probe() > 0 && ThreadLocalRandom.current().nextDouble() < config.probe()) {
-      probes.increment();
-      return true;
-    }
-    nonSpeculative.increment();
-    return false;
+    double x = (r - (threshold - w)) / (2 * w);   // 0 at r* - w, 1 at r* + w
+    double clamped = Math.max(0, Math.min(1, x));
+    return config.pMax() - (config.pMax() - config.pMin()) * clamped;
   }
 
-  /** A branch that speculated committed: its outcome, and the lock wait speculation saved it. */
-  public void speculatedCommitted(long savedNanos, int dependencies) {
-    record(false, savedNanos, dependencies);
+  /**
+   * A branch that speculated committed: its outcome, the lock wait speculation saved it, and its
+   * reach (the txns granted behind it while it was uncommitted).
+   */
+  public void speculatedCommitted(long savedNanos, int dependencies, int dependents) {
+    record(false, savedNanos, dependencies, dependents);
   }
 
-  /** A branch that speculated was cascade-aborted: its outcome, and the work lost (its lifetime). */
-  public void speculatedCascaded(long lifetimeNanos, int dependencies) {
-    record(true, lifetimeNanos, dependencies);
+  /**
+   * A branch that speculated was cascade-aborted: its outcome, the work lost (its lifetime), and its
+   * reach (the txns its own abort doomed directly).
+   */
+  public void speculatedCascaded(long lifetimeNanos, int dependencies, int fanout) {
+    record(true, lifetimeNanos, dependencies, fanout);
   }
 
   /** A resolved txn's grants that the commit-wait mode had to take speculatively (deadlock guard). */
@@ -158,22 +183,25 @@ public final class SpeculationAdmission {
     }
   }
 
-  private void record(boolean cascade, long nanos, int dependencies) {
+  private void record(boolean cascade, long nanos, int dependencies, int reach) {
     int k = Math.min(Math.max(dependencies, 1), K_BUCKETS) - 1;
     outcomesByK[k].increment();
     if (cascade) {
       cascadedByK[k].increment();
     }
+    double weight = 1 + Math.min(Math.max(reach, 0), config.reachCap());
     synchronized (this) {
       decayTo(System.nanoTime());
       outcomes += 1;
       if (cascade) {
         cascaded += 1;
-        lostSum += nanos;
+        lostSum += nanos * weight;
         lostCount += 1;
+        fanoutSum += reach;
       } else {
-        savedSum += nanos;
+        savedSum += nanos * weight;
         savedCount += 1;
+        dependentsSum += reach;
       }
     }
   }
@@ -186,6 +214,8 @@ public final class SpeculationAdmission {
     savedCount *= w;
     lostSum *= w;
     lostCount *= w;
+    dependentsSum *= w;
+    fanoutSum *= w;
     lastNanos = now;
   }
 
@@ -210,16 +240,17 @@ public final class SpeculationAdmission {
   }
 
   /**
-   * One line, key=value, for the node log. r and r* as of the last update (not decayed to now): the
-   * node logs it at shutdown too, after the load stopped, when they would only show the prior.
+   * One line, key=value, for the node log. p, r and r* as of the last update (not decayed to now):
+   * the node logs it at shutdown too, after the load stopped, when they would only show the prior.
+   * saved and lost are the reach-weighted means r* uses.
    */
   public synchronized String summary() {
     StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
-        "on=%d r=%.4f r_star=%.4f saved_us_mean=%.0f lost_us_mean=%.0f admitted_speculative=%d"
-            + " admitted_probe=%d admitted_nonspeculative=%d forced_grants=%d switches=%d",
-        on ? 1 : 0, r(), threshold(), savedCount > 0 ? savedSum / savedCount / 1000 : 0,
-        lostCount > 0 ? lostSum / lostCount / 1000 : 0, speculating.sum(), probes.sum(), nonSpeculative.sum(),
-        forcedGrants.sum(), switches.sum()));
+        "p=%.3f r=%.4f r_star=%.4f saved_us_mean=%.0f lost_us_mean=%.0f dependents_mean=%.2f fanout_mean=%.2f"
+            + " admitted_speculative=%d admitted_nonspeculative=%d forced_grants=%d",
+        lastP, r(), threshold(), savedCount > 0 ? savedSum / savedCount / 1000 : 0,
+        lostCount > 0 ? lostSum / lostCount / 1000 : 0, savedCount > 0 ? dependentsSum / savedCount : 0,
+        lostCount > 0 ? fanoutSum / lostCount : 0, speculative.sum(), nonSpeculative.sum(), forcedGrants.sum()));
     for (int k = 0; k < K_BUCKETS; k++) {
       sb.append(" k").append(k + 1).append(k + 1 == K_BUCKETS ? "plus" : "").append('=')
           .append(outcomesByK[k].sum()).append('/').append(cascadedByK[k].sum());

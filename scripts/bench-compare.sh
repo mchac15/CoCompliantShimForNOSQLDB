@@ -13,9 +13,11 @@
 #   nonspeculative-mysql, ...          its database sI in SQL database sI on server I of the Sonata
 #                                      variants (same servers, same settings, same tables and keys,
 #                                      same statements; see SqlKvStore), refilled at node start
-#   admission-auto[-tau<T>], ...       the speculation admission shim (CoShimNode --shim admission) with
-#   admission-r<X>[-tau<T>]            --adm-r-max auto / X (and --adm-tau-ms T), on top of ADMISSION_ARGS:
-#                                      several admission configurations in one sweep (also -mysql/-pg)
+#   admission-auto..., admission-r<X>  the speculation admission shim (CoShimNode --shim admission) with
+#     [-tau<T>][-w<W>][-reach<C>]      --adm-r-max auto / X, and optionally --adm-tau-ms T, --adm-width W
+#                                      (0: a hard switch), --adm-reach-cap C (0: no reach weighting), on top
+#                                      of ADMISSION_ARGS: several admission configurations in one sweep
+#                                      (also -mysql/-pg), e.g. admission-auto-w0-reach0
 #   <shim variant>@wait-die,           a shim variant with that deadlock policy instead of DEADLOCK's
 #   <shim variant>@wound-wait          (e.g. speculative-pg@wound-wait); the label keeps the suffix
 #   sonata-mysql, sonata-pg            Sonata: SHIMS MySQL / PostgreSQL servers (scripts/bench-dbs.sh:
@@ -149,10 +151,13 @@ for rep in $(seq 1 "$reps"); do
         policy="$deadlock"
         [[ $variant != *@* ]] || policy="${variant#*@}"
         admission_args=()
-        if [[ $shim =~ ^admission-(auto|r([0-9.]+))(-tau([0-9]+))?$ ]]; then   # admission-r0.15-tau1000
+        if [[ $shim =~ ^admission-(auto|r([0-9.]+))(-tau([0-9]+))?(-w([0-9.]+))?(-reach([0-9]+))?$ ]]; then
+            # e.g. admission-r0.15-tau1000-w0.1-reach10
             read -r -a admission_args <<< "${ADMISSION_ARGS:-}"
             admission_args+=(--adm-r-max "${BASH_REMATCH[2]:-auto}")
             [[ -z ${BASH_REMATCH[4]} ]] || admission_args+=(--adm-tau-ms "${BASH_REMATCH[4]}")
+            [[ -z ${BASH_REMATCH[6]} ]] || admission_args+=(--adm-width "${BASH_REMATCH[6]}")
+            [[ -z ${BASH_REMATCH[8]} ]] || admission_args+=(--adm-reach-cap "${BASH_REMATCH[8]}")
             shim=admission
         elif [[ $shim == admission ]]; then
             read -r -a admission_args <<< "${ADMISSION_ARGS:-}"

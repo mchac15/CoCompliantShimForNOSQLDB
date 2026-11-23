@@ -26,19 +26,22 @@ import java.util.concurrent.TimeUnit;
  * <pre>
  *   COSHIM_TOKEN=secret java -cp ... ch.epfl.coshim.net.CoShimNode [--port P] [--shim S] [--databases D]
  *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--stats-interval-s I] [--allow HOST ...]
- *       [--store memory|URL] [--adm-r-max X|auto] [--adm-tau-ms T] [--adm-probe P] [--adm-hysteresis H]
- *       [--adm-prior-mean M] [--adm-prior-weight W]
+ *       [--store memory|URL] [--adm-r-max X|auto] [--adm-tau-ms T] [--adm-p-min P] [--adm-p-max P]
+ *       [--adm-width W] [--adm-reach-cap C] [--adm-prior-mean M] [--adm-prior-weight W]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | admission (speculative, but
  *                         each txn speculates or not as SpeculationAdmission decides at its start)
  *                         | nocc (no concurrency control); default nocc
- *     --adm-r-max         admission: speculation goes off once the share of speculating txns that
- *                         cascades abort exceeds this (plus the hysteresis); auto (default): the
- *                         measured break-even saved / (saved + lost)
- *     --adm-tau-ms        admission: decay time constant of that share; default 1000
- *     --adm-probe         admission: share of txns that speculate while it is off; default 0.05
- *     --adm-hysteresis    admission: half-width of the band around the threshold; default 0.02
+ *     --adm-r-max         admission: the threshold r* on r, the share of speculating txns that cascades
+ *                         abort; auto (default): the measured break-even saved / (saved + lost)
+ *     --adm-tau-ms        admission: decay time constant of r, saved and lost; default 1000
+ *     --adm-p-min         admission: share of txns that speculate once r >= r* + width; default 0.05
+ *     --adm-p-max         admission: share of txns that speculate while r <= r* - width; default 1
+ *     --adm-width         admission: half-width of the linear ramp between the two around r*; 0: a
+ *                         hard switch; default 0.1
+ *     --adm-reach-cap     admission: cap on an outcome's reach (saved x (1 + dependents), lost x (1 +
+ *                         fan-out)); 0: no weighting; default 10
  *     --adm-prior-mean    admission: the share assumed without evidence; default 0.05
  *     --adm-prior-weight  admission: how many outcomes that assumption is worth; default 3
  *     --databases         comma-separated database names; default "default"
@@ -88,8 +91,10 @@ public final class CoShimNode {
             SpeculationAdmission.Config adm = SpeculationAdmission.Config.DEFAULT;
             double admRMax = adm.rMax();
             long admTauMs = adm.tau().toMillis();
-            double admProbe = adm.probe();
-            double admHysteresis = adm.hysteresis();
+            double admPMin = adm.pMin();
+            double admPMax = adm.pMax();
+            double admWidth = adm.width();
+            int admReachCap = adm.reachCap();
             double admPriorMean = adm.priorMean();
             double admPriorWeight = adm.priorWeight();
             if (args.length > 0 && args[0].startsWith("--")) {
@@ -111,8 +116,10 @@ public final class CoShimNode {
                         case "--store" -> store = value;
                         case "--adm-r-max" -> admRMax = value.equals("auto") ? Double.NaN : Double.parseDouble(value);
                         case "--adm-tau-ms" -> admTauMs = Long.parseLong(value);
-                        case "--adm-probe" -> admProbe = Double.parseDouble(value);
-                        case "--adm-hysteresis" -> admHysteresis = Double.parseDouble(value);
+                        case "--adm-p-min" -> admPMin = Double.parseDouble(value);
+                        case "--adm-p-max" -> admPMax = Double.parseDouble(value);
+                        case "--adm-width" -> admWidth = Double.parseDouble(value);
+                        case "--adm-reach-cap" -> admReachCap = Integer.parseInt(value);
                         case "--adm-prior-mean" -> admPriorMean = Double.parseDouble(value);
                         case "--adm-prior-weight" -> admPriorWeight = Double.parseDouble(value);
                         default -> throw new IllegalArgumentException("unknown option " + flag);
@@ -128,8 +135,8 @@ public final class CoShimNode {
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
                     prepareWaitDie, statsIntervalSeconds, allowed, store,
-                    new SpeculationAdmission.Config(Duration.ofMillis(admTauMs), admRMax, admProbe, admHysteresis,
-                            admPriorMean, admPriorWeight));
+                    new SpeculationAdmission.Config(Duration.ofMillis(admTauMs), admRMax, admPMin, admPMax, admWidth,
+                            admReachCap, admPriorMean, admPriorWeight));
         }
 
         private static boolean parsePrepareDeadlock(String value) {

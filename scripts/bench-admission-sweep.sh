@@ -22,7 +22,7 @@
 # Plots: scripts/bench-admission-plot.py DIR.
 #
 # Env: THREADS_LIST ("50 100 200 400 600 800 1000"), SKEWS ("0.9 0.95 0.99"), REPS (2),
-#      ADMISSION_VARIANTS ("admission-auto admission-r0.15": see scripts/bench-compare.sh),
+#      ADMISSION_VARIANTS ("admission-auto admission-r0.15": see scripts/bench-compare.sh for -w / -reach),
 #      ADMISSION_ARGS (the other admission options, default CoShimNode's), PREPARE_DEADLOCK (wait-die),
 #      OUT, and bench-final.sh's.
 set -euo pipefail
@@ -38,7 +38,8 @@ out = sys.argv[1]
 if not os.path.exists(os.path.join(out, "summary.csv")):
     sys.exit(f"no summary.csv in {out}: no cell ran")
 rows = list(csv.DictReader(open(os.path.join(out, "summary.csv"))))
-SUMS = ("admitted_speculative", "admitted_probe", "admitted_nonspeculative", "forced_grants", "switches")
+SUMS = ("admitted_speculative", "admitted_nonspeculative", "forced_grants")
+MEANS = ("p", "r", "r_star", "dependents_mean", "fanout_mean")
 
 def last_line(log, prefix):
     lines = [l for l in open(log, errors="replace") if l.startswith(prefix)]
@@ -47,7 +48,7 @@ def last_line(log, prefix):
 def admission(t, s, variant):
     acc = dict.fromkeys(SUMS, 0)
     k = defaultdict(lambda: [0, 0])
-    rs, cascades = [], 0
+    means, cascades = defaultdict(list), 0
     for log in glob.glob(os.path.join(out, f"t{t}-skew{s}-nodes", f"rep*-{variant}-s*.log")):
         st = last_line(log, "stats ")
         if st:
@@ -57,12 +58,14 @@ def admission(t, s, variant):
             continue
         for key in SUMS:
             acc[key] += int(f.get(key, 0))
-        rs.append((float(f["r"]), float(f["r_star"])))
+        for key in MEANS:
+            if key in f:
+                means[key].append(float(f[key]))
         for key in ("k1", "k2", "k3plus"):
             n, c = f.get(key, "0/0").split("/")
             k[key][0] += int(n)
             k[key][1] += int(c)
-    return acc, k, rs, cascades
+    return acc, k, means, cascades
 
 base = lambda v: v.split("-mysql")[0].split("-pg")[0]
 print(f"# Speculation admission sweep: {out}\n")
@@ -91,21 +94,24 @@ for s in sorted(by_skew, key=float):
 print()
 
 print("## Per cell\n")
-print("Admission counters at the end of the runs, summed over nodes and reps (warm-up included): spec / probe "
-      "/ non-spec = txns admitted speculative (speculation on), as probes (off), non-speculative (off); "
-      "forced = grants a non-speculative txn took speculatively (deadlock guard); switches = on/off changes; "
-      "r and r* = the final values (mean over nodes and reps); k1 / k2 / k3+ = cascade share of the "
-      "speculating branches that depended on 1 / 2 / 3+ uncommitted txns.\n")
-print("| threads | skew | variant | tps | abort rate | txn p99 us | cascade aborts | spec | probe | non-spec "
-      "| forced | switches | r | r* | k1 | k2 | k3+ |")
-print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+print("Admission counters at the end of the runs, summed over nodes and reps (warm-up included): spec / "
+      "non-spec = txns admitted speculative / non-speculative; forced = grants a non-speculative txn took "
+      "speculatively (deadlock guard); p, r, r* = the share admitted speculative, the cascade share and the "
+      "threshold as of the last outcome (mean over nodes and reps: not the values during the run); deps / "
+      "fan-out = mean reach of the commits / cascades; k1 / k2 / k3+ = cascade share of the speculating "
+      "branches that depended on 1 / 2 / 3+ uncommitted txns.\n")
+print("| threads | skew | variant | tps | abort rate | txn p99 us | cascade aborts | spec | non-spec | forced "
+      "| p | r | r* | deps | fan-out | k1 | k2 | k3+ |")
+print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
 for r in sorted(rows, key=lambda r: (float(r["skew"]), int(r["threads"]), r["variant"])):
-    a, k, rs, cascades = admission(r["threads"], r["skew"], r["variant"])
+    a, k, means, cascades = admission(r["threads"], r["skew"], r["variant"])
     share = lambda key: f"{100 * k[key][1] / k[key][0]:.1f}% of {k[key][0]}" if k[key][0] else ""
-    tail = (f"| {a['admitted_speculative']} | {a['admitted_probe']} | {a['admitted_nonspeculative']} "
-            f"| {a['forced_grants']} | {a['switches']} | {sum(x for x, _ in rs) / len(rs):.3f} "
-            f"| {sum(y for _, y in rs) / len(rs):.3f} | {share('k1')} | {share('k2')} | {share('k3plus')} |"
-            if rs else "| | | | | | | | | | |")
+    mean = lambda key, fmt: fmt.format(sum(means[key]) / len(means[key])) if means[key] else ""
+    tail = (f"| {a['admitted_speculative']} | {a['admitted_nonspeculative']} | {a['forced_grants']} "
+            f"| {mean('p', '{:.2f}')} | {mean('r', '{:.3f}')} | {mean('r_star', '{:.3f}')} "
+            f"| {mean('dependents_mean', '{:.2f}')} | {mean('fanout_mean', '{:.2f}')} "
+            f"| {share('k1')} | {share('k2')} | {share('k3plus')} |"
+            if means else "| | | | | | | | | | | |")
     print(f"| {r['threads']} | {r['skew']} | {r['variant']} | {float(r['tps']):.1f} "
           f"| {100 * float(r['abort_rate']):.2f}% | {r['txn_p99_us']} | {cascades} " + tail)
 EOF

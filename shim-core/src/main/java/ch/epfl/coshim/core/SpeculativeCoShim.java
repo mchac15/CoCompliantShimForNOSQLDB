@@ -342,7 +342,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
     stats.committed(txn.maxDepth(), grants, saved, txn.prepareWaitNanos());
     if (admission != null) {
       if (txn.maxDepth() > 0) {   // it speculated
-        admission.speculatedCommitted(saved, txn.dependencyCount());
+        admission.speculatedCommitted(saved, txn.dependencyCount(), txn.dependents());
       }
       admission.forcedGrants(txn.forcedGrants());
     }
@@ -440,7 +440,7 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
       // maxDepth outlives markResolved: > 0 iff it speculated. Other causes are not counted: they
       // abort with or without speculation
       if (finalCause == AbortCause.CASCADE && txn.maxDepth() > 0) {
-        admission.speculatedCascaded(lifetime, txn.dependencyCount());
+        admission.speculatedCascaded(lifetime, txn.dependencyCount(), txn.cascadeFanout());
       }
       admission.forcedGrants(txn.forcedGrants());
     }
