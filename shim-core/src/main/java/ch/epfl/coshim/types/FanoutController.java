@@ -10,15 +10,16 @@ import java.util.concurrent.atomic.LongAdder;
  * An adaptive fanout cap: a hill-climb of the fractional cap F on the shim's commit rate. Every
  * {@code period} it compares the commit rate of the period that just ended with that of the one before
  * (each measured after {@code settle}: the txns in flight at a change still ran under the old F):
- * if they fell by more than {@code eps}, the last step hurt and the direction reverses; if they rose by
- * more than {@code eps}, it keeps going; in between (no clear effect: the cap does not bind, e.g. at low
- * load) it goes up, toward speculating, which then costs nothing and shortens the waits. Then F moves
- * one step, x (1 + step) up or / (1 + step) down, within [min, max]: it stays at max until a step down
- * helps, and turns around at min. The best static cap falls with the load (skew 0.99: 4 or more at
- * 100 threads, 1 at 1000), so F should follow it.
+ * if they fell by more than {@code eps}, the last step hurt and the direction reverses; otherwise it
+ * keeps going, also when nothing changed. Then F moves one step, x (1 + step) up or / (1 + step) down,
+ * within [min, max] (at a bound it turns around). The best static cap falls with the load (skew 0.99:
+ * 4 or more at 100 threads, 1 at 1000), so F should follow it.
  *
- * <p>Without the lean up, F swept from bound to bound at low load (0-2 reversals in 24 steps at skew
- * 0.95, 100-200 threads) and lost 4-6 % on the time spent near min.
+ * <p>Going on through a flat stretch matters: the throughput is about flat in F from 8 down to about
+ * 2, and only a cap near 1 or below pays under heavy load. A variant that stepped up on a flat step
+ * (to stay high at low load) never crossed that stretch: at skew 0.95 / 800 threads F stayed near 8
+ * and the throughput fell to about the uncapped one (499 tps against 688). The price of going on: at
+ * low load, where the cap never binds, F sweeps between the bounds (4-6 % lost at 100-200 threads).
  *
  * <p>The defaults are slow on purpose: with 1 s periods, +-15 % steps and a 2 % margin, the noise of a
  * second's commit count (about +-6 % on the difference of two windows) exceeded the effect of a step
@@ -46,7 +47,7 @@ public final class FanoutController {
   public record Config(
       double start, double min, double max, double step, double eps, Duration period, Duration settle) {
     public static final Config DEFAULT =
-        new Config(8, 0.25, 8, 0.4, 0.05, Duration.ofSeconds(5), Duration.ofSeconds(1));
+        new Config(4, 0.25, 8, 0.4, 0.05, Duration.ofSeconds(5), Duration.ofSeconds(1));
 
     public Config {
       Objects.requireNonNull(period);
@@ -124,15 +125,11 @@ public final class FanoutController {
     boolean flat = compared && !reversed && rate <= lastRate * (1 + config.eps());
     if (reversed) {
       direction = -direction;   // the last step made it worse: go back
-    } else if (flat) {
-      direction = 1;            // no clear effect (the cap does not bind): lean toward speculating
-    }
+    }                           // else keep going, also through a flat stretch (see the class comment)
     double next = direction > 0 ? fanout * (1 + config.step()) : fanout / (1 + config.step());
-    if (next > config.max()) {
-      next = config.max();      // stays at the top until a step down helps
-    } else if (next < config.min()) {
-      next = config.min();
-      direction = 1;            // at the bottom: turn around
+    if (next > config.max() || next < config.min()) {
+      next = Math.max(config.min(), Math.min(config.max(), next));
+      direction = -direction;   // at a bound: turn around
     }
     fanout = next;
     lastRate = rate;

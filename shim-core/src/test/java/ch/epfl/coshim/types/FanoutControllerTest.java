@@ -30,25 +30,32 @@ class FanoutControllerTest {
   }
 
   @Test
-  void leansUpWhenTheStepChangedNothing() {
+  void keepsGoingThroughAFlatStep() {
+    // the throughput is about flat in F over a wide range: only going on crosses it
     FanoutController c = controller(4);
     commits(c, 100);
     c.step();                      // 4 -> 3.2
     commits(c, 101);
-    c.step();                      // +1 %, within eps: up, 3.2 -> 4
-    assertEquals(4, c.current(), 1e-9);
+    c.step();                      // +1 %, within eps: still down, 3.2 -> 2.56
+    assertEquals(4 / 1.25 / 1.25, c.current(), 1e-9);
   }
 
   @Test
-  void staysAtTheTopWhileNothingChanges() {
-    FanoutController c = controller(8);
+  void turnsAroundAtTheTop() {
+    FanoutController c = controller(6.4);
     commits(c, 100);
-    c.step();                      // 8 -> 6.4: the first step probes down
+    c.step();                      // down, 6.4 -> 5.12
+    commits(c, 80);
+    c.step();                      // worse: up, back to 6.4
     commits(c, 100);
-    c.step();                      // flat: up, back to 8
-    commits(c, 100);
-    c.step();                      // flat: up, stays at the top
+    c.step();                      // better: up, 6.4 -> 8 (exactly the top)
     assertEquals(8, c.current(), 1e-9);
+    commits(c, 100);
+    c.step();                      // flat: on up, 10 is past the top: clamped to 8, turns around
+    assertEquals(8, c.current(), 1e-9);
+    commits(c, 100);
+    c.step();                      // flat: on, now down
+    assertEquals(8 / 1.25, c.current(), 1e-9);
   }
 
   @Test

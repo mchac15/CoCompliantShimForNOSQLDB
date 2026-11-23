@@ -50,7 +50,7 @@ import java.util.concurrent.TimeUnit;
  *                         txn, or the grant waits; auto: an adaptive fractional cap, hill-climbed on
  *                         the shim's commit rate (see FanoutController, the --spec-fanout-* options
  *                         below; one "fanout" log line per step); default none (no cap)
- *     --spec-fanout-*     auto's start (8), min (0.25), max (8), step (0.4: F x 1.4 or / 1.4),
+ *     --spec-fanout-*     auto's start (4), min (0.25), max (8), step (0.4: F x 1.4 or / 1.4),
  *                         eps (0.05: a drop of the commit rate counts above 5 %), period-ms (5000),
  *                         settle-ms (1000: a period's first commits are not counted)
  *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
