@@ -211,10 +211,11 @@ def plot_bars(out, rows, cells, variants, styles):
     tps = {(int(r["threads"]), r["skew"], r["variant"]): float(r["tps"]) for r in rows}
     fig, axes = plt.subplots(1, len(cells), figsize=(4.6 * len(cells), 0.42 * len(variants) + 1.6),
                              squeeze=False, sharey=True, facecolor=SURFACE)
-    top = max(tps.values())
     for col, (t, skew) in enumerate(cells):
         ax = axes[0][col]
         ax.set_facecolor(SURFACE)
+        # each panel to its own scale: the cells' throughputs differ by up to 10x between skews
+        top = max((tps[(t, skew, v)] for v in variants if (t, skew, v) in tps), default=1)
         for y, v in enumerate(variants):
             x = tps.get((t, skew, v))
             if x is None:
