@@ -19,17 +19,36 @@ class FanoutControllerTest {
   }
 
   @Test
-  void keepsItsDirectionWhileTheCommitRateDoesNotDrop() {
+  void keepsItsDirectionWhileTheCommitRateClearlyRises() {
     FanoutController c = controller(4);
     commits(c, 100);
     c.step();                      // first step: down (nothing to compare yet)
     assertEquals(4 / 1.25, c.current(), 1e-9);
     commits(c, 110);
-    c.step();                      // better: keep going down
+    c.step();                      // +10 %: keep going down
     assertEquals(4 / 1.25 / 1.25, c.current(), 1e-9);
-    commits(c, 109);
-    c.step();                      // within eps: still down
-    assertEquals(4 / Math.pow(1.25, 3), c.current(), 1e-9);
+  }
+
+  @Test
+  void leansUpWhenTheStepChangedNothing() {
+    FanoutController c = controller(4);
+    commits(c, 100);
+    c.step();                      // 4 -> 3.2
+    commits(c, 101);
+    c.step();                      // +1 %, within eps: up, 3.2 -> 4
+    assertEquals(4, c.current(), 1e-9);
+  }
+
+  @Test
+  void staysAtTheTopWhileNothingChanges() {
+    FanoutController c = controller(8);
+    commits(c, 100);
+    c.step();                      // 8 -> 6.4: the first step probes down
+    commits(c, 100);
+    c.step();                      // flat: up, back to 8
+    commits(c, 100);
+    c.step();                      // flat: up, stays at the top
+    assertEquals(8, c.current(), 1e-9);
   }
 
   @Test
