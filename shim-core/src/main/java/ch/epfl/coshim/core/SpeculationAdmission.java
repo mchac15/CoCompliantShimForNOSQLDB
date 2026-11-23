@@ -34,6 +34,16 @@ import java.util.concurrent.atomic.LongAdder;
  * the txns granted behind it while it was uncommitted, which its early finish let through earlier),
  * a cascaded one's lifetime by (1 + the txns its own abort doomed directly).
  *
+ * <p>Ratio mode ({@link Mode#RATIO}) does not judge speculation by its own statistics, which cannot
+ * tell where speculating stops paying (the crossover also depends on how well the non-speculative
+ * shim would do: at skew 0.99 speculation still wins with 37 % of its txns cascaded, at 0.9 it
+ * already loses at 13 %). It runs both modes side by side instead, on random shares of the txns
+ * under the same load: {@code p} speculative, at least {@code pMin} and at most {@code pMax} so that
+ * both groups always exist, and measures each group's efficiency E = commits / total branch lifetime
+ * (committed txns per second spent, aborted lifetimes counted as waste), decayed as r. Every 250 ms
+ * {@code p += eta * ln(E_spec / E_nonspec)}, clamped: p drifts toward the mode that does better now,
+ * and stays put where both do equally well, the crossover.
+ *
  * <p>Statistics only: the outcomes are also kept cumulatively by {@code k}, the number of distinct
  * uncommitted txns the branch depended on (1, 2, 3+), to see whether a per-grant budget on k would
  * separate the risky speculations from the safe ones.
@@ -41,6 +51,16 @@ import java.util.concurrent.atomic.LongAdder;
  * <p>Thread-safe: one monitor, taken once per txn start and once per speculating branch's end.
  */
 public final class SpeculationAdmission {
+
+  /** How p is set: from the cascade share r against r* (THRESHOLD), or by comparing both modes. */
+  public enum Mode {
+    THRESHOLD,
+    RATIO
+  }
+
+  /** Ratio mode: how often p is updated, and the decayed samples each group needs first. */
+  private static final long STEP_NANOS = 250_000_000L;
+  private static final double MIN_GROUP_SAMPLES = 10;
 
   /**
    * @param tau time constant of the decay: an outcome {@code tau} old weighs 1/e of a new one
@@ -53,16 +73,18 @@ public final class SpeculationAdmission {
    * @param priorWeight how many outcomes that assumption is worth, > 0
    */
   public record Config(
+      Mode mode,
       Duration tau,
       double rMax,
       double pMin,
       double pMax,
       double width,
       int reachCap,
+      double eta,
       double priorMean,
       double priorWeight) {
     public static final Config DEFAULT =
-        new Config(Duration.ofSeconds(1), Double.NaN, 0.05, 1, 0.1, 10, 0.05, 3);
+        new Config(Mode.THRESHOLD, Duration.ofSeconds(1), Double.NaN, 0.05, 1, 0.1, 10, 0.1, 0.05, 3);
 
     public Config {
       Objects.requireNonNull(tau);
@@ -77,6 +99,14 @@ public final class SpeculationAdmission {
       }
       if (!(width >= 0 && width < 0.5)) {
         throw new IllegalArgumentException("width must be in [0, 0.5): " + width);
+      }
+      Objects.requireNonNull(mode);
+      if (mode == Mode.RATIO && !(pMin > 0 && pMax < 1)) {
+        throw new IllegalArgumentException("ratio mode needs 0 < pMin <= pMax < 1 (both groups measured): "
+            + pMin + ", " + pMax);
+      }
+      if (!(eta > 0)) {
+        throw new IllegalArgumentException("eta must be positive: " + eta);
       }
       if (reachCap < 0) {
         throw new IllegalArgumentException("reachCap must be >= 0: " + reachCap);
@@ -97,9 +127,12 @@ public final class SpeculationAdmission {
     @Override
     public String toString() {
       return String.format(Locale.ROOT,
-          "admission[r*=%s, tau=%d ms, p=%.2f..%.2f over r* +- %.3f, reach cap %d, prior=%.3f x %.1f]",
-          measuredThreshold() ? "saved/(saved+lost)" : String.format(Locale.ROOT, "%.3f", rMax),
-          tau.toMillis(), pMin, pMax, width, reachCap, priorMean, priorWeight);
+          mode == Mode.RATIO
+              ? "admission[ratio: p in %.2f..%.2f, p += %.3f ln(E_spec / E_nonspec) every 250 ms, tau=%d ms]"
+              : "admission[r*=%s, tau=%d ms, p=%.2f..%.2f over r* +- %.3f, reach cap %d, prior=%.3f x %.1f]",
+          mode == Mode.RATIO ? new Object[] {pMin, pMax, eta, tau.toMillis()}
+              : new Object[] {measuredThreshold() ? "saved/(saved+lost)" : String.format(Locale.ROOT, "%.3f", rMax),
+                  tau.toMillis(), pMin, pMax, width, reachCap, priorMean, priorWeight});
     }
   }
 
@@ -118,6 +151,17 @@ public final class SpeculationAdmission {
   private double fanoutSum;
   private long lastNanos = System.nanoTime();
   private double lastP = 1;
+  // ratio mode, decayed as the rest: per group, its commits, the total lifetime (s) of its resolved
+  // branches, and how many resolved
+  private double specCommits;
+  private double specLifetimeS;
+  private double specResolved;
+  private double nonCommits;
+  private double nonLifetimeS;
+  private double nonResolved;
+  private double ratioP;
+  private long lastStepNanos = System.nanoTime();
+  private final LongAdder steps = new LongAdder();
   // statistics
   private final LongAdder speculative = new LongAdder();
   private final LongAdder nonSpeculative = new LongAdder();
@@ -128,6 +172,8 @@ public final class SpeculationAdmission {
   public SpeculationAdmission(Config config) {
     this.config = Objects.requireNonNull(config);
     this.tauNanos = config.tau().toNanos();
+    this.ratioP = config.pMax();   // start speculating: the better mode at low load
+    this.lastP = config.mode() == Mode.RATIO ? ratioP : 1;
   }
 
   public Config config() {
@@ -139,12 +185,62 @@ public final class SpeculationAdmission {
     double p;
     synchronized (this) {
       decayTo(System.nanoTime());
-      p = share();
+      if (config.mode() == Mode.RATIO) {
+        step(System.nanoTime());
+        p = ratioP;
+      } else {
+        p = share();
+      }
       lastP = p;
     }
     boolean speculate = p >= 1 || (p > 0 && ThreadLocalRandom.current().nextDouble() < p);
     (speculate ? speculative : nonSpeculative).increment();
     return speculate;
+  }
+
+  /**
+   * Ratio mode, under this monitor: at most every STEP_NANOS, once both groups have enough recent
+   * samples, moves p by eta * ln(E_spec / E_nonspec), clamped to [pMin, pMax].
+   */
+  private void step(long now) {
+    if (now - lastStepNanos < STEP_NANOS) {
+      return;
+    }
+    lastStepNanos = now;
+    if (specResolved < MIN_GROUP_SAMPLES || nonResolved < MIN_GROUP_SAMPLES) {
+      return;
+    }
+    double ratio = efficiency(specCommits, specLifetimeS) / efficiency(nonCommits, nonLifetimeS);
+    ratioP = Math.max(config.pMin(), Math.min(config.pMax(), ratioP + config.eta() * Math.log(ratio)));
+    steps.increment();
+  }
+
+  /** Commits per second of branch lifetime; half a commit added so that 0 commits stays finite. */
+  private static double efficiency(double commits, double lifetimeS) {
+    return (commits + 0.5) / Math.max(lifetimeS, 1e-3);
+  }
+
+  /**
+   * Any txn of this shim resolved, speculative mode or not, committed or aborted (whatever the
+   * cause): its group's efficiency sample for ratio mode. A no-op in threshold mode.
+   */
+  public void resolved(boolean speculativeMode, boolean committed, long lifetimeNanos) {
+    if (config.mode() != Mode.RATIO) {
+      return;
+    }
+    double lifetimeS = lifetimeNanos / 1e9;
+    synchronized (this) {
+      decayTo(System.nanoTime());
+      if (speculativeMode) {
+        specResolved += 1;
+        specLifetimeS += lifetimeS;
+        specCommits += committed ? 1 : 0;
+      } else {
+        nonResolved += 1;
+        nonLifetimeS += lifetimeS;
+        nonCommits += committed ? 1 : 0;
+      }
+    }
   }
 
   /** The share of txns that speculate now: the ramp from pMax to pMin around r*. */
@@ -216,6 +312,12 @@ public final class SpeculationAdmission {
     lostCount *= w;
     dependentsSum *= w;
     fanoutSum *= w;
+    specCommits *= w;
+    specLifetimeS *= w;
+    specResolved *= w;
+    nonCommits *= w;
+    nonLifetimeS *= w;
+    nonResolved *= w;
     lastNanos = now;
   }
 
@@ -251,6 +353,12 @@ public final class SpeculationAdmission {
         lastP, r(), threshold(), savedCount > 0 ? savedSum / savedCount / 1000 : 0,
         lostCount > 0 ? lostSum / lostCount / 1000 : 0, savedCount > 0 ? dependentsSum / savedCount : 0,
         lostCount > 0 ? fanoutSum / lostCount : 0, speculative.sum(), nonSpeculative.sum(), forcedGrants.sum()));
+    if (config.mode() == Mode.RATIO) {
+      double es = efficiency(specCommits, specLifetimeS);
+      double en = efficiency(nonCommits, nonLifetimeS);
+      sb.append(String.format(Locale.ROOT, " e_spec=%.3f e_nonspec=%.3f e_ratio=%.3f steps=%d", es, en, es / en,
+          steps.sum()));
+    }
     for (int k = 0; k < K_BUCKETS; k++) {
       sb.append(" k").append(k + 1).append(k + 1 == K_BUCKETS ? "plus" : "").append('=')
           .append(outcomesByK[k].sum()).append('/').append(cascadedByK[k].sum());

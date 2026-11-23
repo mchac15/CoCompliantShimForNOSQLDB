@@ -345,6 +345,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
         admission.speculatedCommitted(saved, txn.dependencyCount(), txn.dependents());
       }
       admission.forcedGrants(txn.forcedGrants());
+      // ratio mode: every txn is its group's efficiency sample
+      admission.resolved(txn.isSpeculative(), true, System.nanoTime() - txn.createdAtNanos());
     }
     long now = System.nanoTime();
     stats.committedBudget(now - txn.createdAtNanos(), txn.lockWaitNanos(), txn.prepareWaitNanos(),
@@ -443,6 +445,8 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
         admission.speculatedCascaded(lifetime, txn.dependencyCount(), txn.cascadeFanout());
       }
       admission.forcedGrants(txn.forcedGrants());
+      // ratio mode: an abort of any cause is wasted lifetime of its group
+      admission.resolved(txn.isSpeculative(), false, lifetime);
     }
     transactionsMap.remove(txn.getTransactionId(), txn);
     int victims = txn.cascadeFanout();

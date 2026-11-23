@@ -39,7 +39,7 @@ if not os.path.exists(os.path.join(out, "summary.csv")):
     sys.exit(f"no summary.csv in {out}: no cell ran")
 rows = list(csv.DictReader(open(os.path.join(out, "summary.csv"))))
 SUMS = ("admitted_speculative", "admitted_nonspeculative", "forced_grants")
-MEANS = ("p", "r", "r_star", "dependents_mean", "fanout_mean")
+MEANS = ("p", "r", "r_star", "dependents_mean", "fanout_mean", "e_ratio")
 
 def last_line(log, prefix):
     lines = [l for l in open(log, errors="replace") if l.startswith(prefix)]
@@ -98,20 +98,21 @@ print("Admission counters at the end of the runs, summed over nodes and reps (wa
       "non-spec = txns admitted speculative / non-speculative; forced = grants a non-speculative txn took "
       "speculatively (deadlock guard); p, r, r* = the share admitted speculative, the cascade share and the "
       "threshold as of the last outcome (mean over nodes and reps: not the values during the run); deps / "
-      "fan-out = mean reach of the commits / cascades; k1 / k2 / k3+ = cascade share of the speculating "
-      "branches that depended on 1 / 2 / 3+ uncommitted txns.\n")
+      "fan-out = mean reach of the commits / cascades; E s/n = ratio mode's E_spec / E_nonspec as of the last "
+      "outcome; k1 / k2 / k3+ = cascade share of the speculating branches that depended on 1 / 2 / 3+ "
+      "uncommitted txns.\n")
 print("| threads | skew | variant | tps | abort rate | txn p99 us | cascade aborts | spec | non-spec | forced "
-      "| p | r | r* | deps | fan-out | k1 | k2 | k3+ |")
-print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+      "| p | r | r* | deps | fan-out | E s/n | k1 | k2 | k3+ |")
+print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
 for r in sorted(rows, key=lambda r: (float(r["skew"]), int(r["threads"]), r["variant"])):
     a, k, means, cascades = admission(r["threads"], r["skew"], r["variant"])
     share = lambda key: f"{100 * k[key][1] / k[key][0]:.1f}% of {k[key][0]}" if k[key][0] else ""
     mean = lambda key, fmt: fmt.format(sum(means[key]) / len(means[key])) if means[key] else ""
     tail = (f"| {a['admitted_speculative']} | {a['admitted_nonspeculative']} | {a['forced_grants']} "
             f"| {mean('p', '{:.2f}')} | {mean('r', '{:.3f}')} | {mean('r_star', '{:.3f}')} "
-            f"| {mean('dependents_mean', '{:.2f}')} | {mean('fanout_mean', '{:.2f}')} "
+            f"| {mean('dependents_mean', '{:.2f}')} | {mean('fanout_mean', '{:.2f}')} | {mean('e_ratio', '{:.2f}')} "
             f"| {share('k1')} | {share('k2')} | {share('k3plus')} |"
-            if means else "| | | | | | | | | | | |")
+            if means else "| | | | | | | | | | | | |")
     print(f"| {r['threads']} | {r['skew']} | {r['variant']} | {float(r['tps']):.1f} "
           f"| {100 * float(r['abort_rate']):.2f}% | {r['txn_p99_us']} | {cascades} " + tail)
 EOF

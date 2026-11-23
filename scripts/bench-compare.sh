@@ -18,6 +18,8 @@
 #                                      (0: a hard switch), --adm-reach-cap C (0: no reach weighting), on top
 #                                      of ADMISSION_ARGS: several admission configurations in one sweep
 #                                      (also -mysql/-pg), e.g. admission-auto-w0-reach0
+#   admission-ratio[-tau<T>][-eta<E>]  the admission shim in ratio mode (--adm-mode ratio: both modes side
+#                                      by side, p steered by their measured efficiency), --adm-eta E
 #   <shim variant>@wait-die,           a shim variant with that deadlock policy instead of DEADLOCK's
 #   <shim variant>@wound-wait          (e.g. speculative-pg@wound-wait); the label keeps the suffix
 #   sonata-mysql, sonata-pg            Sonata: SHIMS MySQL / PostgreSQL servers (scripts/bench-dbs.sh:
@@ -151,10 +153,15 @@ for rep in $(seq 1 "$reps"); do
         policy="$deadlock"
         [[ $variant != *@* ]] || policy="${variant#*@}"
         admission_args=()
-        if [[ $shim =~ ^admission-(auto|r([0-9.]+))(-tau([0-9]+))?(-w([0-9.]+))?(-reach([0-9]+))?$ ]]; then
-            # e.g. admission-r0.15-tau1000-w0.1-reach10
+        if [[ $shim =~ ^admission-(auto|ratio|r([0-9.]+))(-tau([0-9]+))?(-w([0-9.]+))?(-reach([0-9]+))?(-eta([0-9.]+))?$ ]]; then
+            # e.g. admission-r0.15-tau1000-w0.1-reach10, admission-ratio-eta0.2
             read -r -a admission_args <<< "${ADMISSION_ARGS:-}"
-            admission_args+=(--adm-r-max "${BASH_REMATCH[2]:-auto}")
+            if [[ ${BASH_REMATCH[1]} == ratio ]]; then
+                admission_args+=(--adm-mode ratio)
+            else
+                admission_args+=(--adm-r-max "${BASH_REMATCH[2]:-auto}")
+            fi
+            [[ -z ${BASH_REMATCH[10]} ]] || admission_args+=(--adm-eta "${BASH_REMATCH[10]}")
             [[ -z ${BASH_REMATCH[4]} ]] || admission_args+=(--adm-tau-ms "${BASH_REMATCH[4]}")
             [[ -z ${BASH_REMATCH[6]} ]] || admission_args+=(--adm-width "${BASH_REMATCH[6]}")
             [[ -z ${BASH_REMATCH[8]} ]] || admission_args+=(--adm-reach-cap "${BASH_REMATCH[8]}")

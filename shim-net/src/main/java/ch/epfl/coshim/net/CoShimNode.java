@@ -28,16 +28,22 @@ import java.util.concurrent.TimeUnit;
  *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--stats-interval-s I] [--allow HOST ...]
  *       [--store memory|URL] [--adm-r-max X|auto] [--adm-tau-ms T] [--adm-p-min P] [--adm-p-max P]
  *       [--adm-width W] [--adm-reach-cap C] [--adm-prior-mean M] [--adm-prior-weight W]
+ *       [--adm-mode threshold|ratio] [--adm-eta E]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | admission (speculative, but
  *                         each txn speculates or not as SpeculationAdmission decides at its start)
  *                         | nocc (no concurrency control); default nocc
+ *     --adm-mode          admission: threshold (default: p from r against r*, the options below) |
+ *                         ratio (both modes side by side, p += eta ln(E_spec / E_nonspec) every 250 ms,
+ *                         E = commits per second of branch lifetime; p within --adm-p-min..--adm-p-max)
+ *     --adm-eta           admission ratio: the step size eta; default 0.1
  *     --adm-r-max         admission: the threshold r* on r, the share of speculating txns that cascades
  *                         abort; auto (default): the measured break-even saved / (saved + lost)
  *     --adm-tau-ms        admission: decay time constant of r, saved and lost; default 1000
  *     --adm-p-min         admission: share of txns that speculate once r >= r* + width; default 0.05
  *     --adm-p-max         admission: share of txns that speculate while r <= r* - width; default 1
+ *                         (ratio mode: 0.95, so that both groups are always measured)
  *     --adm-width         admission: half-width of the linear ramp between the two around r*; 0: a
  *                         hard switch; default 0.1
  *     --adm-reach-cap     admission: cap on an outcome's reach (saved x (1 + dependents), lost x (1 +
@@ -92,7 +98,9 @@ public final class CoShimNode {
             double admRMax = adm.rMax();
             long admTauMs = adm.tau().toMillis();
             double admPMin = adm.pMin();
-            double admPMax = adm.pMax();
+            Double admPMax = null;   // default: the mode's
+            SpeculationAdmission.Mode admMode = adm.mode();
+            double admEta = adm.eta();
             double admWidth = adm.width();
             int admReachCap = adm.reachCap();
             double admPriorMean = adm.priorMean();
@@ -118,6 +126,8 @@ public final class CoShimNode {
                         case "--adm-tau-ms" -> admTauMs = Long.parseLong(value);
                         case "--adm-p-min" -> admPMin = Double.parseDouble(value);
                         case "--adm-p-max" -> admPMax = Double.parseDouble(value);
+                        case "--adm-mode" -> admMode = SpeculationAdmission.Mode.valueOf(value.toUpperCase());
+                        case "--adm-eta" -> admEta = Double.parseDouble(value);
                         case "--adm-width" -> admWidth = Double.parseDouble(value);
                         case "--adm-reach-cap" -> admReachCap = Integer.parseInt(value);
                         case "--adm-prior-mean" -> admPriorMean = Double.parseDouble(value);
@@ -135,8 +145,9 @@ public final class CoShimNode {
             }
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
                     prepareWaitDie, statsIntervalSeconds, allowed, store,
-                    new SpeculationAdmission.Config(Duration.ofMillis(admTauMs), admRMax, admPMin, admPMax, admWidth,
-                            admReachCap, admPriorMean, admPriorWeight));
+                    new SpeculationAdmission.Config(admMode, Duration.ofMillis(admTauMs), admRMax, admPMin,
+                            admPMax != null ? admPMax : admMode == SpeculationAdmission.Mode.RATIO ? 0.95 : adm.pMax(),
+                            admWidth, admReachCap, admEta, admPriorMean, admPriorWeight));
         }
 
         private static boolean parsePrepareDeadlock(String value) {
