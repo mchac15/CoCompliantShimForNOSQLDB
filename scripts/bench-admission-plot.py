@@ -2,7 +2,7 @@
 """Latency-throughput plot of a scripts/bench-admission-sweep.sh sweep (or any bench-final.sh sweep of the
 speculative and non-speculative shims against admission / adaptive variants), from its summary.csv.
 
-    scripts/bench-admission-plot.py DIR       # writes DIR/latency-throughput.png, DIR/throughput-threads.png
+    scripts/bench-admission-plot.py DIR [--all]   # writes DIR/latency-throughput.png, DIR/throughput-threads.png
                                               # and, with more than two cap configurations, DIR/peak-gain.png;
                                               # with at most 6 cells, DIR/tps-by-variant.png
 
@@ -17,7 +17,8 @@ one panel per skew (where a system collapses under load). tps-by-variant.png (sm
 pilot over a few cells): one panel per (threads, skew) cell, every variant's throughput as a
 horizontal bar, value at its end; the baselines in their colors, the candidates in theirs.
 
-With more than two cap configurations, those two figures show two of them: the best mean peak gain
+With more than two cap configurations (and without --all, which shows them all), those two figures
+show two of them: the best mean peak gain
 (over the skews), and of the others the highest mean throughput at the highest thread count (the
 one that resists a collapse best); peak-gain.png has them all: per skew, a theta x tau grid of each configuration's
 peak throughput (best thread count) relative to the better of the two baselines' peaks (diverging:
@@ -79,6 +80,8 @@ def style(variant, adaptive_order):
             + (f", τ={int(a.group(3)) / 1000:g} s" if a.group(3) else "") \
             + ("" if a.group(4) is None else ", switch" if float(a.group(4)) == 0 else f", ramp ±{a.group(4)}") \
             + ("" if a.group(5) is None else ", no reach" if a.group(5) == "0" else f", reach ≤{a.group(5)}")
+    elif re.fullmatch(r"spec-f(\d+)", system):
+        name = f"Speculative, fanout ≤ {system[len('spec-f'):]}"
     elif m:
         name = f"Adaptive θ={m.group(1)}" + (f", τ={int(m.group(2)) / 1000:g} s" if m.group(2) else "")
     else:
@@ -86,7 +89,7 @@ def style(variant, adaptive_order):
     return dict(color=AQUA, marker=marker, linestyle=dash, name=name)
 
 
-def plot(out):
+def plot(out, show_all=False):
     rows = list(csv.DictReader(open(out / "summary.csv")))
     skews = sorted({r["skew"] for r in rows}, key=float)
     variants = list(dict.fromkeys(r["variant"] for r in rows))
@@ -116,7 +119,7 @@ def plot(out):
     cells = sorted({(int(r["threads"]), r["skew"]) for r in rows}, key=lambda c: (float(c[1]), c[0]))
     if len(cells) <= 6:
         plot_bars(out, rows, cells, variants, {v: style(v, adaptive) for v in variants})
-    if len(adaptive) > 2:
+    if len(adaptive) > 2 and not show_all:
         if all(cap(v) for v in adaptive):   # a theta x tau grid of the per-key cap
             plot_gains(out, adaptive, skews, gain)
         # the trade-off: the best one at the peak, and of the others the best one under the highest load
@@ -298,4 +301,5 @@ def plot_gains(out, adaptive, skews, gain):
 
 
 if __name__ == "__main__":
-    plot(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    args = [a for a in sys.argv[1:] if a != "--all"]
+    plot(Path(args[0] if args else "."), show_all="--all" in sys.argv[1:])
