@@ -32,7 +32,8 @@
 # Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), STATS_INTERVAL_S (0: the nodes log their
 #      counters at shutdown only; N: also every N s), PREPARE_DEADLOCK (none | wait-die: the nodes'
 #      --prepare-deadlock, default none), SPEC_MAX_DEPTH / SPEC_MAX_FANOUT (the nodes' --spec-max-depth /
-#      --spec-max-fanout: caps on speculation, a count or none, default none), GC_LOGS (1: GC and safepoint logs of the nodes and of
+#      --spec-max-fanout: caps on speculation, a count, none or auto, default none), SPEC_FANOUT_ARGS (the
+#      adaptive cap's options for the nodes, e.g. "--spec-fanout-period-ms 15000 --spec-fanout-step 1"), GC_LOGS (1: GC and safepoint logs of the nodes and of
 #      MicroBench, next to the node logs; the shim variants only), DEADLOCK (wait-die | wound-wait, default
 #      wait-die), VARIANTS ("speculative nonspeculative"),
 #      COSHIM_TOKEN (random), CSV (bench-results/<timestamp>.csv), MVN_FLAGS (e.g. -o), and
@@ -159,9 +160,11 @@ for rep in $(seq 1 "$reps"); do
             if [[ "${GC_LOGS:-0}" == 1 ]]; then
                 node_gc=("-Xlog:gc*,safepoint:file=$logs/rep$rep-$variant-s$s.gc:time,uptime")
             fi
+            read -r -a fanout_args <<< "${SPEC_FANOUT_ARGS:-}"
             java ${node_gc[@]+"${node_gc[@]}"} -cp "$cp" ch.epfl.coshim.net.CoShimNode --port "$port" --shim "$shim" --databases "s$s" \
                 --lock-timeout-ms "$lock_timeout" --deadlock "$policy" --prepare-deadlock "${PREPARE_DEADLOCK:-none}" \
                 --spec-max-depth "${SPEC_MAX_DEPTH:-none}" --spec-max-fanout "${SPEC_MAX_FANOUT:-none}" --stats-interval-s "${STATS_INTERVAL_S:-0}" --store "$store" \
+                ${fanout_args[@]+"${fanout_args[@]}"} \
                 > "$logs/rep$rep-$variant-s$s.log" 2>&1 &
             nodes+=($!)
             until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
