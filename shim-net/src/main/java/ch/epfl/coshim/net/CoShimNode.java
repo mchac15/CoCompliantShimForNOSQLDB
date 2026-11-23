@@ -29,7 +29,7 @@ import java.util.concurrent.TimeUnit;
  *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--spec-max-depth D] [--spec-max-fanout F]
  *       [--stats-interval-s I] [--allow HOST ...] [--store memory|URL]
  *       [--spec-fanout-start F] [--spec-fanout-min F] [--spec-fanout-max F] [--spec-fanout-step S]
- *       [--spec-fanout-eps E] [--spec-fanout-period-ms T] [--spec-fanout-settle-ms T]
+ *       [--spec-fanout-eps E] [--spec-fanout-period-ms T] [--spec-fanout-settle-ms T] [--spec-fanout-probe-every N]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | nocc (no concurrency
@@ -52,7 +52,8 @@ import java.util.concurrent.TimeUnit;
  *                         below; one "fanout" log line per step); default none (no cap)
  *     --spec-fanout-*     auto's start (4), min (0.25), max (8), step (0.4: F x 1.4 or / 1.4),
  *                         eps (0.05: a drop of the commit rate counts above 5 %), period-ms (5000),
- *                         settle-ms (1000: a period's first commits are not counted)
+ *                         settle-ms (1000: a period's first commits are not counted), probe-every (4:
+ *                         at a bound, F stays that many periods, then probes one step inward)
  *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
  *     --allow             a client address allowed to connect (e.g. an RM host), repeatable; default:
  *                         any authenticated client
@@ -92,6 +93,7 @@ public final class CoShimNode {
             double fStart = fc.start(), fMin = fc.min(), fMax = fc.max(), fStep = fc.step(), fEps = fc.eps();
             long fPeriodMs = fc.period().toMillis();
             long fSettleMs = fc.settle().toMillis();
+            int fProbeEvery = fc.probeEvery();
             long statsIntervalSeconds = 10;
             Set<InetAddress> allowed = new HashSet<>();
             String store = "memory";
@@ -121,6 +123,7 @@ public final class CoShimNode {
                         case "--spec-fanout-eps" -> fEps = Double.parseDouble(value);
                         case "--spec-fanout-period-ms" -> fPeriodMs = Long.parseLong(value);
                         case "--spec-fanout-settle-ms" -> fSettleMs = Long.parseLong(value);
+                        case "--spec-fanout-probe-every" -> fProbeEvery = Integer.parseInt(value);
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
                         case "--allow" -> allowed.add(InetAddress.getByName(value));
                         case "--store" -> store = value;
@@ -139,7 +142,7 @@ public final class CoShimNode {
                     prepareWaitDie,
                     new SpeculationLimits(maxDepth, maxFanout, autoFanout
                             ? new FanoutController(new FanoutController.Config(fStart, fMin, fMax, fStep, fEps,
-                                    Duration.ofMillis(fPeriodMs), Duration.ofMillis(fSettleMs)))
+                                    Duration.ofMillis(fPeriodMs), Duration.ofMillis(fSettleMs), fProbeEvery))
                             : null),
                     statsIntervalSeconds, allowed, store);
         }

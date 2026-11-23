@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Test;
 class FanoutControllerTest {
 
   private static FanoutController controller(double start) {
-    return new FanoutController(new FanoutController.Config(start, 0.25, 8, 0.25, 0.02, Duration.ofSeconds(1), Duration.ZERO));
+    return new FanoutController(new FanoutController.Config(start, 0.25, 8, 0.25, 0.02, Duration.ofSeconds(1), Duration.ZERO, 2));
   }
 
   private static void commits(FanoutController c, int n) {
@@ -41,7 +41,7 @@ class FanoutControllerTest {
   }
 
   @Test
-  void turnsAroundAtTheTop() {
+  void stopsAtTheTopAndGoesBackAfterAProbeThatDidNotHelp() {
     FanoutController c = controller(6.4);
     commits(c, 100);
     c.step();                      // down, 6.4 -> 5.12
@@ -49,13 +49,18 @@ class FanoutControllerTest {
     c.step();                      // worse: up, back to 6.4
     commits(c, 100);
     c.step();                      // better: up, 6.4 -> 8 (exactly the top)
+    commits(c, 100);
+    c.step();                      // flat: on up, 10 is past the top: stops at 8, no turnaround
     assertEquals(8, c.current(), 1e-9);
     commits(c, 100);
-    c.step();                      // flat: on up, 10 is past the top: clamped to 8, turns around
+    c.step();                      // holds (1 of 2)
     assertEquals(8, c.current(), 1e-9);
     commits(c, 100);
-    c.step();                      // flat: on, now down
+    c.step();                      // 2 of 2: probes one step inward
     assertEquals(8 / 1.25, c.current(), 1e-9);
+    commits(c, 101);
+    c.step();                      // +1 %, not clearly better: back to the top
+    assertEquals(8, c.current(), 1e-9);
   }
 
   @Test
@@ -69,14 +74,23 @@ class FanoutControllerTest {
   }
 
   @Test
-  void turnsAroundAtABound() {
+  void leavesTheFloorAfterAProbeThatClearlyHelped() {
     FanoutController c = controller(0.3);
     commits(c, 100);
-    c.step();                      // 0.3 / 1.25 < 0.25: clamped, turns around
+    c.step();                      // 0.3 / 1.25 < 0.25: stops at 0.25, no turnaround
     assertEquals(0.25, c.current(), 1e-9);
     commits(c, 100);
-    c.step();
+    c.step();                      // holds
+    assertEquals(0.25, c.current(), 1e-9);
+    commits(c, 100);
+    c.step();                      // probes up
     assertEquals(0.25 * 1.25, c.current(), 1e-9);
+    commits(c, 110);
+    c.step();                      // +10 %: leaves the floor and goes on up
+    assertEquals(0.25 * 1.25 * 1.25, c.current(), 1e-9);
+    commits(c, 110);
+    c.step();                      // flat: on up, as away from a bound
+    assertEquals(0.25 * Math.pow(1.25, 3), c.current(), 1e-9);
   }
 
   @Test

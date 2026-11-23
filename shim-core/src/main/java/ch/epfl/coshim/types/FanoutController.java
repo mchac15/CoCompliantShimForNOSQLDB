@@ -12,7 +12,13 @@ import java.util.concurrent.atomic.LongAdder;
  * (each measured after {@code settle}: the txns in flight at a change still ran under the old F):
  * if they fell by more than {@code eps}, the last step hurt and the direction reverses; otherwise it
  * keeps going, also when nothing changed. Then F moves one step, x (1 + step) up or / (1 + step) down,
- * within [min, max] (at a bound it turns around). The best static cap falls with the load (skew 0.99:
+ * within [min, max].
+ *
+ * <p>A bound is sticky: F stops there, with no turnaround (a turnaround there is a reversal no
+ * measurement asked for: with steps that rarely clear the noise, F swept from bound to bound). Every
+ * {@code probeEvery} periods it probes one step inward, and keeps it only if the commit rate clearly
+ * rose (by more than {@code eps}); then it goes on inward, else back to the bound. Under heavy load the
+ * best caps are near min (0.3-0.5 at 600-1000 threads, skew 0.95), where F now stays. The best static cap falls with the load (skew 0.99:
  * 4 or more at 100 threads, 1 at 1000), so F should follow it.
  *
  * <p>Going on through a flat stretch matters: the throughput is about flat in F from 8 down to about
@@ -43,11 +49,13 @@ public final class FanoutController {
    * @param period how often it steps
    * @param settle the commits of a period's first {@code settle} are not counted (they still ran
    *     under the previous F); shorter than the period
+   * @param probeEvery at a bound, how many periods F stays before probing one step inward, >= 1
    */
   public record Config(
-      double start, double min, double max, double step, double eps, Duration period, Duration settle) {
+      double start, double min, double max, double step, double eps, Duration period, Duration settle,
+      int probeEvery) {
     public static final Config DEFAULT =
-        new Config(4, 0.25, 8, 0.4, 0.05, Duration.ofSeconds(5), Duration.ofSeconds(1));
+        new Config(4, 0.25, 8, 0.4, 0.05, Duration.ofSeconds(5), Duration.ofSeconds(1), 4);
 
     public Config {
       Objects.requireNonNull(period);
@@ -61,6 +69,9 @@ public final class FanoutController {
       if (settle.isNegative() || settle.compareTo(period) >= 0) {
         throw new IllegalArgumentException("need 0 <= settle < period: " + settle + ", " + period);
       }
+      if (probeEvery < 1) {
+        throw new IllegalArgumentException("probeEvery must be >= 1: " + probeEvery);
+      }
     }
   }
 
@@ -70,6 +81,9 @@ public final class FanoutController {
   // the hill-climb's state, touched by its own thread only
   private int direction = -1;   // start by trying a lower cap
   private double lastRate = -1;
+  private boolean atBound;      // F stopped at min or max
+  private boolean probing;      // F is one step inward of the bound, on trial
+  private int held;             // periods spent at the bound since the last probe
 
   public FanoutController(Config config) {
     this.config = Objects.requireNonNull(config);
@@ -121,26 +135,64 @@ public final class FanoutController {
   String step() {
     double rate = commits.sumThenReset() / (config.period().minus(config.settle()).toNanos() / 1e9);
     boolean compared = lastRate > 0;
-    boolean reversed = compared && rate < lastRate * (1 - config.eps());
-    boolean flat = compared && !reversed && rate <= lastRate * (1 + config.eps());
-    if (reversed) {
-      direction = -direction;   // the last step made it worse: go back
-    }                           // else keep going, also through a flat stretch (see the class comment)
+    boolean reversed = false;
+    boolean flat = false;
+    String bound = "no";
+    if (atBound) {
+      double edge = fanout >= config.max() || probing && direction < 0 ? config.max() : config.min();
+      int inward = edge == config.max() ? -1 : 1;
+      if (probing) {
+        probing = false;
+        if (compared && rate > lastRate * (1 + config.eps())) {
+          atBound = false;   // the step inward clearly helped: leave the bound, go on inward
+          direction = inward;
+          bound = "left";
+        } else {
+          fanout = edge;     // it did not: back to the bound
+          held = 0;
+          lastRate = rate;
+          return log(rate, false, false, "back");
+        }
+      } else if (++held >= config.probeEvery()) {
+        held = 0;
+        probing = true;
+        direction = inward;
+        fanout = inward > 0 ? fanout * (1 + config.step()) : fanout / (1 + config.step());
+        lastRate = rate;     // the probe is judged against the bound's rate
+        return log(rate, false, false, "probe");
+      } else {
+        lastRate = rate;
+        return log(rate, false, false, "hold");
+      }
+    } else {
+      reversed = compared && rate < lastRate * (1 - config.eps());
+      flat = compared && !reversed && rate <= lastRate * (1 + config.eps());
+      if (reversed) {
+        direction = -direction;   // the last step made it worse: go back
+      }                           // else keep going, also through a flat stretch (see the class comment)
+    }
     double next = direction > 0 ? fanout * (1 + config.step()) : fanout / (1 + config.step());
     if (next > config.max() || next < config.min()) {
       next = Math.max(config.min(), Math.min(config.max(), next));
-      direction = -direction;   // at a bound: turn around
+      atBound = true;             // stop there, no turnaround: see the class comment
+      held = 0;
     }
     fanout = next;
     lastRate = rate;
-    return String.format(Locale.ROOT, "rate=%.1f reversed=%d F=%.3f direction=%d flat=%d", rate, reversed ? 1 : 0,
-        next, direction, flat ? 1 : 0);
+    return log(rate, reversed, flat, bound);
+  }
+
+  /** A step's log text (the fields before bound= keep the format of the earlier versions). */
+  private String log(double rate, boolean reversed, boolean flat, String bound) {
+    return String.format(Locale.ROOT, "rate=%.1f reversed=%d F=%.3f direction=%d flat=%d bound=%s", rate,
+        reversed ? 1 : 0, fanout, direction, flat ? 1 : 0, bound);
   }
 
   @Override
   public String toString() {
-    return String.format(Locale.ROOT, "auto (F %.2f in %.2f..%.2f, step %.2f, eps %.2f, every %d ms, settle %d ms)",
+    return String.format(Locale.ROOT,
+        "auto (F %.2f in %.2f..%.2f, step %.2f, eps %.2f, every %d ms, settle %d ms, sticky bounds probed every %d)",
         config.start(), config.min(), config.max(), config.step(), config.eps(), config.period().toMillis(),
-        config.settle().toMillis());
+        config.settle().toMillis(), config.probeEvery());
   }
 }
