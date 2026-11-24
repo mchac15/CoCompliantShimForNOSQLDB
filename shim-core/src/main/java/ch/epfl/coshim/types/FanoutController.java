@@ -3,6 +3,7 @@ package ch.epfl.coshim.types;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -10,27 +11,25 @@ import java.util.concurrent.atomic.LongAdder;
  * An adaptive fanout cap: a hill-climb of the fractional cap F on the shim's commit rate. Every
  * {@code period} it compares the commit rate of the period that just ended with that of the one before
  * (each measured after {@code settle}: the txns in flight at a change still ran under the old F):
- * if they fell by more than {@code eps}, the last step hurt and the direction reverses; otherwise it
- * keeps going, also when nothing changed. Then F moves one step, x (1 + step) up or / (1 + step) down,
- * within [min, max].
+ * <ul>
+ *   <li>a drop by more than {@code eps}: the last step hurt, the direction reverses;
+ *   <li>a rise by more than {@code eps}: the last step helped, it keeps the direction;
+ *   <li>in between (no clear effect): the next direction is drawn at random, up or down with
+ *       probability 1/2.
+ * </ul>
+ * Then F moves one step, x (1 + step) up or / (1 + step) down, clamped to [min, max] (no turnaround at
+ * a bound: a flat step there draws again).
  *
- * <p>A bound is sticky: F stops there, with no turnaround (a turnaround there is a reversal no
- * measurement asked for: with steps that rarely clear the noise, F swept from bound to bound). Every
- * {@code probeEvery} periods it probes one step inward, and keeps it only if the commit rate clearly
- * rose (by more than {@code eps}); then it goes on inward, else back to the bound. Under heavy load the
- * best caps are near min (0.3-0.5 at 600-1000 threads, skew 0.95), where F now stays. The best static cap falls with the load (skew 0.99:
- * 4 or more at 100 threads, 1 at 1000), so F should follow it.
+ * <p>Why the random draw: going on in the same direction after a flat step drifted F to a bound by
+ * default (with no reversal at all at 50-200 threads it walked from its start down to min and stayed
+ * there, 4-14 % below the uncapped shim), and turning up after a flat step pinned F at max under heavy
+ * load (where a single step down looks flat but a few of them pay: skew 0.95 / 800 threads, 499 tps
+ * against 688). A random draw does not favour either bound.
  *
- * <p>Going on through a flat stretch matters: the throughput is about flat in F from 8 down to about
- * 2, and only a cap near 1 or below pays under heavy load. A variant that stepped up on a flat step
- * (to stay high at low load) never crossed that stretch: at skew 0.95 / 800 threads F stayed near 8
- * and the throughput fell to about the uncapped one (499 tps against 688). The price of going on: at
- * low load, where the cap never binds, F sweeps between the bounds (4-6 % lost at 100-200 threads).
- *
- * <p>The defaults are slow on purpose: with 1 s periods, +-15 % steps and a 2 % margin, the noise of a
- * second's commit count (about +-6 % on the difference of two windows) exceeded the effect of a step
- * (3-4 %), F random-walked (25-50 % of the steps reversed) and ended about the reverse of the best
- * static caps (skew 0.95). Now 5 s periods (1 s of them settling), x 1.4 steps and a 5 % margin.
+ * <p>Steps are large on purpose: the throughput moves little with F over a single step (a x 1.4
+ * step: 1-5 % per 15 s window under load, about the noise), while a x 2 step showed about 10 %. The
+ * default x 1.7 sits between them. Periods are long for the same reason (15 s, 3 s of them settling):
+ * with 1 s periods the noise exceeded a step's effect and F random-walked.
  *
  * <p>F is fractional: a writer's cap is drawn once, when a txn first asks to depend on it, as floor(F)
  * plus 1 with probability frac(F) (see {@link Transaction#specCap}): x.y dependents on average.
@@ -45,17 +44,15 @@ public final class FanoutController {
    * @param min the lowest F, > 0 (0 would be the non-speculative shim)
    * @param max the highest F (where the cap no longer binds)
    * @param step a step's relative size: F x (1 + step) or F / (1 + step)
-   * @param eps a drop of the commit rate counts only if larger than this share (noise)
+   * @param eps a change of the commit rate counts only if larger than this share (noise)
    * @param period how often it steps
    * @param settle the commits of a period's first {@code settle} are not counted (they still ran
    *     under the previous F); shorter than the period
-   * @param probeEvery at a bound, how many periods F stays before probing one step inward, >= 1
    */
   public record Config(
-      double start, double min, double max, double step, double eps, Duration period, Duration settle,
-      int probeEvery) {
+      double start, double min, double max, double step, double eps, Duration period, Duration settle) {
     public static final Config DEFAULT =
-        new Config(4, 0.25, 8, 0.4, 0.05, Duration.ofSeconds(5), Duration.ofSeconds(1), 4);
+        new Config(2, 0.25, 8, 0.7, 0.05, Duration.ofSeconds(15), Duration.ofSeconds(3));
 
     public Config {
       Objects.requireNonNull(period);
@@ -69,24 +66,25 @@ public final class FanoutController {
       if (settle.isNegative() || settle.compareTo(period) >= 0) {
         throw new IllegalArgumentException("need 0 <= settle < period: " + settle + ", " + period);
       }
-      if (probeEvery < 1) {
-        throw new IllegalArgumentException("probeEvery must be >= 1: " + probeEvery);
-      }
     }
   }
 
   private final Config config;
+  private final Random random;
   private volatile double fanout;
   private final LongAdder commits = new LongAdder();
   // the hill-climb's state, touched by its own thread only
-  private int direction = -1;   // start by trying a lower cap
+  private int direction;
   private double lastRate = -1;
-  private boolean atBound;      // F stopped at min or max
-  private boolean probing;      // F is one step inward of the bound, on trial
-  private int held;             // periods spent at the bound since the last probe
 
   public FanoutController(Config config) {
+    this(config, new Random());
+  }
+
+  /** @param random the draws of the direction after a flat step (seeded in tests) */
+  FanoutController(Config config, Random random) {
     this.config = Objects.requireNonNull(config);
+    this.random = Objects.requireNonNull(random);
     this.fanout = config.start();
   }
 
@@ -135,64 +133,26 @@ public final class FanoutController {
   String step() {
     double rate = commits.sumThenReset() / (config.period().minus(config.settle()).toNanos() / 1e9);
     boolean compared = lastRate > 0;
-    boolean reversed = false;
-    boolean flat = false;
-    String bound = "no";
-    if (atBound) {
-      double edge = fanout >= config.max() || probing && direction < 0 ? config.max() : config.min();
-      int inward = edge == config.max() ? -1 : 1;
-      if (probing) {
-        probing = false;
-        if (compared && rate > lastRate * (1 + config.eps())) {
-          atBound = false;   // the step inward clearly helped: leave the bound, go on inward
-          direction = inward;
-          bound = "left";
-        } else {
-          fanout = edge;     // it did not: back to the bound
-          held = 0;
-          lastRate = rate;
-          return log(rate, false, false, "back");
-        }
-      } else if (++held >= config.probeEvery()) {
-        held = 0;
-        probing = true;
-        direction = inward;
-        fanout = inward > 0 ? fanout * (1 + config.step()) : fanout / (1 + config.step());
-        lastRate = rate;     // the probe is judged against the bound's rate
-        return log(rate, false, false, "probe");
-      } else {
-        lastRate = rate;
-        return log(rate, false, false, "hold");
-      }
-    } else {
-      reversed = compared && rate < lastRate * (1 - config.eps());
-      flat = compared && !reversed && rate <= lastRate * (1 + config.eps());
-      if (reversed) {
-        direction = -direction;   // the last step made it worse: go back
-      }                           // else keep going, also through a flat stretch (see the class comment)
-    }
+    boolean reversed = compared && rate < lastRate * (1 - config.eps());
+    boolean improved = compared && rate > lastRate * (1 + config.eps());
+    boolean flat = !reversed && !improved;   // also the first step: nothing to compare yet
+    if (reversed) {
+      direction = -direction;                // the last step hurt: go back
+    } else if (flat) {
+      direction = random.nextBoolean() ? 1 : -1;   // no clear effect: up or down at random
+    }                                        // improved: keep going
     double next = direction > 0 ? fanout * (1 + config.step()) : fanout / (1 + config.step());
-    if (next > config.max() || next < config.min()) {
-      next = Math.max(config.min(), Math.min(config.max(), next));
-      atBound = true;             // stop there, no turnaround: see the class comment
-      held = 0;
-    }
-    fanout = next;
+    fanout = Math.max(config.min(), Math.min(config.max(), next));
     lastRate = rate;
-    return log(rate, reversed, flat, bound);
-  }
-
-  /** A step's log text (the fields before bound= keep the format of the earlier versions). */
-  private String log(double rate, boolean reversed, boolean flat, String bound) {
-    return String.format(Locale.ROOT, "rate=%.1f reversed=%d F=%.3f direction=%d flat=%d bound=%s", rate,
-        reversed ? 1 : 0, fanout, direction, flat ? 1 : 0, bound);
+    return String.format(Locale.ROOT, "rate=%.1f reversed=%d F=%.3f direction=%d flat=%d", rate,
+        reversed ? 1 : 0, fanout, direction, flat ? 1 : 0);
   }
 
   @Override
   public String toString() {
     return String.format(Locale.ROOT,
-        "auto (F %.2f in %.2f..%.2f, step %.2f, eps %.2f, every %d ms, settle %d ms, sticky bounds probed every %d)",
+        "auto (F %.2f in %.2f..%.2f, step %.2f, eps %.2f, every %d ms, settle %d ms, random direction when flat)",
         config.start(), config.min(), config.max(), config.step(), config.eps(), config.period().toMillis(),
-        config.settle().toMillis(), config.probeEvery());
+        config.settle().toMillis());
   }
 }

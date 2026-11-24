@@ -4,12 +4,29 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
+import java.util.Random;
 import org.junit.jupiter.api.Test;
 
 class FanoutControllerTest {
 
-  private static FanoutController controller(double start) {
-    return new FanoutController(new FanoutController.Config(start, 0.25, 8, 0.25, 0.02, Duration.ofSeconds(1), Duration.ZERO, 2));
+  /** The direction draws after flat steps, in order (true: up). */
+  private static final class Draws extends Random {
+    private final boolean[] ups;
+    private int next;
+
+    Draws(boolean... ups) {
+      this.ups = ups;
+    }
+
+    @Override
+    public boolean nextBoolean() {
+      return ups[next++];
+    }
+  }
+
+  private static FanoutController controller(double start, boolean... ups) {
+    return new FanoutController(
+        new FanoutController.Config(start, 0.25, 8, 0.25, 0.02, Duration.ofSeconds(1), Duration.ZERO), new Draws(ups));
   }
 
   private static void commits(FanoutController c, int n) {
@@ -19,78 +36,48 @@ class FanoutControllerTest {
   }
 
   @Test
-  void keepsItsDirectionWhileTheCommitRateClearlyRises() {
-    FanoutController c = controller(4);
+  void aFlatStepGoesTheDrawnWay() {
+    FanoutController c = controller(4, false, true);
     commits(c, 100);
-    c.step();                      // first step: down (nothing to compare yet)
+    c.step();                      // first step, nothing to compare: drawn down, 4 -> 3.2
     assertEquals(4 / 1.25, c.current(), 1e-9);
-    commits(c, 110);
-    c.step();                      // +10 %: keep going down
-    assertEquals(4 / 1.25 / 1.25, c.current(), 1e-9);
-  }
-
-  @Test
-  void keepsGoingThroughAFlatStep() {
-    // the throughput is about flat in F over a wide range: only going on crosses it
-    FanoutController c = controller(4);
-    commits(c, 100);
-    c.step();                      // 4 -> 3.2
     commits(c, 101);
-    c.step();                      // +1 %, within eps: still down, 3.2 -> 2.56
-    assertEquals(4 / 1.25 / 1.25, c.current(), 1e-9);
-  }
-
-  @Test
-  void stopsAtTheTopAndGoesBackAfterAProbeThatDidNotHelp() {
-    FanoutController c = controller(6.4);
-    commits(c, 100);
-    c.step();                      // down, 6.4 -> 5.12
-    commits(c, 80);
-    c.step();                      // worse: up, back to 6.4
-    commits(c, 100);
-    c.step();                      // better: up, 6.4 -> 8 (exactly the top)
-    commits(c, 100);
-    c.step();                      // flat: on up, 10 is past the top: stops at 8, no turnaround
-    assertEquals(8, c.current(), 1e-9);
-    commits(c, 100);
-    c.step();                      // holds (1 of 2)
-    assertEquals(8, c.current(), 1e-9);
-    commits(c, 100);
-    c.step();                      // 2 of 2: probes one step inward
-    assertEquals(8 / 1.25, c.current(), 1e-9);
-    commits(c, 101);
-    c.step();                      // +1 %, not clearly better: back to the top
-    assertEquals(8, c.current(), 1e-9);
-  }
-
-  @Test
-  void reversesWhenTheLastStepHurt() {
-    FanoutController c = controller(4);
-    commits(c, 100);
-    c.step();                      // 4 -> 3.2
-    commits(c, 80);
-    c.step();                      // -20 %: back up, 3.2 -> 4
+    c.step();                      // +1 %, within eps: drawn up, 3.2 -> 4
     assertEquals(4, c.current(), 1e-9);
   }
 
   @Test
-  void leavesTheFloorAfterAProbeThatClearlyHelped() {
-    FanoutController c = controller(0.3);
+  void keepsItsDirectionAfterAClearGain() {
+    FanoutController c = controller(4, false);
     commits(c, 100);
-    c.step();                      // 0.3 / 1.25 < 0.25: stops at 0.25, no turnaround
+    c.step();                      // drawn down, 4 -> 3.2
+    commits(c, 110);
+    c.step();                      // +10 %: on down, no draw
+    assertEquals(4 / 1.25 / 1.25, c.current(), 1e-9);
+  }
+
+  @Test
+  void reversesAfterAClearDrop() {
+    FanoutController c = controller(4, false);
+    commits(c, 100);
+    c.step();                      // drawn down, 4 -> 3.2
+    commits(c, 80);
+    c.step();                      // -20 %: back up, no draw
+    assertEquals(4, c.current(), 1e-9);
+  }
+
+  @Test
+  void clampsAtABoundWithoutTurningAround() {
+    FanoutController c = controller(0.3, false, false, true);
+    commits(c, 100);
+    c.step();                      // drawn down, 0.3 / 1.25 < 0.25: clamped
     assertEquals(0.25, c.current(), 1e-9);
     commits(c, 100);
-    c.step();                      // holds
+    c.step();                      // flat, drawn down again: stays at the bound
     assertEquals(0.25, c.current(), 1e-9);
     commits(c, 100);
-    c.step();                      // probes up
+    c.step();                      // flat, drawn up: leaves it
     assertEquals(0.25 * 1.25, c.current(), 1e-9);
-    commits(c, 110);
-    c.step();                      // +10 %: leaves the floor and goes on up
-    assertEquals(0.25 * 1.25 * 1.25, c.current(), 1e-9);
-    commits(c, 110);
-    c.step();                      // flat: on up, as away from a bound
-    assertEquals(0.25 * Math.pow(1.25, 3), c.current(), 1e-9);
   }
 
   @Test
