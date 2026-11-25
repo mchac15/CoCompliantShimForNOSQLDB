@@ -29,7 +29,7 @@ import java.util.concurrent.TimeUnit;
  *       [--lock-timeout-ms T] [--deadlock P] [--prepare-deadlock Q] [--spec-max-depth D] [--spec-max-fanout F]
  *       [--stats-interval-s I] [--allow HOST ...] [--store memory|URL]
  *       [--spec-fanout-start F] [--spec-fanout-min F] [--spec-fanout-max F] [--spec-fanout-step S]
- *       [--spec-fanout-eps E] [--spec-fanout-period-ms T] [--spec-fanout-settle-ms T]
+ *       [--spec-fanout-small-step S] [--spec-fanout-eps E] [--spec-fanout-max-flat N] [--spec-fanout-period-ms T] [--spec-fanout-settle-ms T]
  *     --port              default 7000
  *     --shim              speculative (pseudo.txt) | nonspeculative (strict 2PL baseline: lock() waits
  *                         for the predecessors to commit, no cascades) | nocc (no concurrency
@@ -50,10 +50,11 @@ import java.util.concurrent.TimeUnit;
  *                         txn, or the grant waits; auto: an adaptive fractional cap, hill-climbed on
  *                         the shim's commit rate (see FanoutController, the --spec-fanout-* options
  *                         below; one "fanout" log line per step); default none (no cap)
- *     --spec-fanout-*     auto's start (2), min (0.25), max (8), step (0.7: F x 1.7 or / 1.7),
- *                         eps (0.05: a change of the commit rate counts above 5 %; below, the next
- *                         step goes up or down at random), period-ms (15000), settle-ms (3000: a
- *                         period's first commits are not counted)
+ *     --spec-fanout-*     auto's start (2), min (0.25), max (8), step (0.4: F x 1.4 or / 1.4 after
+ *                         a clear gain), small-step (0.1: while there is no clear effect), eps (0.025:
+ *                         a change of the commit rate against the anchor counts above 2.5 %),
+ *                         max-flat (4 small steps without effect, then re-anchor and turn),
+ *                         period-ms (15000), settle-ms (3000: a period's first commits are not counted)
  *     --stats-interval-s  period of the commit/abort counters log line, 0 = only at shutdown; default 10
  *     --allow             a client address allowed to connect (e.g. an RM host), repeatable; default:
  *                         any authenticated client
@@ -91,6 +92,8 @@ public final class CoShimNode {
             boolean autoFanout = false;
             FanoutController.Config fc = FanoutController.Config.DEFAULT;
             double fStart = fc.start(), fMin = fc.min(), fMax = fc.max(), fStep = fc.step(), fEps = fc.eps();
+            double fSmallStep = fc.smallStep();
+            int fMaxFlat = fc.maxFlat();
             long fPeriodMs = fc.period().toMillis();
             long fSettleMs = fc.settle().toMillis();
             long statsIntervalSeconds = 10;
@@ -119,7 +122,9 @@ public final class CoShimNode {
                         case "--spec-fanout-min" -> fMin = Double.parseDouble(value);
                         case "--spec-fanout-max" -> fMax = Double.parseDouble(value);
                         case "--spec-fanout-step" -> fStep = Double.parseDouble(value);
+                        case "--spec-fanout-small-step" -> fSmallStep = Double.parseDouble(value);
                         case "--spec-fanout-eps" -> fEps = Double.parseDouble(value);
+                        case "--spec-fanout-max-flat" -> fMaxFlat = Integer.parseInt(value);
                         case "--spec-fanout-period-ms" -> fPeriodMs = Long.parseLong(value);
                         case "--spec-fanout-settle-ms" -> fSettleMs = Long.parseLong(value);
                         case "--stats-interval-s" -> statsIntervalSeconds = Long.parseLong(value);
@@ -139,8 +144,8 @@ public final class CoShimNode {
             return new Options(port, shim, databases.split(","), Duration.ofMillis(lockTimeoutMs), deadlock,
                     prepareWaitDie,
                     new SpeculationLimits(maxDepth, maxFanout, autoFanout
-                            ? new FanoutController(new FanoutController.Config(fStart, fMin, fMax, fStep, fEps,
-                                    Duration.ofMillis(fPeriodMs), Duration.ofMillis(fSettleMs)))
+                            ? new FanoutController(new FanoutController.Config(fStart, fMin, fMax, fStep, fSmallStep,
+                                    fEps, fMaxFlat, Duration.ofMillis(fPeriodMs), Duration.ofMillis(fSettleMs)))
                             : null),
                     statsIntervalSeconds, allowed, store);
         }

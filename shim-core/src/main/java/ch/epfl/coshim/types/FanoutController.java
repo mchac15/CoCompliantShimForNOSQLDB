@@ -8,28 +8,25 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * An adaptive fanout cap: a hill-climb of the fractional cap F on the shim's commit rate. Every
- * {@code period} it compares the commit rate of the period that just ended with that of the one before
- * (each measured after {@code settle}: the txns in flight at a change still ran under the old F):
+ * An adaptive fanout cap: a hill-climb of the fractional cap F on the shim's commit rate, against an
+ * anchor. The anchor is the last F that made a clear difference, with the commit rate measured there.
+ * Every {@code period} the rate of the period that just ended (measured after {@code settle}: the txns
+ * in flight at a change still ran under the old F) is compared with the anchor's:
  * <ul>
- *   <li>a drop by more than {@code eps}: the last step hurt, the direction reverses;
- *   <li>a rise by more than {@code eps}: the last step helped, it keeps the direction;
- *   <li>in between (no clear effect): the next direction is drawn at random, up or down with
- *       probability 1/2.
+ *   <li>higher by more than {@code eps}: this F is better, it becomes the anchor and F takes a big step
+ *       on in the same direction (x or / (1 + step));
+ *   <li>lower by more than {@code eps}: the drift since the anchor hurt, F jumps back to the anchor and
+ *       the direction reverses; the next period measures the anchor again (its rate becomes the mean of
+ *       the two readings, so one lucky reading does not keep pulling F back);
+ *   <li>in between: no clear effect yet, F takes a small step on (x or / (1 + smallStep)), still
+ *       compared with the same anchor; after {@code maxFlat} small steps without a clear effect the
+ *       current F becomes the anchor and the direction reverses (F matters little here).
  * </ul>
- * Then F moves one step, x (1 + step) up or / (1 + step) down, clamped to [min, max] (no turnaround at
- * a bound: a flat step there draws again).
+ * The first direction is drawn at random. F is clamped to [min, max].
  *
- * <p>Why the random draw: going on in the same direction after a flat step drifted F to a bound by
- * default (with no reversal at all at 50-200 threads it walked from its start down to min and stayed
- * there, 4-14 % below the uncapped shim), and turning up after a flat step pinned F at max under heavy
- * load (where a single step down looks flat but a few of them pay: skew 0.95 / 800 threads, 499 tps
- * against 688). A random draw does not favour either bound.
- *
- * <p>Steps are large on purpose: the throughput moves little with F over a single step (a x 1.4
- * step: 1-5 % per 15 s window under load, about the noise), while a x 2 step showed about 10 %. The
- * default x 1.7 sits between them. Periods are long for the same reason (15 s, 3 s of them settling):
- * with 1 s periods the noise exceeded a step's effect and F random-walked.
+ * <p>Why an anchor: one step changes the commit rate by about 1-5 % under load (x 1.4, 15 s windows),
+ * within the noise, so a comparison with the previous period alone saw most steps as flat. Against the
+ * anchor the small effects of several steps add up until they show.
  *
  * <p>F is fractional: a writer's cap is drawn once, when a txn first asks to depend on it, as floor(F)
  * plus 1 with probability frac(F) (see {@link Transaction#specCap}): x.y dependents on average.
@@ -43,16 +40,19 @@ public final class FanoutController {
    * @param start F at start
    * @param min the lowest F, > 0 (0 would be the non-speculative shim)
    * @param max the highest F (where the cap no longer binds)
-   * @param step a step's relative size: F x (1 + step) or F / (1 + step)
+   * @param step a big step's relative size, after a clear gain: F x (1 + step) or F / (1 + step)
+   * @param smallStep a small step's relative size, while there is no clear effect
    * @param eps a change of the commit rate counts only if larger than this share (noise)
+   * @param maxFlat small steps without a clear effect before the current F becomes the anchor
    * @param period how often it steps
    * @param settle the commits of a period's first {@code settle} are not counted (they still ran
    *     under the previous F); shorter than the period
    */
   public record Config(
-      double start, double min, double max, double step, double eps, Duration period, Duration settle) {
+      double start, double min, double max, double step, double smallStep, double eps, int maxFlat,
+      Duration period, Duration settle) {
     public static final Config DEFAULT =
-        new Config(2, 0.25, 8, 0.7, 0.05, Duration.ofSeconds(15), Duration.ofSeconds(3));
+        new Config(2, 0.25, 8, 0.4, 0.1, 0.025, 4, Duration.ofSeconds(15), Duration.ofSeconds(3));
 
     public Config {
       Objects.requireNonNull(period);
@@ -60,8 +60,9 @@ public final class FanoutController {
       if (!(min > 0 && min <= start && start <= max)) {
         throw new IllegalArgumentException("need 0 < min <= start <= max: " + min + ", " + start + ", " + max);
       }
-      if (!(step > 0) || !(eps >= 0) || period.isNegative() || period.isZero()) {
-        throw new IllegalArgumentException("step must be > 0, eps >= 0, period > 0");
+      if (!(step > 0) || !(smallStep > 0) || !(eps >= 0) || maxFlat < 1 || period.isNegative()
+          || period.isZero()) {
+        throw new IllegalArgumentException("need step, smallStep > 0, eps >= 0, maxFlat >= 1, period > 0");
       }
       if (settle.isNegative() || settle.compareTo(period) >= 0) {
         throw new IllegalArgumentException("need 0 <= settle < period: " + settle + ", " + period);
@@ -75,13 +76,16 @@ public final class FanoutController {
   private final LongAdder commits = new LongAdder();
   // the hill-climb's state, touched by its own thread only
   private int direction;
-  private double lastRate = -1;
+  private double anchorF;
+  private double anchorRate = -1;   // < 0: no period measured yet
+  private int smallSteps;           // since the anchor
+  private boolean remeasure;        // F is back at the anchor: the next period measures it again
 
   public FanoutController(Config config) {
     this(config, new Random());
   }
 
-  /** @param random the draws of the direction after a flat step (seeded in tests) */
+  /** @param random the draw of the first direction (seeded in tests) */
   FanoutController(Config config, Random random) {
     this.config = Objects.requireNonNull(config);
     this.random = Objects.requireNonNull(random);
@@ -132,27 +136,65 @@ public final class FanoutController {
   /** One hill-climb step; returns its log text. */
   String step() {
     double rate = commits.sumThenReset() / (config.period().minus(config.settle()).toNanos() / 1e9);
-    boolean compared = lastRate > 0;
-    boolean reversed = compared && rate < lastRate * (1 - config.eps());
-    boolean improved = compared && rate > lastRate * (1 + config.eps());
-    boolean flat = !reversed && !improved;   // also the first step: nothing to compare yet
-    if (reversed) {
-      direction = -direction;                // the last step hurt: go back
-    } else if (flat) {
-      direction = random.nextBoolean() ? 1 : -1;   // no clear effect: up or down at random
-    }                                        // improved: keep going
-    double next = direction > 0 ? fanout * (1 + config.step()) : fanout / (1 + config.step());
+    String event;
+    if (anchorRate < 0) {                          // first period: the start is the first anchor
+      anchor(rate);
+      direction = random.nextBoolean() ? 1 : -1;
+      moveSmall();
+      event = "start";
+    } else if (remeasure) {                        // measured the anchor again
+      anchorRate = (anchorRate + rate) / 2;
+      remeasure = false;
+      moveSmall();
+      event = "remeasured";
+    } else if (rate > anchorRate * (1 + config.eps())) {
+      anchor(rate);                                // better: keep going, big
+      move(config.step());
+      event = "better";
+    } else if (rate < anchorRate * (1 - config.eps())) {
+      fanout = anchorF;                            // worse: back to the anchor, the other way next
+      direction = -direction;
+      smallSteps = 0;
+      remeasure = true;
+      event = "back";
+    } else if (smallSteps >= config.maxFlat()) {
+      anchor(rate);                                // F matters little here: anchor, the other way
+      direction = -direction;
+      moveSmall();
+      event = "reanchored";
+    } else {
+      moveSmall();                    // no clear effect yet: on, small
+      event = "flat";
+    }
+    return String.format(Locale.ROOT,
+        "rate=%.1f reversed=%d F=%.3f direction=%d flat=%d event=%s anchorF=%.3f anchorRate=%.1f", rate,
+        event.equals("back") ? 1 : 0, fanout, direction, event.equals("flat") ? 1 : 0, event, anchorF,
+        anchorRate);
+  }
+
+  private void anchor(double rate) {
+    anchorF = fanout;
+    anchorRate = rate;
+    smallSteps = 0;
+  }
+
+  /** F one step of relative size {@code size} in the current direction, clamped. */
+  private void move(double size) {
+    double next = direction > 0 ? fanout * (1 + size) : fanout / (1 + size);
     fanout = Math.max(config.min(), Math.min(config.max(), next));
-    lastRate = rate;
-    return String.format(Locale.ROOT, "rate=%.1f reversed=%d F=%.3f direction=%d flat=%d", rate,
-        reversed ? 1 : 0, fanout, direction, flat ? 1 : 0);
+  }
+
+  private void moveSmall() {
+    move(config.smallStep());
+    smallSteps++;
   }
 
   @Override
   public String toString() {
     return String.format(Locale.ROOT,
-        "auto (F %.2f in %.2f..%.2f, step %.2f, eps %.2f, every %d ms, settle %d ms, random direction when flat)",
-        config.start(), config.min(), config.max(), config.step(), config.eps(), config.period().toMillis(),
-        config.settle().toMillis());
+        "auto (F %.2f in %.2f..%.2f, step %.2f, small step %.2f, eps %.3f, max flat %d, every %d ms, "
+            + "settle %d ms, anchored)",
+        config.start(), config.min(), config.max(), config.step(), config.smallStep(), config.eps(),
+        config.maxFlat(), config.period().toMillis(), config.settle().toMillis());
   }
 }
