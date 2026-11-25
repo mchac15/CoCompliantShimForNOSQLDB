@@ -209,8 +209,10 @@ class Chain<K, V> {
    * lock_timeout breaks (the whole shim then stalls until it expires: seen with a fanout cap of 1).
    * Waiting only for older txns' commits keeps every wait for a commit going from a younger txn to an
    * older one, the direction of prepare()'s wait-die. A grant taken this way still counts the txn as a
-   * dependent (the fanout counts stay exact) and is counted as forced. Not with a cap of 0, which
-   * disables speculation: that one keeps the non-speculative baseline's waits.
+   * dependent (the fanout counts stay exact) and is counted as forced. Also with a cap of 0: it does
+   * not make the shim the baseline, the grants with no undecided writer ahead (behind a reader, a
+   * committing txn, a blind write) still come at the speculation point, and their prepare() waits for
+   * the commit ahead, so the cycle can form there too (issue #104: a 27 s stall at 800 threads).
    *
    * @param deadlineNanos a {@link System#nanoTime()} deadline
    * @param limits the caps on speculative grants
@@ -286,7 +288,7 @@ class Chain<K, V> {
         if (pred == null || pred.allHoldersIn(ready)) {
           List<Transaction<K, V>> b = new ArrayList<>();
           Refusal r = bounded ? admit(txn, limits, b) : null;
-          if (r != null && policy != DeadlockPolicy.WAIT_DIE && limits.allowsSpeculation() && hasYounger(txn, b)) {
+          if (r != null && policy != DeadlockPolicy.WAIT_DIE && hasYounger(txn, b)) {
             // the refused grant would wait for a younger txn to commit: taken anyway (see awaitLockReady)
             if (limits.limitsFanout()) {
               txn.forceSpecDependencies(riskyAhead(txn.getLock(key).node()));

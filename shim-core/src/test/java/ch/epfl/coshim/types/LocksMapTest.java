@@ -932,6 +932,32 @@ class LocksMapTest {
   }
 
   @Test
+  void aCapOfZeroAlsoTakesARefusedGrantRatherThanWaitForAYoungerTxnsCommit() {
+    // issue #104: a cap of 0 still grants at the speculation point when no undecided writer is ahead,
+    // so the cross-shim cycle can form; o is granted past the cap as with a cap of 1
+    LocksMap<String, String> locks = limited(NONE, 0, DeadlockPolicy.WOUND_WAIT);
+    Transaction<String, String> o = txn("o", 1);
+    Transaction<String, String> w = txn("w", 2);
+    locks.lock("x", w, LockMode.EXCLUSIVE, LONG);
+    set(locks, w, Status.EXECUTED);
+
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", o, LockMode.SHARED, Duration.ofMillis(100)));
+    assertEquals(1, o.limitForced());
+  }
+
+  @Test
+  void aCapOfZeroStillHoldsBackAGrantBehindAnOlderTxn() {
+    LocksMap<String, String> locks = limited(NONE, 0, DeadlockPolicy.WOUND_WAIT);
+    Transaction<String, String> w = txn("w", 1);
+    Transaction<String, String> y = txn("y", 2);
+    locks.lock("x", w, LockMode.EXCLUSIVE, LONG);
+    set(locks, w, Status.EXECUTED);
+
+    assertEquals(LockResult.TIMED_OUT, locks.lock("x", y, LockMode.SHARED, Duration.ofMillis(100)));
+    assertEquals(0, y.limitForced());
+  }
+
+  @Test
   void woundWaitStillHoldsBackARefusedGrantBehindAnOlderTxn() {
     LocksMap<String, String> locks = limited(NONE, 1, DeadlockPolicy.WOUND_WAIT);
     Transaction<String, String> w = txn("w", 1);
@@ -992,19 +1018,17 @@ class LocksMapTest {
   }
 
   @Test
-  void underWoundWaitARefusedOlderTxnWaitsForAnExecutedYoungerOne() throws Exception {
+  void underWoundWaitADepthCapOfZeroTakesTheGrantRatherThanWaitForAnExecutedYoungerOne() {
+    // issue #104: waiting for the younger txn's commit could close a cross-shim cycle through prepare()
     LocksMap<String, String> locks = limited(0, NONE, DeadlockPolicy.WOUND_WAIT);
     Transaction<String, String> young = txn("young", 2);
     Transaction<String, String> old = txn("old", 1);
     locks.lock("x", young, LockMode.EXCLUSIVE, LONG);
     set(locks, young, Status.EXECUTED);
-    CompletableFuture<LockResult> f =
-        CompletableFuture.supplyAsync(() -> locks.lock("x", old, LockMode.SHARED, LONG));
-    assertBlocked(f);
-    assertEquals(Status.EXECUTED, young.getStatus(), "an executed txn is never wounded");
 
-    commit(locks, young);
-    assertEquals(LockResult.ACQUIRED, f.get(2, TimeUnit.SECONDS));
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", old, LockMode.SHARED, Duration.ofMillis(100)));
+    assertEquals(1, old.limitForced());
+    assertEquals(Status.EXECUTED, young.getStatus(), "an executed txn is never wounded");
   }
 
   // ---- a cascade dooms only the holders that may have read the key ----
