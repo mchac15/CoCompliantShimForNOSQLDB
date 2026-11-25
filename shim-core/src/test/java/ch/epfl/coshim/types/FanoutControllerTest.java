@@ -97,12 +97,23 @@ class FanoutControllerTest {
   }
 
   @Test
-  void clampsAtTheBounds() {
+  void belowTheMinimumItIsZeroAndComesBackAtTheMinimum() {
     FanoutController c = controller(0.26, false);
-    period(c, 100);                // 0.26 / 1.1 < 0.25: clamped
+    period(c, 100);                // 0.26 / 1.1 < 0.25: 0
+    assertEquals(0, c.current(), 1e-9);
+    assertEquals(0, c.drawCap());
+    period(c, 100);                // flat, down: stays at 0
+    period(c, 100);                // flat (3 small steps)
+    assertEquals(0, c.current(), 1e-9);
+    period(c, 100);                // still flat: re-anchor at 0 and turn up, to the minimum
     assertEquals(0.25, c.current(), 1e-9);
-    period(c, 100);                // flat, down again: stays
-    assertEquals(0.25, c.current(), 1e-9);
+  }
+
+  @Test
+  void staysAtTheMaximum() {
+    FanoutController c = controller(7.5, true);
+    period(c, 100);                // 7.5 x 1.1 > 8: 8
+    assertEquals(8, c.current(), 1e-9);
   }
 
   @Test

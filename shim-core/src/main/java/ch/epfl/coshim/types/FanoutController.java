@@ -22,7 +22,11 @@ import java.util.concurrent.atomic.LongAdder;
  *       compared with the same anchor; after {@code maxFlat} small steps without a clear effect the
  *       current F becomes the anchor and the direction reverses (F matters little here).
  * </ul>
- * The first direction is drawn at random. F is clamped to [min, max].
+ * The first direction is drawn at random. F stays at most {@code max}; a step down below {@code min}
+ * goes to 0 and a step up from 0 back to {@code min}. At F = 0 no grant speculates, except the ones the
+ * deadlock guard forces (a refused grant that would wait for a younger txn, see Chain#awaitLockReady):
+ * under heavy load a cap of 0 matched or beat the non-speculative shim (skew 0.95, 800-1000 threads),
+ * and the lowest positive F was where the cap kept ending up.
  *
  * <p>Why an anchor: one step changes the commit rate by about 1-5 % under load (x 1.4, 15 s windows),
  * within the noise, so a comparison with the previous period alone saw most steps as flat. Against the
@@ -38,7 +42,7 @@ public final class FanoutController {
 
   /**
    * @param start F at start
-   * @param min the lowest F, > 0 (0 would be the non-speculative shim)
+   * @param min the lowest positive F, > 0 (below it F is 0)
    * @param max the highest F (where the cap no longer binds)
    * @param step a big step's relative size, after a clear gain: F x (1 + step) or F / (1 + step)
    * @param smallStep a small step's relative size, while there is no clear effect
@@ -178,10 +182,14 @@ public final class FanoutController {
     smallSteps = 0;
   }
 
-  /** F one step of relative size {@code size} in the current direction, clamped. */
+  /** F one step of relative size {@code size} in the current direction: at most max, 0 below min. */
   private void move(double size) {
+    if (fanout == 0) {
+      fanout = direction > 0 ? config.min() : 0;
+      return;
+    }
     double next = direction > 0 ? fanout * (1 + size) : fanout / (1 + size);
-    fanout = Math.max(config.min(), Math.min(config.max(), next));
+    fanout = next < config.min() ? 0 : Math.min(config.max(), next);
   }
 
   private void moveSmall() {
