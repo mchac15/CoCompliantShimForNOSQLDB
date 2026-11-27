@@ -56,7 +56,7 @@ public final class FanoutController {
       double start, double min, double max, double step, double smallStep, double eps, int maxFlat,
       Duration period, Duration settle) {
     public static final Config DEFAULT =
-        new Config(2, 0.25, 8, 0.4, 0.1, 0.025, 4, Duration.ofSeconds(15), Duration.ofSeconds(3));
+        new Config(2, 0.25, 8, 0.4, 0.2, 0.025, 4, Duration.ofSeconds(15), Duration.ofSeconds(3));
 
     public Config {
       Objects.requireNonNull(period);

@@ -51,7 +51,7 @@ import java.util.concurrent.TimeUnit;
  *                         the shim's commit rate (see FanoutController, the --spec-fanout-* options
  *                         below; one "fanout" log line per step); default none (no cap)
  *     --spec-fanout-*     auto's start (2), min (0.25: the lowest positive F, below it 0), max (8), step (0.4: F x 1.4 or / 1.4 after
- *                         a clear gain), small-step (0.1: while there is no clear effect), eps (0.025:
+ *                         a clear gain), small-step (0.2: while there is no clear effect), eps (0.025:
  *                         a change of the commit rate against the anchor counts above 2.5 %),
  *                         max-flat (4 small steps without effect, then re-anchor and turn),
  *                         period-ms (15000), settle-ms (3000: a period's first commits are not counted)
