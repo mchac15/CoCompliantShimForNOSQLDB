@@ -69,6 +69,9 @@ final class CoShimParticipant implements Participant {
     /** Reads only the written keys, one by one through the shim: the others are still 0. */
     @Override
     public long sum(int tables, int tableSize, Map<String, Set<Integer>> written) throws SQLException {
+        // the audit, after the drain: one local txn (5 messages) per written key, so with the emulated round
+        // trip it took 10-25 min per run (5 x 10 ms per key); it measures nothing, so no delay from here on
+        remote.withRoundTrip(Duration.ZERO);
         long sum = 0;
         try (Connection c = dataSource.getConnection()) {
             for (int t = 0; t < tables; t++) {
