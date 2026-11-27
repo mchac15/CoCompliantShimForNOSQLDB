@@ -88,7 +88,7 @@ def point(nodes_dir):
             v = int(sp.get(f"cascade_root_{c}_victims_total", ["0"])[0])
             tot["victims_by_root"][c] = tot["victims_by_root"].get(c, 0) + v
         for name, k in (("marked", "cascade_marked_total"), ("marked_executed", "cascade_marked_executed_total"),
-                        ("marked_waiting", "cascade_marked_waiting_total")):
+                        ("marked_waiting", "cascade_spared_total" if "cascade_spared_total" in sp else "cascade_marked_waiting_total")):
             tot[name] += int(sp.get(k, ["0"])[0])
         for d, (c, a, _) in hist(sp.get("depth", []), 3).items():
             pc, pa = tot["depth"].get(d, (0, 0))
