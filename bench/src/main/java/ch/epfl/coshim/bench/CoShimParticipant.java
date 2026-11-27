@@ -1,5 +1,6 @@
 package ch.epfl.coshim.bench;
 
+import java.time.Duration;
 import ch.epfl.coshim.jdbc.CoShimDataSource;
 import ch.epfl.coshim.jdbc.KvSession;
 import ch.epfl.coshim.net.Codec;
@@ -21,14 +22,15 @@ final class CoShimParticipant implements Participant {
     private final RemoteCoShim<TableKey<String>, String> remote;
     private final DataSource dataSource;
 
-    CoShimParticipant(String spec, String token) {
+    /** @param rttUs the emulated round trip to the node, every message alike (0: none) */
+    CoShimParticipant(String spec, String token, double rttUs) {
         this.spec = spec;
         int colon = spec.indexOf(':');
         int slash = spec.indexOf('/');
         InetSocketAddress node = new InetSocketAddress(spec.substring(0, colon),
                 Integer.parseInt(spec.substring(colon + 1, slash)));
         remote = new RemoteCoShim<>(node, spec.substring(slash + 1), token, new TableKeyCodec<>(Codec.UTF8),
-                Codec.UTF8).verify();
+                Codec.UTF8).withRoundTrip(Duration.ofNanos(Math.round(rttUs * 1000))).verify();
         dataSource = new DataSourceProxyCoShim(new CoShimDataSource<>(spec, remote));
     }
 

@@ -28,7 +28,7 @@ sealed interface Participant extends AutoCloseable permits CoShimParticipant, Sq
         if (token == null || token.isEmpty()) {
             throw new IllegalArgumentException("set COSHIM_TOKEN to the shim nodes' token");
         }
-        return new CoShimParticipant(spec, token);
+        return new CoShimParticipant(spec, token, config.rttUs());
     }
 
     /** Whether {@code spec} names a shim database, which needs COSHIM_TOKEN. */

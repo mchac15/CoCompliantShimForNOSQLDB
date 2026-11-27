@@ -14,15 +14,15 @@
 #
 # The configurations (ops per branch; totals per txn). "one hot": branch 0 at skew 0.95, the others
 # uniform (0.5). The totals stay near 20 where an exact read ratio needs it (4 and 6 branches: 24).
-#   base        2 branches, all hot, 5 r + 5 w (20 ops, read ratio 0.5), think 10 +- 5 ms
+#   base        2 branches, all hot, 5 r + 5 w (20 ops, read ratio 0.5), round trip 10 ms on every message
 #   b2-onehot   2 branches, one hot, 5 r + 5 w
 #   b4-onehot   4 branches, one hot, 3 r + 3 w (24 ops)
 #   b6-onehot   6 branches, one hot, 2 r + 2 w (24 ops)
 #   b4-allhot   4 branches, all hot, 3 r + 3 w (24 ops)
 #   ops50       2 branches, 13 r + 13 w (52 ops)
 #   ops100      2 branches, 25 r + 25 w (100 ops)
-#   rtt2        think 2 +- 1 ms
-#   rtt30       think 30 +- 15 ms
+#   rtt2        round trip 2 ms (client <-> shim and coordinator <-> shim alike)
+#   rtt30       round trip 30 ms
 #   ratio25     2 branches, 3 r + 9 w (24 ops, read ratio 0.25)
 #   ratio75     2 branches, 9 r + 3 w (24 ops, read ratio 0.75)
 #
@@ -43,8 +43,8 @@ configs=(
     "b4-allhot|--branches 4 --reads 3 --writes 3"
     "ops50|--reads 13 --writes 13"
     "ops100|--reads 25 --writes 25"
-    "rtt2|--think-mean-us 2000 --think-sd-us 1000"
-    "rtt30|--think-mean-us 30000 --think-sd-us 15000"
+    "rtt2|--rtt-us 2000"
+    "rtt30|--rtt-us 30000"
     "ratio25|--reads 3 --writes 9"
     "ratio75|--reads 9 --writes 3"
 )

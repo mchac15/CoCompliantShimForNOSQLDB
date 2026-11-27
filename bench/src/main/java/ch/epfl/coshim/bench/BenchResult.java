@@ -219,6 +219,10 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                     config.thinkMeanUs() > 0 ? String.format(Locale.ROOT, "N(%.0f, %.0f) us", config.thinkMeanUs(),
                             config.thinkSdUs()) : "none"));
         }
+        if (config.rttUs() > 0) {
+            sb.append(String.format(Locale.ROOT, "  network round trip to the shims: %.0f us, every message%n",
+                    config.rttUs()));
+        }
         sb.append(String.format(Locale.ROOT, "  committed: %d (%.1f txn/s)   rolled back: %d (+%d by TC timeout), "
                         + "unknown: %d, abort rate %.1f%%%n",
                 committed, tps(), aborted, timedOut, unknown, 100 * abortRate()));
@@ -254,7 +258,7 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         "branch_failures", "ops_mean", "ops_sd", "ops_max", "think_mean_us", "think_sd_us",
                         "mean_attempts", "retried_share", "op_p50_us", "op_p99_us", "txn_active_p50_us",
                         "txn_active_p99_us", "retries_p50", "retries_p99", "dist", "hot_share", "randomness",
-                        "pipelined_branches")
+                        "pipelined_branches", "rtt_us")
                 .collect(Collectors.joining(","));
     }
 
@@ -270,7 +274,8 @@ public record BenchResult(BenchConfig config, long committed, long aborted, long
                         String.format(Locale.ROOT, "%.4f", retriedShare()), opLatencyPercentileUs(50),
                         opLatencyPercentileUs(99), activeLatencyPercentileUs(50), activeLatencyPercentileUs(99),
                         retriesPercentile(50), retriesPercentile(99), config.dist(),
-                        String.format(Locale.ROOT, "%.4f", hotShare), config.randomness(), config.pipelinedBranches())
+                        String.format(Locale.ROOT, "%.4f", hotShare), config.randomness(), config.pipelinedBranches(),
+                        config.rttUs())
                 .map(String::valueOf)
                 .collect(Collectors.joining(","));
     }

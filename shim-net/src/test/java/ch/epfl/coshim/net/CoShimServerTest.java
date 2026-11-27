@@ -77,6 +77,22 @@ class CoShimServerTest {
     }
 
     @Test
+    void anEmulatedRoundTripDelaysEveryMessageAlike() throws Exception {
+        startNode(new NoCcShim<>(store), Set.of());
+        client = connect(TOKEN).verify().withRoundTrip(java.time.Duration.ofMillis(40));
+
+        long t0 = System.nanoTime();
+        client.start("t1");
+        client.put("t1", "x", "1");
+        client.end("t1");
+        client.prepare("t1");
+        client.commit("t1");             // 5 messages, 40 ms each
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        assertTrue(ms >= 200, "5 round trips of 40 ms took " + ms + " ms");
+        assertEquals("1", store.get("x"));
+    }
+
+    @Test
     void shimAbortsReachTheClientAsTxnAbortedException() throws Exception {
         startNode(new NoCcShim<>(store), Set.of());
         client = connect(TOKEN);
