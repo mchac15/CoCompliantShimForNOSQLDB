@@ -17,7 +17,7 @@
 # per server); set them back with the variables below on a large machine.
 #
 # Env: MYSQL_PORT (3306), PG_PORT (5432), MYSQL_IMAGE (mysql:8.4), POSTGRES_IMAGE (postgres:16),
-#      MYSQL_BUFFER_POOL (2G), PG_SHARED_BUFFERS (2GB), PG_SHM_SIZE (4g),
+#      MYSQL_BUFFER_POOL (2G), PG_SHARED_BUFFERS (2GB), PG_SHM_SIZE (4g), DB_MAX_CONNECTIONS (6000),
 #      MYSQL_LOCK_WAIT_TIMEOUT_S (60), PG_LOCK_TIMEOUT (60s): how long a lock wait lasts on the servers.
 set -euo pipefail
 
@@ -63,7 +63,7 @@ start_mysql() {
         -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=acta \
         "${MYSQL_IMAGE:-mysql:8.4}" \
         --bind-address=127.0.0.1 --port="$port" --mysqlx=OFF \
-        --max-connections=6000 \
+        --max-connections="${DB_MAX_CONNECTIONS:-6000}" \
         --innodb-lock-wait-timeout="${MYSQL_LOCK_WAIT_TIMEOUT_S:-60}" \
         --innodb-use-native-aio=OFF \
         --innodb-buffer-pool-size="${MYSQL_BUFFER_POOL:-2G}" \
@@ -78,7 +78,7 @@ start_postgres() {
         -e POSTGRES_USER=acta -e POSTGRES_DB=acta -e POSTGRES_HOST_AUTH_METHOD=trust \
         "${POSTGRES_IMAGE:-postgres:16}" \
         postgres -c listen_addresses=127.0.0.1 -p "$port" \
-        -c max_connections=6000 \
+        -c max_connections="${DB_MAX_CONNECTIONS:-6000}" \
         -c lock_timeout="${PG_LOCK_TIMEOUT:-60s}" \
         -c deadlock_timeout=1s \
         -c max_prepared_transactions=1500 \
