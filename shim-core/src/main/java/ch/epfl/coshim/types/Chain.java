@@ -2,6 +2,7 @@ package ch.epfl.coshim.types;
 
 import ch.epfl.coshim.types.LockType.LockMode;
 import ch.epfl.coshim.types.Transaction.Status;
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
@@ -16,9 +17,10 @@ import java.util.concurrent.TimeUnit;
  * <p>Latching: {@link LocksMap} calls the methods that modify the chain ({@link #acquire}, {@link
  * #upgrade}, {@link #release}, {@link #abortAndRelease}) only inside {@code locksMap.compute(key,
  * ...)}, so they run under the key's map entry, and each of them is also {@code synchronized} on the
- * chain. Readers ({@link #awaitPredecessor}, {@link #read}) only take the chain's monitor, which is
- * enough to see a consistent chain, and waiters {@code wait()} on it: every change that can satisfy
- * a wait predicate ends with {@code notifyAll()}. Lock order: map entry, then chain, then txn.
+ * chain. Readers ({@link #awaitLockReady}, {@link #awaitResolved}, {@link #read}) only take the
+ * chain's monitor, which is enough to see a consistent chain, and waiters {@code wait()} on it:
+ * every change that can satisfy a wait predicate ends with {@code notifyAll()}. Lock order: map
+ * entry, then chain, then txn.
  */
 class Chain<K, V> {
   private static final Set<Status> MARKABLE = EnumSet.of(Status.STARTED, Status.EXECUTED);
@@ -30,6 +32,16 @@ class Chain<K, V> {
    */
   private static final Set<Status> PREPARE_NO_CYCLE =
       EnumSet.of(Status.COMMITTED, Status.COMMITTING, Status.MUST_ABORT, Status.ABORTED);
+  /** Holders that can no longer abort: nobody depends on them for the speculation limits. */
+  private static final Set<Status> DECIDED = EnumSet.of(Status.COMMITTING, Status.COMMITTED);
+  /** What a grant the limiter refused waits for, as in the non-speculative baseline. */
+  private static final Set<Status> COMMITTED = EnumSet.of(Status.COMMITTED);
+
+  /** Why the speculation limiter refused a grant. */
+  static enum Refusal {
+    DEPTH,
+    FANOUT
+  }
 
   static enum UpgradeResult {
     /** txn is no longer started, or read-modify-write against read-modify-write: txn aborts. */
@@ -85,9 +97,9 @@ class Chain<K, V> {
    * abort_transaction may have released its locks meanwhile, or end() ran), joins the last node if
    * both are SHARED or appends a new node, and records it in txn.locks_acquired.
    *
-   * @param readsKey txn takes an EXCLUSIVE lock to read k before writing it (get-for-update). Its
-   *     node is marked upgraded, as one upgrade() made: its holder read k, so it is not a blind write
-   *     (the cascade must not stop at it, and an upgrade must not move another txn in front of it)
+   * @param readsKey txn takes an EXCLUSIVE lock to read k before writing it (get-for-update). Its node is marked upgraded, as one upgrade() made: its
+   *     holder read k, so it is not a blind write (the cascade must not stop at it, and an upgrade
+   *     must not move another txn in front of it)
    * @return false if txn is no longer started (nothing was changed): it must abort
    */
   synchronized boolean acquire(Transaction<K, V> txn, LockMode mode, boolean readsKey) {
@@ -157,16 +169,14 @@ class Chain<K, V> {
   }
 
   /**
-   * The wait loop of lock()/upgrade() (ready = at least executed, bounded) and of prepare() (ready =
-   * committed, unbounded): waits until every holder of the predecessor of txn's node on this key is
-   * in {@code ready}. The predecessor is re-read on every wake-up, since it is spliced out or
-   * replaced while waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn
-   * waits until it is spliced out (the cascade marks the dependents before that).
+   * The wait loop of lock()/upgrade() (ready = at least executed): waits, at most until {@code
+   * deadlineNanos}, until every holder of the predecessor of txn's node on this key is in {@code
+   * ready}. The predecessor is re-read on every wake-up, since it is spliced out or replaced while
+   * waiting. An aborted / doomed predecessor holder does not satisfy the wait: txn waits until it is
+   * spliced out (the cascade marks the dependents before that).
    *
    * <p>Deadlock prevention, so that every wait-for edge goes from a younger txn to an older one and
    * no cycle can form. Chains are FIFO, so the common case (younger behind older) just waits.
-   * prepare() is unbounded and never wounds; with wait-die it dies as described below, else its waits
-   * are left to the coordinator.
    *
    * <ul>
    *   <li>wait-die: a txn that would wait for a younger one returns DIE instead.
@@ -184,61 +194,210 @@ class Chain<K, V> {
    *       ones may execute meanwhile and then need not die. Still no cycle: txn only stays blocked
    *       on older txns or on txns past started (which wait on no lock), and as soon as those are
    *       gone it wounds the younger ones it would otherwise wait for.
-   *   <li>none: just wait, until the deadline.
-   *   <li>prepare()'s wait-die (unbounded, policy WAIT_DIE): DIE as soon as a predecessor holder txn
-   *       would wait for is younger than txn (it may be executed or prepared, which nobody can wound,
-   *       and its commit may wait for txn's vote on another shim: the cross-shim cycle). Every wait
-   *       of prepare() then goes from a younger txn to an older one, on every shim alike since the
-   *       ages are global, so no cycle of prepare waits can form. Holders that commit or leave
-   *       without waiting for anyone (PREPARE_NO_CYCLE) are waited for.
    * </ul>
    *
-   * <p>On READY txn is granted on its node (see {@link LockNode#isGranted}): from then on it may read
-   * the holders ahead, so a cascade from them must reach it.
+   * <p>Speculation limits: at the speculation point the grant must also fit {@code limits} (see
+   * {@link SpeculationLimits}); if not, txn keeps waiting (it sleeps on this monitor, and every
+   * commit or abort that can make it fit wakes it up here). Such a wait is the baseline's: txn now
+   * waits for txns that executed to commit, and their commits wait on prepare()/2PC, so the deadlock
+   * prevention treats them as waited for, as when not speculative: wait-die dies if one of the txns
+   * it waits for (the ones that must commit, or the full one) is younger.
    *
-   * @param deadlineNanos a {@link System#nanoTime()} deadline, used only if {@code bounded}
+   * <p>With wound-wait (or none), such a txn is granted anyway, past the caps, instead of waiting for
+   * a younger txn's commit. That younger txn is past started, so it cannot be wounded, and its commit
+   * may wait, in prepare() on another shim, for this txn's branch there: a cross-shim cycle that only
+   * lock_timeout breaks (the whole shim then stalls until it expires: seen with a fanout cap of 1).
+   * Waiting only for older txns' commits keeps every wait for a commit going from a younger txn to an
+   * older one, the direction of prepare()'s wait-die. A grant taken this way still counts the txn as a
+   * dependent (the fanout counts stay exact) and is counted as forced. Also with a cap of 0: it does
+   * not make the shim the baseline, the grants with no undecided writer ahead (behind a reader, a
+   * committing txn, a blind write) still come at the speculation point, and their prepare() waits for
+   * the commit ahead, so the cycle can form there too (issue #104: a 27 s stall at 800 threads).
+   *
+   * @param deadlineNanos a {@link System#nanoTime()} deadline
+   * @param limits the caps on speculative grants
    * @param victims receives the txns marked on WOUND (only with WOUND_WAIT)
    */
-  synchronized WaitResult awaitPredecessor(
+  synchronized WaitResult awaitLockReady(
       Transaction<K, V> txn,
       Set<Status> ready,
-      boolean bounded,
       long deadlineNanos,
       DeadlockPolicy policy,
+      SpeculationLimits limits,
       List<Transaction<K, V>> victims) {
+    return awaitPredecessor(txn, ready, true, deadlineNanos, policy, limits, victims);
+  }
+
+  /**
+   * The wait loop of prepare() (ready = committed): as {@link #awaitLockReady}, but unbounded and
+   * with no deadlock prevention (it never dies nor wounds): its waits are left to the coordinator.
+   * Returns READY or DOOMED (TIMED_OUT only if the thread is interrupted).
+   */
+  synchronized WaitResult awaitResolved(Transaction<K, V> txn, Set<Status> ready) {
+    return awaitResolved(txn, ready, false);
+  }
+
+  /**
+   * prepare()'s wait, with wait-die if {@code waitDie}: DIE as soon as a predecessor holder txn would
+   * wait for is younger than txn (it may be executed or prepared, which nobody can wound, and its
+   * commit may wait for txn's vote on another shim: the cross-shim cycle). Every wait of prepare()
+   * then goes from a younger txn to an older one, on every shim alike since the ages are global, so
+   * no cycle of prepare waits can form. Holders that commit or leave without waiting for anyone
+   * (PREPARE_NO_CYCLE) are waited for. Re-checked on every wake-up: the predecessor changes as nodes
+   * are spliced out, but nothing is ever put in front of a txn in prepare.
+   */
+  synchronized WaitResult awaitResolved(Transaction<K, V> txn, Set<Status> ready, boolean waitDie) {
     while (true) {
       if (txn.isDoomed()) {
         return WaitResult.DOOMED;
       }
       LockNode<K, V> pred = txn.getLock(key).node().getPrev();
       if (pred == null || pred.allHoldersIn(ready)) {
-        txn.getLock(key).node().markGranted(txn);
         return WaitResult.READY;
       }
-      if (bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, ready)) {
+      if (waitDie && pred.hasYoungerHolderNotIn(txn, PREPARE_NO_CYCLE)) {
         return WaitResult.DIE;
-      }
-      if (!bounded && policy == DeadlockPolicy.WAIT_DIE && pred.hasYoungerHolderNotIn(txn, PREPARE_NO_CYCLE)) {
-        return WaitResult.DIE;
-      }
-      if (bounded && policy == DeadlockPolicy.WOUND_WAIT && wound(txn, pred, ready, victims)) {
-        return WaitResult.WOUND;
       }
       try {
-        if (bounded) {
-          long remaining = deadlineNanos - System.nanoTime();
-          if (remaining <= 0) {
-            return WaitResult.TIMED_OUT;
-          }
-          TimeUnit.NANOSECONDS.timedWait(this, remaining);
-        } else {
-          wait();
-        }
+        wait();
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         return WaitResult.TIMED_OUT;
       }
     }
+  }
+
+  private WaitResult awaitPredecessor(
+      Transaction<K, V> txn,
+      Set<Status> ready,
+      boolean bounded,
+      long deadlineNanos,
+      DeadlockPolicy policy,
+      SpeculationLimits limits,
+      List<Transaction<K, V>> victims) {
+    Refusal refused = null;   // statistics only: the first refusal of this wait, and when
+    long refusedAt = 0;
+    try {
+      while (true) {
+        if (txn.isDoomed()) {
+          return WaitResult.DOOMED;
+        }
+        LockNode<K, V> pred = txn.getLock(key).node().getPrev();
+        // the txns a refused grant waits for (null: not refused)
+        List<Transaction<K, V>> blockers = null;
+        if (pred == null || pred.allHoldersIn(ready)) {
+          List<Transaction<K, V>> b = new ArrayList<>();
+          Refusal r = bounded ? admit(txn, limits, b) : null;
+          if (r != null && policy != DeadlockPolicy.WAIT_DIE && hasYounger(txn, b)) {
+            // the refused grant would wait for a younger txn to commit: taken anyway (see awaitLockReady)
+            if (limits.limitsFanout()) {
+              txn.forceSpecDependencies(riskyAhead(txn.getLock(key).node()));
+            } else {
+              txn.forceSpecDependencies(List.of());   // counts the forced grant only
+            }
+            r = null;
+          }
+          if (r == null) {
+            txn.getLock(key).node().markGranted(txn);
+            if (bounded) {
+              recordGrant(txn, pred);
+            }
+            return WaitResult.READY;
+          }
+          if (refused == null) {
+            refused = r;
+            refusedAt = System.nanoTime();
+          }
+          blockers = b;
+        }
+        if (bounded && policy == DeadlockPolicy.WAIT_DIE
+            && (blockers == null ? pred.hasYoungerHolderNotIn(txn, ready) : hasYounger(txn, blockers))) {
+          return WaitResult.DIE;
+        }
+        if (bounded && policy == DeadlockPolicy.WOUND_WAIT
+            && wound(txn, pred, blockers == null ? ready : COMMITTED, victims)) {
+          return WaitResult.WOUND;
+        }
+        try {
+          if (bounded) {
+            long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0) {
+              return WaitResult.TIMED_OUT;
+            }
+            TimeUnit.NANOSECONDS.timedWait(this, remaining);
+          } else {
+            wait();
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return WaitResult.TIMED_OUT;
+        }
+      }
+    } finally {
+      if (refused != null) {
+        txn.recordLimited(refused == Refusal.DEPTH, System.nanoTime() - refusedAt);
+      }
+    }
+  }
+
+  /**
+   * The speculation limits' check of a grant at the speculation point, under this monitor: null if
+   * txn's grant fits {@code limits} (with a fanout cap, txn is then counted as a dependent of the txns
+   * it depends on here), else why not, {@code blockers} receiving the txns txn now waits for: the
+   * farthest ones ahead that must commit for the depth to fit, or the txn with too many dependents.
+   */
+  private Refusal admit(
+      Transaction<K, V> txn, SpeculationLimits limits, List<Transaction<K, V>> blockers) {
+    if (limits.isUnlimited()) {
+      return null;
+    }
+    List<Transaction<K, V>> risky = riskyAhead(txn.getLock(key).node());
+    if (risky.size() > limits.maxDepth()) {
+      blockers.addAll(risky.subList(limits.maxDepth(), risky.size()));
+      return Refusal.DEPTH;
+    }
+    if (!risky.isEmpty()
+        && limits.limitsFanout()
+        && !txn.addSpecDependencies(risky, limits, blockers)) {
+      return Refusal.FANOUT;
+    }
+    return null;
+  }
+
+  /**
+   * The txns whose abort would doom the holder of {@code node} once granted, nearest first: the
+   * undecided holders of the EXCLUSIVE nodes ahead of it, back to the first blind writer (included),
+   * exactly those whose abortAndRelease would reach node. A reader's abort never cascades, and a
+   * blind write ({@code node} itself, or one ahead) depends on nobody's value.
+   */
+  private List<Transaction<K, V>> riskyAhead(LockNode<K, V> node) {
+    List<Transaction<K, V>> risky = new ArrayList<>();
+    if (node.getMode() == LockMode.EXCLUSIVE && !node.isUpgraded()) {
+      return risky;
+    }
+    for (LockNode<K, V> n = node.getPrev(); n != null; n = n.getPrev()) {
+      if (n.getMode() != LockMode.EXCLUSIVE) {
+        continue;
+      }
+      Transaction<K, V> t = n.getHolders().iterator().next();   // an EXCLUSIVE node has one holder
+      if (!DECIDED.contains(t.getStatus())) {
+        risky.add(t);
+      }
+      if (!n.isUpgraded()) {
+        break;
+      }
+    }
+    return risky;
+  }
+
+  /** Wait-die for a refused grant: one of the txns it waits for is younger and not leaving. */
+  private static <K, V> boolean hasYounger(Transaction<K, V> txn, List<Transaction<K, V>> blockers) {
+    for (Transaction<K, V> t : blockers) {
+      if (t.getTs() > txn.getTs() && !LEAVING.contains(t.getStatus())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -275,16 +434,32 @@ class Chain<K, V> {
     return !victims.isEmpty();
   }
 
+  /** Statistics only: the uncommitted txns ahead of txn's node, and on how many nodes. */
+  private void recordGrant(Transaction<K, V> txn, LockNode<K, V> pred) {
+    int depth = 0;
+    List<Transaction<K, V>> pending = new ArrayList<>();
+    for (LockNode<K, V> n = pred; n != null; n = n.getPrev()) {
+      boolean any = false;
+      for (Transaction<K, V> t : n.getHolders()) {
+        if (t.getStatus() != Status.COMMITTED) {
+          pending.add(t);
+          any = true;
+        }
+      }
+      depth += any ? 1 : 0;
+    }
+    txn.recordGrant(depth, pending);
+  }
+
   /**
    * get()'s critical section, for a txn that holds key: DOOMED if txn is aborted / must_abort (a
    * foreign abort_transaction may have spliced its node out since lock() returned); else the value
    * txn already read (read_buffer); else the write of the nearest EXCLUSIVE node before txn's own
    * node whose holder wrote key (txn's own node is never a predecessor version: if it is EXCLUSIVE,
    * txn holds it and its own write was already looked up by get(), e.g. a get-for-update before the
-   * put; and a get-for-update holder that did not write key is skipped); else a null value (no
-   * predecessor version: read the store, a committed writer applied its buffer before being spliced
-   * out). Reading that holder's buffer is safe: lock() only returned once it was executed, so its
-   * buffer is final.
+   * put; and a get-for-update holder that did not write key is skipped); else a null value (no predecessor version: read the store, a committed writer applied
+   * its buffer before being spliced out). Reading that holder's buffer is safe: lock() only returned
+   * once it was executed, so its buffer is final.
    */
   synchronized LocksMap.ReadResult<V> read(Transaction<K, V> txn) {
     if (txn.isDoomed()) {
@@ -336,6 +511,8 @@ class Chain<K, V> {
    * @param cascade false for the non-speculative baseline: release only
    * @param marked receives every txn this call moved to must_abort (to wake them up)
    * @param doomedFinished receives those of them that were executed (the caller aborts them)
+   * @param granted statistics only: for every holder met behind txn's node, whether it was granted on
+   *     at least one of the nodes met: false means it was spared on every key txn met it on
    * @return true iff the chain is now empty, as in {@link #release}
    */
   synchronized boolean abortAndRelease(
@@ -343,20 +520,23 @@ class Chain<K, V> {
       LockType<K, V> held,
       boolean cascade,
       List<Transaction<K, V>> marked,
-      List<Transaction<K, V>> doomedFinished) {
+      List<Transaction<K, V>> doomedFinished,
+      Map<Transaction<K, V>, Boolean> granted) {
     if (cascade && held.mode() == LockMode.EXCLUSIVE && txn.hasReachedExecuted()) {
       for (LockNode<K, V> s = held.node().getNext(); s != null; s = s.getNext()) {
         if (s.getMode() == LockMode.EXCLUSIVE && !s.isUpgraded()) {
           break;   // blind write: it does not depend on txn's value
         }
         for (Transaction<K, V> t : s.getHolders()) {
-          if (!s.isGranted(t)) {
+          boolean read = s.isGranted(t);
+          granted.merge(t, read, Boolean::logicalOr);
+          if (!read) {
             // still blocked in lock() on this node: it read nothing of txn's (nor of a txn behind it
             // here, which it would first have to wait for), so it is spared; it waits on and is
             // woken up by the release
             continue;
           }
-          Status before = t.compareAndSwapStatus(MARKABLE, Status.MUST_ABORT);
+          Status before = t.markMustAbort(MARKABLE, txn.rootCause());
           if (MARKABLE.contains(before)) {
             marked.add(t);
             if (before == Status.EXECUTED) {

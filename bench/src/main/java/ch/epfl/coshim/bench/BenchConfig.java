@@ -3,7 +3,9 @@ package ch.epfl.coshim.bench;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 
 /**
  * Parameters of one {@link MicroBench} run. The defaults are Acta's Micro workload with
@@ -17,24 +19,31 @@ import java.util.concurrent.ThreadLocalRandom;
  * over TCP.
  *
  * @param variant          label of the run in the results (the variant the nodes were started with)
- * @param shims            the shim databases, {@code host:port/database}; each branch goes to one of
- *                         them at random
+ * @param shims            the participants: shim databases ({@code host:port/database}) or SQL databases
+ *                         ({@code jdbc:mysql://...}, {@code jdbc:postgresql://...}); each branch goes to
+ *                         one of them at random
  * @param tc               the Seata TC, {@code host:port}
  * @param threads          closed-loop workers (Acta's concurrency)
  * @param tableSize        keys per table; branch i of every txn uses table micro-i
  * @param branches         branches (subtransactions) per global transaction
- * @param reads            pure reads per branch (with {@code opsMean <= 0})
- * @param writes           writes per branch (with {@code opsMean <= 0}); a branch runs its reads and
- *                         writes in a random order
- * @param skewness         share of the accesses that go to the hot range, the first (1 - skewness) *
- *                         tableSize keys, in [0.5, 1): 0.9 = 90 % of the accesses on 10 % of the keys
- *                         (Acta's definition)
+ * @param reads            pure reads per branch
+ * @param writes           writes per branch; a branch runs its reads and writes in a random order
+ * @param skewness         share of the accesses that go to the hot range, the first (1 - skewness) * tableSize
+ *                         keys, in [0.5, 1): 0.9 = 90 % of the accesses on 10 % of the keys (Acta's definition)
+ * @param dist             how the keys of a branch are drawn: {@code hotspot}, each one independently from the
+ *                         hot range with probability {@code skewness}, else from the cold range, uniformly
+ *                         within each (the definition's intent: the share of hot accesses is the skewness,
+ *                         whatever the op count); {@code acta}, Acta's makeWorkingSet, the first
+ *                         ceil(ops * skewness) keys of each list hot (with a few ops per list every key is hot
+ *                         from skewness 0.67 on: the skewness only sets the size of the hot range)
  * @param rmw              writes are v := get(k) + 1 instead of blind random values; enables the audit
  * @param warmup           run time before measuring
  * @param measure          measured run time
  * @param txnTimeout       global transaction timeout, enforced by the TC (rolls the branches back)
  * @param parallelBranches run the branches of a global transaction at the same time (each still
  *                         start, ops, end, prepare) instead of one after the other
+ * @param sonata           turn Sonata on for the SQL databases ({@code sonata.enableGlobalSerializability};
+ *                         Sonata's other settings stay at their defaults). Seata reads it once per JVM
  * @param opsMean          > 0: every branch draws its reads and its writes from a normal distribution of
  *                         this mean truncated to [0, opsMax] (not both 0), instead of {@code reads} /
  *                         {@code writes}; <= 0: the fixed counts
@@ -44,26 +53,39 @@ import java.util.concurrent.ThreadLocalRandom;
  *                         0) before every operation of a branch but the first and before its commit,
  *                         standing for the network hop and the work between two requests; 0: no pause
  * @param thinkSdUs        standard deviation of that pause (µs)
- * @param dist             how the keys of a branch are drawn: {@code hotspot}, each one independently from
- *                         the hot range with probability {@code skewness}, else from the cold range,
- *                         uniformly within each (the definition's intent: the share of hot accesses is the
- *                         skewness, whatever the op count); {@code acta}, Acta's makeWorkingSet, the first
- *                         ceil(ops * skewness) keys of each list hot (with a few ops per list every key is
- *                         hot from skewness 0.67 on: the skewness only sets the size of the hot range)
- * @param getForUpdate     before a branch runs, its planned ops are scanned and every read of a key the
- *                         branch writes at that op or later (a read-modify-write's own read, or a pure read
- *                         followed by a write of its key) becomes a get-for-update: the shims lock the key
- *                         EXCLUSIVE right away instead of SHARED, then upgrading at the write. false: every
- *                         read is a plain get
- * @param pipelinedBranches the branches run one after the other, but each one starts as soon as the
- *                         previous one finished its operations: the previous one's end + prepare (Seata's
- *                         close of its XA connection) runs in the background meanwhile, instead of the next
- *                         branch waiting for its vote. Exclusive with {@code parallelBranches}
+ * @param sampleMs         > 0: every that many ms, the commits and aborts of the whole run (warm-up and drain
+ *                         included) are sampled into {@code timeseries-<csv name>}; 0: no samples
+ * @param randomness       share of a branch's operations issued in a random order, in [0, 1]: the first
+ *                         round((1 - randomness) x ops) of them (a random subset of its keys) go in ascending
+ *                         key order, the rest after them in a random order. 1 (default): every op in a random
+ *                         order; 0: the whole branch locks its keys in ascending order. The keys are the same
+ * @param getForUpdate     before a branch runs, its planned ops are scanned and every read of a key the branch
+ *                         writes at that op or later (a read-modify-write's own read, or a pure read followed by a
+ *                         write of its key) becomes a get-for-update: the shims lock the key EXCLUSIVE right away
+ *                         instead of SHARED, then upgrading at the write. Other reads stay plain gets; SQL
+ *                         participants still run a plain select. false: every read is a plain get
+ * @param pipelinedBranches the branches run one after the other, but each one starts as soon as the previous one
+ *                         finished its operations: the previous one's end + prepare (Seata's close of its XA
+ *                         connection) runs in the background meanwhile, instead of the next branch waiting for its
+ *                         vote. Exclusive with {@code parallelBranches}
+ * @param branchSkews      empty (default): every branch uses {@code skewness}; else one skewness per branch (branch i,
+ *                         table micro-i, draws its keys with the i-th one, each in [0.5, 1)), e.g. 0.99,0.5 for
+ *                         contention on the first branch's table only (0.5: uniform over the table). {@code
+ *                         skewness} stays the run's label (result folders, CSVs)
+ * @param rttUs            > 0: an emulated network round trip (µs) between the client and every shim node, on
+ *                         every message alike: the operations, end, prepare and Seata's commit / rollback (which
+ *                         reach the shim through this process's RM), half of it before each request is sent,
+ *                         half after its reply (see RemoteCoShim#withRoundTrip); 0 (default): none. Shim
+ *                         participants only
+ * @param readOnlyBranches branch indices (0-based: branch i uses table micro-i) that only read: no writes, at least
+ *                         one read. Readers never wait for each other, so no transaction ever waits on those tables:
+ *                         with parallel branches, no cross-branch deadlock can form through them. Empty (default): none
  */
 public record BenchConfig(String variant, List<String> shims, String tc, int threads, int tableSize, int branches,
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
-        boolean parallelBranches, double opsMean, double opsSd, int opsMax, double thinkMeanUs, double thinkSdUs,
-        KeyDist dist, boolean getForUpdate, boolean pipelinedBranches) {
+        boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
+        double thinkSdUs, int sampleMs, KeyDist dist, double randomness, boolean getForUpdate,
+        boolean pipelinedBranches, List<Double> branchSkews, Set<Integer> readOnlyBranches, double rttUs) {
 
     /** How the keys of a branch are drawn; see {@code dist}. */
     public enum KeyDist {
@@ -87,7 +109,8 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
                 10_000, 4, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, 5, 1.5, 10, 10_000, 5_000, KeyDist.HOTSPOT, true, true);
+                false, false, 5, 1.5, 10, 10_000, 5_000, 1000, KeyDist.HOTSPOT, 1.0, true, true, List.of(), Set.of(),
+                0);
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -98,6 +121,11 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     /** Writes of one branch: {@code writes}, or a draw from the distribution. */
     public int drawWrites() {
         return opsMean > 0 ? drawOps() : writes;
+    }
+
+    /** Branch {@code branch} only reads (see {@code readOnlyBranches}). */
+    public boolean readOnly(int branch) {
+        return readOnlyBranches.contains(branch);
     }
 
     /** round(N(opsMean, opsSd)), drawn again until it is in [0, opsMax] (a truncated normal). */
@@ -128,16 +156,28 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         return opsMean > 0 ? opsMax : writes;
     }
 
-    /** Keys per table in the hot range. */
+    /** The skewness branch {@code branch} draws its keys with: its {@code branchSkews} entry, else {@code skewness}. */
+    public double skewness(int branch) {
+        return branchSkews.isEmpty() ? skewness : branchSkews.get(branch);
+    }
+
+    /** Keys in the hot range of branch {@code branch}'s table. */
+    public int hotRangeSize(int branch) {
+        return (int) (tableSize * (1 - skewness(branch)));
+    }
+
+    /** Keys per table in the hot range (of {@code skewness}, the run's label). */
     public int hotRangeSize() {
         return (int) (tableSize * (1 - skewness));
     }
 
     /** Same checks as Acta's Micro run endpoint: every txn must find distinct hot and cold keys. */
     public BenchConfig validate() {
-        require(!shims.isEmpty(), "--shims needs at least one host:port/database");
+        require(!shims.isEmpty(), "--shims needs at least one host:port/database or jdbc: URL");
+        require(rttUs >= 0, "--rtt-us must be >= 0: " + rttUs);
         for (String shim : shims) {
-            require(shim.matches("[^:/]+:\\d+/.+"), "--shims entries are host:port/database: " + shim);
+            require(shim.matches("[^:/]+:\\d+/.+") || shim.matches("jdbc:(mysql|postgresql)://.+"),
+                    "--shims entries are host:port/database, jdbc:mysql://... or jdbc:postgresql://...: " + shim);
         }
         require(tc.matches("[^:]+:\\d+"), "--tc is host:port: " + tc);
         require(threads > 0, "--threads must be > 0");
@@ -152,16 +192,30 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 "--txn-timeout-ms must be in [1, 2^31)");
         require(opsMean <= 0 || (opsSd > 0 && opsMax >= 1), "--ops-sd must be > 0 and --ops-max >= 1");
         require(thinkMeanUs <= 0 || thinkSdUs >= 0, "--think-sd-us must be >= 0");
-        require(!(parallelBranches && pipelinedBranches),
-                "--parallel-branches and --pipelined-branches exclude each other");
+        require(sampleMs >= 0, "--sample-ms must be >= 0");
+        require(randomness >= 0 && randomness <= 1, "--randomness must be in [0, 1]");
+        require(!(parallelBranches && pipelinedBranches), "--parallel-branches and --pipelined-branches exclude each other");
         // a txn's keys are distinct: the ranges must hold the most a txn can draw from each of them
         long hotPerBranch = dist == KeyDist.ACTA
                 ? (long) Math.ceil(maxReads() * skewness) + (long) Math.ceil(maxWrites() * skewness)
                 : (long) maxReads() + maxWrites();   // hotspot: every key of a branch may be drawn hot
         long coldPerBranch = dist == KeyDist.ACTA ? (long) maxReads() + maxWrites() - hotPerBranch
                 : (long) maxReads() + maxWrites();   // ... or cold
-        require(hotPerBranch * branches <= hotRangeSize(), "requested hot keys exceed the hot range");
-        require(coldPerBranch * branches <= tableSize - hotRangeSize(), "requested cold keys exceed the cold range");
+        require(branchSkews.isEmpty() || branchSkews.size() == branches,
+                "--branch-skews needs one skewness per branch (--branches " + branches + ")");
+        for (int b : readOnlyBranches) {
+            require(b >= 0 && b < branches, "--read-only-branches are 0-based indices below --branches " + branches);
+        }
+        require(readOnlyBranches.isEmpty() || maxReads() > 0, "--read-only-branches needs reads (--reads or --ops-mean)");
+        for (double s : branchSkews) {
+            require(s >= 0.5 && s < 1.0, "--branch-skews entries must be in [0.5, 1)");
+        }
+        // a txn's keys are distinct across its branches (they share one key space): every branch's ranges must
+        // hold the most the whole txn can draw from them
+        for (int b = 0; b < branches; b++) {
+            require(hotPerBranch * branches <= hotRangeSize(b), "requested hot keys exceed the hot range");
+            require(coldPerBranch * branches <= tableSize - hotRangeSize(b), "requested cold keys exceed the cold range");
+        }
         return this;
     }
 
@@ -188,14 +242,20 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         Duration measure = c.measure;
         Duration txnTimeout = c.txnTimeout;
         boolean parallelBranches = c.parallelBranches;
+        boolean sonata = c.sonata;
         double opsMean = c.opsMean;
         double opsSd = c.opsSd;
         int opsMax = c.opsMax;
         double thinkMeanUs = c.thinkMeanUs;
         double thinkSdUs = c.thinkSdUs;
+        int sampleMs = c.sampleMs;
         KeyDist dist = c.dist;
+        double randomness = c.randomness;
         boolean getForUpdate = c.getForUpdate;
         boolean pipelinedBranches = c.pipelinedBranches;
+        List<Double> branchSkews = c.branchSkews;
+        Set<Integer> readOnlyBranches = c.readOnlyBranches;
+        double rttUs = c.rttUs;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -222,20 +282,29 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--measure-s" -> measure = seconds(v);
                 case "--txn-timeout-ms" -> txnTimeout = Duration.ofMillis(Long.parseLong(v));
                 case "--parallel-branches" -> parallelBranches = Boolean.parseBoolean(v);
+                case "--sonata" -> sonata = Boolean.parseBoolean(v);
                 case "--ops-mean" -> opsMean = Double.parseDouble(v);
                 case "--ops-sd" -> opsSd = Double.parseDouble(v);
                 case "--ops-max" -> opsMax = Integer.parseInt(v);
                 case "--think-mean-us" -> thinkMeanUs = Double.parseDouble(v);
                 case "--think-sd-us" -> thinkSdUs = Double.parseDouble(v);
+                case "--sample-ms" -> sampleMs = Integer.parseInt(v);
                 case "--dist" -> dist = KeyDist.parse(v);
+                case "--randomness" -> randomness = Double.parseDouble(v);
                 case "--get-for-update" -> getForUpdate = Boolean.parseBoolean(v);
                 case "--pipelined-branches" -> pipelinedBranches = Boolean.parseBoolean(v);
+                case "--read-only-branches" -> readOnlyBranches = Arrays.stream(v.split(",")).map(String::trim)
+                        .filter(x -> !x.isEmpty()).map(Integer::parseInt).collect(Collectors.toUnmodifiableSet());
+                case "--rtt-us" -> rttUs = Double.parseDouble(v);
+                case "--branch-skews" -> branchSkews = Arrays.stream(v.split(",")).map(String::trim)
+                        .filter(x -> !x.isEmpty()).map(Double::parseDouble).toList();
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
-                measure, txnTimeout, parallelBranches, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, dist,
-                getForUpdate, pipelinedBranches).validate();
+                measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs,
+                dist, randomness, getForUpdate, pipelinedBranches, branchSkews, readOnlyBranches, rttUs)
+                .validate();
     }
 
     private static Duration seconds(String v) {

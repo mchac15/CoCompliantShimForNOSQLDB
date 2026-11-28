@@ -5,8 +5,10 @@ import ch.epfl.coshim.types.Transaction.Status;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
@@ -91,6 +93,8 @@ public class LocksMap<K, V> {
   private final Consumer<Transaction<K, V>> woundHandler;
   /** prepare() dies instead of waiting for a younger txn (cross-shim deadlock prevention). */
   private final boolean prepareWaitDie;
+  /** The caps on speculative grants (unlimited when not speculative: nothing to cap). */
+  private final SpeculationLimits limits;
 
   /** Outcome of prepare()'s wait for the predecessors to commit. */
   public static enum PrepareWait {
@@ -135,6 +139,20 @@ public class LocksMap<K, V> {
       DeadlockPolicy deadlockPolicy,
       Consumer<Transaction<K, V>> woundHandler,
       boolean prepareWaitDie) {
+    this(speculative, deadlockPolicy, woundHandler, prepareWaitDie, SpeculationLimits.UNLIMITED);
+  }
+
+  /**
+   * @param limits caps on speculative grants (see {@link SpeculationLimits}); ignored when not
+   *     speculative
+   */
+  public LocksMap(
+      boolean speculative,
+      DeadlockPolicy deadlockPolicy,
+      Consumer<Transaction<K, V>> woundHandler,
+      boolean prepareWaitDie,
+      SpeculationLimits limits) {
+    this.limits = speculative ? Objects.requireNonNull(limits) : SpeculationLimits.UNLIMITED;
     this.prepareWaitDie = prepareWaitDie;
     this.speculative = speculative;
     this.lockReady = speculative ? SPECULATION_POINT : RESOLVED;
@@ -213,14 +231,13 @@ public class LocksMap<K, V> {
    * only go from younger to older txns, by ages every shim agrees on, cannot form one.
    */
   public PrepareWait awaitPredecessorsCommitted(Transaction<K, V> txn) {
-    DeadlockPolicy policy = prepareWaitDie ? DeadlockPolicy.WAIT_DIE : DeadlockPolicy.NONE;
     for (K key : txn.frozenLocks().keySet()) {
       Chain<K, V> chain = locksMap.get(key);
       // no chain: txn's locks were released by a foreign abort_transaction, as in lock()
       if (chain == null) {
         return PrepareWait.MUST_ABORT;
       }
-      switch (chain.awaitPredecessor(txn, RESOLVED, false, 0, policy, null)) {
+      switch (chain.awaitResolved(txn, RESOLVED, prepareWaitDie)) {
         case READY -> {
         }
         case DIE -> {
@@ -243,6 +260,18 @@ public class LocksMap<K, V> {
       LockNode<K, V> node = e.getValue().node();
       locksMap.computeIfPresent(e.getKey(), (k, c) -> c.release(txn, node) ? null : c);
     }
+    // the txns it depended on committed before it: nobody waits on their counters anymore
+    txn.clearSpecDependencies();
+  }
+
+  /**
+   * commit()'s move to committing: with speculation limits, the grants waiting for txn to stop
+   * counting (it can no longer abort) are woken up before its store writes, not only at its release.
+   */
+  public void committing(Transaction<K, V> txn) {
+    if (!limits.isUnlimited()) {
+      statusChanged(txn);
+    }
   }
 
   /**
@@ -256,14 +285,25 @@ public class LocksMap<K, V> {
   public List<Transaction<K, V>> abortAndRelease(Transaction<K, V> txn) {
     List<Transaction<K, V>> marked = new ArrayList<>();
     List<Transaction<K, V>> doomedFinished = new ArrayList<>();
+    Map<Transaction<K, V>, Boolean> granted = new HashMap<>();
     for (Map.Entry<K, LockType<K, V>> e : txn.frozenLocks().entrySet()) {
       LockType<K, V> held = e.getValue();
       locksMap.computeIfPresent(
           e.getKey(),
-          (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished) ? null : c);
+          (k, c) -> c.abortAndRelease(txn, held, speculative, marked, doomedFinished, granted) ? null : c);
     }
+    txn.setCascadeFanout(marked.size());
+    // statistics only: the txns met behind txn but spared, blocked on every key it met them on
+    txn.setSparedMarks((int) granted.values().stream().filter(g -> !g).count());
     for (Transaction<K, V> t : marked) {
       statusChanged(t);
+    }
+    // fanout cap: one dependent fewer for each txn txn depended on; a grant refused on one of them
+    // waits on one of its keys (it is a holder ahead there)
+    for (Transaction<K, V> t : txn.clearSpecDependencies()) {
+      if (!t.isRunning()) {
+        statusChanged(t);
+      }
     }
     return doomedFinished;
   }
@@ -314,7 +354,7 @@ public class LocksMap<K, V> {
   private LockResult await(Chain<K, V> chain, Transaction<K, V> txn, long deadline) {
     while (true) {
       List<Transaction<K, V>> victims = new ArrayList<>();
-      switch (chain.awaitPredecessor(txn, lockReady, true, deadline, deadlockPolicy, victims)) {
+      switch (chain.awaitLockReady(txn, lockReady, deadline, deadlockPolicy, limits, victims)) {
         case READY -> {
           return LockResult.ACQUIRED;
         }

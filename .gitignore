@@ -6,3 +6,5 @@ target/
 .project
 .settings/
 bench-results/
+.venv/
+__pycache__/
