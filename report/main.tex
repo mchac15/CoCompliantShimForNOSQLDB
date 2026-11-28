@@ -1,0 +1,88 @@
+% Semester project report -- LaTeX port of "Semester project report DIAS template.dotx"
+\documentclass[10pt,a4paper,openany,oneside]{report}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{newtxtext,newtxmath}   % Times New Roman, as in the template
+\usepackage[scaled=0.92]{helvet}   % Arial-like sans for the title
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+
+% Page geometry taken from the template (A4, margins in twips converted to cm)
+\usepackage[a4paper,
+  left=2.5cm, right=2cm,
+  top=3.39cm, bottom=3.1cm,
+  footskip=1.2cm]{geometry}
+
+\graphicspath{{figures/}}
+
+\definecolor{epflred}{HTML}{E8332A}
+
+% Keep the document compiling while references.bib is still empty
+\makeatletter
+\let\@noitemerr\relax
+\makeatother
+
+% Chapter headings: "Chapter N" (19pt bold) above the title (22.5pt bold)
+\titleformat{\chapter}[display]
+  {\normalfont\bfseries}
+  {\fontsize{19}{23}\selectfont\chaptertitlename\ \thechapter}
+  {12pt}
+  {\fontsize{22.5}{27}\selectfont}
+\titleformat{name=\chapter,numberless}[display]
+  {\normalfont\bfseries}
+  {}
+  {0pt}
+  {\fontsize{22.5}{27}\selectfont}
+\titlespacing*{\chapter}{0pt}{0pt}{30pt}
+
+% Title-page fields
+\newcommand{\reporttitle}{<Title>}
+\newcommand{\studentname}{<name of student>}
+\newcommand{\supervisorname}{<name of DIAS member>}
+\newcommand{\reportdate}{<date>}
+
+\begin{document}
+
+\input{titlepage}
+\setcounter{page}{2}
+
+\chapter*{Acknowledgments}
+\addcontentsline{toc}{chapter}{Acknowledgments}
+\input{chapters/acknowledgments}
+
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+\input{chapters/abstract}
+
+\renewcommand{\contentsname}{Contents}
+\tableofcontents
+
+\chapter{Introduction and Related Work}
+\input{chapters/introduction}
+
+\chapter{Algorithm Design}
+\input{chapters/design}
+
+\chapter{Implementation}
+\input{chapters/implementation}
+
+\chapter{Evaluation and Discussion}
+\input{chapters/evaluation}
+
+\chapter{Conclusion and Future Work}
+\input{chapters/conclusion}
+
+\renewcommand{\bibname}{Bibliography}
+\clearpage
+\phantomsection
+\addcontentsline{toc}{chapter}{Bibliography}
+\nocite{*}
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

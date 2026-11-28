@@ -1,0 +1,56 @@
+% Title page, laid out after the DIAS .dotx template
+\begin{titlepage}
+\newgeometry{left=2.5cm, right=2cm, top=1.16cm, bottom=0.5cm}
+\noindent\hspace*{-1.17cm}%
+\begin{tikzpicture}[x=1mm, y=1mm, even odd rule]
+  \fill[epflred] % E
+    (10.672,0.000) -- (0.000,0.000) -- (0.000,-6.032) -- (3.182,-6.032) -- (3.182,-8.749) -- (0.000,-8.749) -- (0.000,-14.781) -- (10.672,-14.781) -- (10.672,-12.030) -- (3.182,-12.030) -- (3.182,-8.755) -- (10.032,-8.755) -- (10.032,-6.027) -- (3.182,-6.027) -- (3.182,-2.752) -- (10.672,-2.752) -- cycle;
+  \begin{scope}[xshift=13mm]
+  \fill[epflred] % P
+    (6.591,0.000) -- (0.000,0.000) -- (0.000,-14.754) -- (3.182,-14.754) -- (3.182,-8.740) -- (6.591,-8.740) -- (7.872,-8.647) -- (8.947,-8.368) -- (10.200,-7.676) -- (11.054,-6.729) -- (11.403,-6.013) -- (11.678,-4.779) -- (11.695,-4.371) -- (11.678,-3.954) -- (11.625,-3.545) -- (11.538,-3.143) -- (11.416,-2.748) -- (11.408,-2.728) -- (11.256,-2.368) -- (10.528,-1.355) -- (9.410,-0.573) -- (7.872,-0.093) -- (7.258,-0.023) -- cycle
+    (3.182,-2.728) -- (5.703,-2.728) -- (5.979,-2.732) -- (6.250,-2.744) -- (7.482,-2.946) -- (8.420,-3.700) -- (8.554,-4.371) -- (8.539,-4.619) -- (7.873,-5.616) -- (6.777,-5.951) -- (5.703,-6.013) -- (3.182,-6.013) -- cycle;
+  \end{scope}
+  \begin{scope}[xshift=27mm]
+  \fill[epflred] % F
+    (10.673,0.000) -- (0.000,0.000) -- (0.000,-14.767) -- (3.182,-14.767) -- (3.182,-8.755) -- (10.032,-8.755) -- (10.032,-6.027) -- (3.182,-6.027) -- (3.182,-2.752) -- (10.673,-2.752) -- cycle;
+  \end{scope}
+  \begin{scope}[xshift=40mm]
+  \fill[epflred] % L
+    (10.672,-12.030) -- (3.182,-12.030) -- (3.182,0.000) -- (0.000,0.000) -- (0.000,-14.781) -- (10.672,-14.781) -- cycle;
+  \end{scope}
+\end{tikzpicture}
+
+\vspace{3cm}
+\begin{center}
+  \includegraphics[width=7.6cm]{dias-logo}\\[0.6cm]
+  {\fontsize{15.5}{19}\selectfont École Polytechnique Fédérale de Lausanne}
+
+  \vspace{2.5cm}
+  {\fontsize{17}{21}\selectfont\sffamily\bfseries \reporttitle}
+
+  \vspace{0.8cm}
+  by \studentname
+
+  \vspace{2.5cm}
+  {\fontsize{15.5}{19}\selectfont Semester Project Report}
+\end{center}
+
+\vfill
+\noindent
+\begin{tabular}{@{}l}
+  Prof.\ Anastasia Ailamaki\\
+  Project Advisor\\[1em]
+  \supervisorname\\
+  Project Supervisor
+\end{tabular}
+
+\vspace{1.5cm}
+\begin{center}
+  EPFL IC IINFCOM DIAS\\
+  BC 222 (Bâtiment BC) Station 14\\
+  CH-1015 Lausanne\\[1em]
+  \reportdate
+\end{center}
+\vspace{1.5cm}
+\restoregeometry
+\end{titlepage}
