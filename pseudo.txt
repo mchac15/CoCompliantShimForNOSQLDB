@@ -1,591 +1,377 @@
 Data Structures:
     lock_mode ∈ {SHARED, EXCLUSIVE}
 
-    LockNode: { mode, holders: set of txn, predecessor, next, upgraded }
-        // upgraded (default false): the holder read k before writing it, i.e. the node was created or
-        // flipped to EXCLUSIVE by upgrade(). A node created by a direct put(k) is a blind write
-    chain: { head, tail: LockNode }   // doubly linked through predecessor/next; arrival order = required commit order
-        // chain.last_node() = tail. "append n" makes n the new tail (and the head if the chain was empty);
-        // "remove n" fixes head/tail if n was one of them. predecessor/next are relinked explicitly by the callers
-    locks_map: ConcurrentHashMap<key, chain>   // one chain per key, generations of holders
-        // a key k stands for (table, key): one shim manages all the tables of its database
+    LockNode: { mode, holders: set of txn, granted: set of txn, predecessor, next, upgraded }
+        // one generation of holders of a key: consecutive SHARED requests share a node, every EXCLUSIVE
+        // request (or a SHARED one behind an EXCLUSIVE node) gets a new one, so an EXCLUSIVE node has one holder
+        // granted ⊆ holders: the holders that got past the wait in lock(), i.e. that may have read the key.
+        //   A holder still blocked in lock() read nothing yet, so a cascade spares it (see abort_transaction)
+        // upgraded: the holder read k before writing it (upgrade() or get_for_update). A node from a plain
+        //   put(k) is a blind write: it depends on no earlier value of k
+    chain: { head, tail: LockNode }   // doubly linked through predecessor/next; order = required commit order
+    locks_map: ConcurrentHashMap<key, chain>   // one chain per key; a key k stands for (table, key)
 
-    txn: { txn_id, locks_acquired: key -> (mode, target_node) (built dynamically), status, write_buffer: key -> value,
-           read_buffer: key -> value, expires_at }   // expires_at: only set on a tombstone (see abort()), null otherwise
-        // read_buffer: the value each get(k) returned to this txn, so a repeated get(k) is answered without
-        // walking the chain or reading the store again (see get()). Private to the txn, never applied to the store
+    txn: { txn_id, ts, status, locks_acquired: key -> (mode, node), write_buffer: key -> value,
+           read_buffer: key -> value, reached_executed, depends_on: set of txn, dependents, fanout_cap }
+        // ts: the txn's age (smaller = older), taken from the global transaction id, so every shim agrees on
+        //     it. A retry is a new global transaction, hence younger
+        // read_buffer: the value each get(k) returned, so a repeated get(k) returns the same value
+        // reached_executed: the txn was executed at some point, so a successor may have read its write_buffer
+        // depends_on / dependents / fanout_cap: the fanout cap's bookkeeping (see admit_fanout)
     status ∈ {started, executed, prepared, committing, committed, aborted, must_abort}
+    SPEC_READY = {executed, prepared, committing, committed}
+        // the speculation point: from executed on, a txn's write_buffer no longer changes, so successors may
+        // read on top of it. The non-speculative baseline is the same protocol with SPEC_READY = {committed}
+        // (no successor ever reads an uncommitted value, no abort ever cascades, no fanout cap)
 
     transactions_map: ConcurrentHashMap<txn_id, txn>
-        // also holds the tombstones: a tombstone for txn_id is a txn entry with status=aborted, no locks,
-        // an empty write_buffer and read_buffer, and expires_at set. It records "the coordinator aborted this
-        // id before the shim ever saw its start" (see abort()). Kept in this map rather than in a separate one so that
-        // (1) abort()'s "known txn or else tombstone" and start()'s "no entry, tombstone included" are each a
-        // single atomic operation on the same map entry (computeIfAbsent / putIfAbsent), and (2) every other
-        // request on a tombstoned id needs no new branch: it finds an aborted txn without locks
-    tombstone_ttl: duration   // lifetime of a tombstone, to be chosen >= the coordinator's maximum global
-                              // transaction timeout (see gc_tombstones())
-    // atomic(locks_map) { ... } is one critical section over the chains. An implementation may use
-    // per-key latches (one at a time) as long as the status re-check in lock()/upgrade() and the update of
-    // txn.locks_acquired stay atomic with respect to abort_transaction() reading locks_acquired (e.g. both
-    // under a per-txn guard); otherwise a foreign abort_transaction() can miss a node appended concurrently
-    lock_timeout: duration   // bounds every wait of the execution phase (lock(), upgrade()); prepare() has none
+        // also holds the tombstones: an aborted txn with no locks and an expires_at, left by an abort that
+        // came before the start (see abort()), removed after tombstone_ttl
+    F: real >= 0   // the shim's adaptive fanout cap, tuned by fanout_controller()
+    lock_timeout   // backstop on the waits of lock()/upgrade(); deadlocks are prevented by wound-wait
+    // atomic(locks_map) { ... } is one critical section over the chains (an implementation may use a
+    // latch per key, one at a time). "wait until" sleeps until something changes on the chain it reads
 
 
 Store:
-    // black box NoSQL store, nothing more is assumed than the following
     store.read(k) -> value
-    store.write(k, v)    // blind put; no atomicity across keys assumed
+    store.write(k, v)   // blind put, blocking, no atomicity across keys
 
     Assumptions:
-        // 1. Blocking semantics: store.write is blocking. If it fails it is simply retried / blocked
-        //    until it succeeds, so the protocol has no error path for store failures.
-        // 2. No crashes: crash recovery is out of scope. The shim is assumed not to crash between
-        //    voting YES and the coordinator's decision (nothing is logged, so a crash there would
-        //    lose a prepared txn and break 2PC atomicity).
-        // 3. Coordinator: txn_ids are assigned by the coordinator. It calls start at most once per
-        //    txn_id, sends end at most once, and sends no get/put/end/prepare/commit for a txn_id
-        //    before its start has been delivered. The get/put/end of one txn are sent one at a time:
-        //    each only after the response to the previous one, so they never overlap and end comes
-        //    after the last get/put has returned. The shim does not check this. If end overtook a
-        //    running put, a successor could read the key before the write is in the buffer, and the
-        //    write could land after the YES vote. The client driver enforces it (coshim-jdbc serializes
-        //    the requests of a connection); a client bypassing the driver is outside this assumption.
-        //    abort/prepare/commit are not covered: they may arrive while a get/put is running.
-        //    An abort MAY arrive before the start (e.g. a global timeout right after the branch was
-        //    registered): the shim then records a tombstone so that the late start fails, instead of
-        //    running, voting YES and holding locks for a global transaction that was rolled back.
-        //    The shim drops a txn from transactions_map once it is committed or aborted, and later or
-        //    duplicate messages for that id take the unknown-id branches (prepare votes NO, commit is a
-        //    no-op, get/put/end fail, abort leaves a tombstone). Tombstones are garbage-collected by
-        //    the shim itself after tombstone_ttl; the coordinator does not have to clean anything up.
-        // 4. Deadlocks: only the execution-phase waits (lock(), upgrade()) are bounded, by lock_timeout.
-        //    The waits in prepare() have no timeout: a cross-shim cycle at prepare (T1 before T2 on one
-        //    shim, T2 before T1 on another) is a 2PC-level deadlock, left to the coordinator (e.g. its
-        //    vote timeout) and not handled by the shim.
-
-
-Requests:
-    // Deployment: one shim per data source, where a data source = a node + a database name. The shim
-    // node is colocated with the store or standalone next to it. One server can host several databases,
-    // each with its own shim, i.e. its own locks_map / transactions_map: nothing is shared between shims.
-    // A shim manages all the tables of its database: a key k stands for (table, key).
-    // The shim never receives or runs client code. Each shim accepts many
-    // concurrent connections, only from the coordinator side (the 2PC participants). A connection carries
-    // one transaction at a time, as a sequence of requests: start(txn_id), then one get/put(txn_id, ...)
-    // per operation, then end(txn_id) once the client sent its last operation; prepare/commit/abort(txn_id)
-    // carry the coordinator's decision. Many transactions run concurrently on different connections.
-    // Each request runs on the thread handling its connection and blocks only that thread. A txn is
-    // identified by its txn_id, not by a connection: its requests may use different connections, so
-    // the connection alone does not keep them from overlapping. What does is assumption 3 (get/put/end
-    // of one txn one at a time, enforced by the client driver). Given it, the only foreign threads that
-    // touch a running txn are cascades (mark_must_abort / abort_transaction from another txn's abort)
-    // and the coordinator's abort()/prepare()
+        // 1. No crashes: crash recovery is out of scope (nothing is logged).
+        // 2. The coordinator assigns txn_ids, calls start once per txn_id, and sends get/put/end of one txn
+        //    one at a time (the client driver serializes them). abort/prepare/commit may arrive at any time,
+        //    an abort even before the start (the shim then leaves a tombstone).
+        // 3. Deadlocks: execution-phase waits are made acyclic by wound-wait, prepare-phase waits by
+        //    wait-die (both on the global ages ts). lock_timeout only remains as a backstop.
 
 
 procedure start(txn_id):
-    txn = new txn with txn_id, locks_acquired={}, status=started, write_buffer={}, read_buffer={}, expires_at=null
-    // putIfAbsent is atomic with abort()'s computeIfAbsent on the same entry: either this start
-    // registers first and the abort finds (and aborts) the txn, or the abort leaves its tombstone first
-    // and this start finds it. There is no window where the abort misses the txn and the start misses
-    // the tombstone. An implementation with a separate tombstone map must keep exactly this: tombstone
-    // check + registration, and lookup + tombstone insertion, under the same per-id critical section
-    if transactions_map.putIfAbsent(txn.txn_id, txn) != null
-        // txn_id already registered (collision / duplicate), or tombstoned: the coordinator already
-        // aborted this id, the txn must never run. A tombstone past its expires_at that gc_tombstones()
-        // has not removed yet still rejects the start (conservative)
-        return FAILED
-
+    txn = new txn with txn_id, ts = age(txn_id), status = started, everything else empty
+    if transactions_map.putIfAbsent(txn_id, txn) != null:
+        return FAILED   // duplicate, or tombstoned: the coordinator already aborted this id
     return SUCCEEDED
 
 
 procedure end(txn_id):
-    // the client sent its last get/put: the write buffer is final from here on
+    // the client sent its last get/put: the write_buffer is final from here on
     txn = transactions_map[txn_id]
     if txn == null:
-        // unknown/already-evicted txn_id: never started, or already aborted (a FAILED get/put, a
-        // cascade's eager cleanup, a coordinator abort) and evicted. A tombstoned id is found instead,
-        // with status aborted: the CAS below fails and abort_transaction is a no-op (FAILED as well)
         return FAILED
-
     if not CAS(txn.status, started, executed):
         if txn.status in {executed, prepared, committing, committed}:
-            // duplicate/late end (assumption 3: sent at most once): the txn already executed. Never
-            // abort here: a prepared txn has voted YES and must stay able to commit
-            return SUCCEEDED
-        // aborted or must_abort. A get/put that returned FAILED already ran abort_transaction, but the
-        // CAS can also fail because a cascade / foreign abort landed after the last get/put, and then
-        // nobody has released the locks yet (no request of this txn is running anymore).
-        // abort_transaction is idempotent (its CAS fails on an already aborted txn), so always call it here
-        abort_transaction(txn)
+            return SUCCEEDED   // duplicate end
+        abort_transaction(txn)   // doomed while running: release its locks (idempotent)
         return FAILED
-
+    txn.reached_executed = true
     return SUCCEEDED
 
 
-procedure get(txn_id, k):
+procedure get(txn_id, k, for_update = false):
+    // for_update = get_for_update(k), i.e. SELECT ... FOR UPDATE: the txn will write k after reading it, so
+    // it takes the EXCLUSIVE lock right away. The later put(k) then needs no upgrade, and two read-modify-
+    // writes of k queue one behind the other instead of one of them aborting in upgrade()
     txn = transactions_map[txn_id]
-    if txn == null:
-        // unknown/already-evicted txn_id: never started, or already aborted and evicted.
-        // A tombstoned id is found with status aborted: lock() returns MUST_ABORT before touching any
-        // chain, so it fails the same way and a tombstone never gets a lock
-        return NULL, FAILED
-    if txn.status in {executed, prepared, committing, committed}:
-        // request after end(): the write buffer is final once executed, so refuse it and leave the txn
-        // as it is (never abort a prepared txn, it voted YES). The only FAILED that does not come from an
-        // abort_transaction; every other FAILED means the txn is aborted and its locks released
-        return NULL, FAILED
-    result = lock(k, SHARED, txn)
+    if txn == null or txn.status in {executed, prepared, committing, committed}:
+        return NULL, FAILED   // unknown txn_id, or a request after end()
+    if for_update:
+        result = lock(k, EXCLUSIVE, txn, reads_key = true)
+    else:
+        result = lock(k, SHARED, txn)
     if result == MUST_ABORT:
         abort_transaction(txn)
         return NULL, FAILED
     if k in txn.write_buffer:
-        return txn.write_buffer[k], SUCCEEDED   // own write first, no need to look at the chain
-    actual_value=null   // null = "no predecessor version", so values are assumed to be non-null
-    // speculative read: find the nearest EXCLUSIVE node at or before this txn's
-    // own node (never a successor's), i.e. the latest predecessor write that
-    // this txn is ordered after. Reading that holder's write_buffer is safe:
-    // lock() only returns after every predecessor holder is at least
-    // executed, so its buffer is final. If the writer already committed, its
-    // buffer was applied to the store before its node was spliced out of the
-    // chain, so no such node is found and reading the store is correct.
-    doomed=false
+        return txn.write_buffer[k], SUCCEEDED   // own write first
+
+    value = null   // null = no predecessor version (values are non-null)
     atomic(locks_map) {
-        // re-check under the latch, as in lock(): a foreign abort_transaction() (coordinator abort(),
-        // prepare() on a still started txn) may have landed since lock() returned and spliced this
-        // txn's node out. A spliced node is no longer relinked, so its predecessor can be a node that
-        // has since been emptied and spliced too (its writer committed), with no holder to read from.
-        // abort_transaction CASes to aborted before it splices, so a status seen here that is neither
-        // aborted nor must_abort means the node is still in the chain until the latch is released
         if txn.status in {aborted, must_abort}:
-            doomed=true
+            doomed = true   // a foreign abort released this txn's locks since lock() returned
         else if k in txn.read_buffer:
-            // k was already read by this txn: return the same value. It is still the one a fresh walk would
-            // find, because the version visible to this txn cannot change while it holds its lock on k:
-            // - a predecessor writer that commits applies its buffer to the store, the same value;
-            // - a predecessor writer that aborts marks this txn must_abort, caught by the check above;
-            // - upgrade() never inserts an EXCLUSIVE node in front of an existing reader (it skips the
-            //   SHARED nodes behind the upgrader, and only flips in place when none follows).
-            // Checked after write_buffer (above), so a read after this txn's own put returns its write.
-            // A cached null (k absent from the store) falls through to store.read(k) again, still correct
-            actual_value=txn.read_buffer[k]
-        else if k in locks_map:
-            current_node=txn.locks_acquired[k].target_node
-            while current_node!=null and current_node.mode!=EXCLUSIVE:
-                current_node=current_node.predecessor
-            if current_node!=null:
-                actual_value=(the sole holder of current_node).write_buffer[k]   // an EXCLUSIVE node has one holder
+            value = txn.read_buffer[k]   // the version visible to txn cannot change while it holds k
+        else:
+            // speculative read: the write of the nearest EXCLUSIVE node ahead of txn's own node whose
+            // holder wrote k (a get_for_update holder that did not write k holds no version of it).
+            // Its write_buffer is final: lock() only returned once every holder ahead was executed
+            for n = txn.locks_acquired[k].node.predecessor; n != null; n = n.predecessor:
+                if n.mode == EXCLUSIVE and k in (the holder of n).write_buffer:
+                    value = (the holder of n).write_buffer[k]
+                    break
     }
     if doomed:
-        abort_transaction(txn)   // outside the latch; idempotent, releases the locks of a must_abort txn
+        abort_transaction(txn)
         return NULL, FAILED
-    if actual_value!=null:
-        txn.read_buffer[k]=actual_value
-        return actual_value, SUCCEEDED
-    actual_value=store.read(k)
-    txn.read_buffer[k]=actual_value
-    return actual_value, SUCCEEDED
+    if value == null:
+        value = store.read(k)   // no uncommitted version ahead: the store holds the latest committed one
+    txn.read_buffer[k] = value
+    return value, SUCCEEDED
 
 
 procedure put(txn_id, k, v):
     txn = transactions_map[txn_id]
-    if txn == null:
-        return FAILED   // unknown/already-evicted txn_id, same as in get()
-    if txn.status in {executed, prepared, committing, committed}:
-        return FAILED   // request after end(), same as in get()
-    result = lock(k, EXCLUSIVE, txn)
-    if result == MUST_ABORT:
+    if txn == null or txn.status in {executed, prepared, committing, committed}:
+        return FAILED
+    if lock(k, EXCLUSIVE, txn) == MUST_ABORT:
         abort_transaction(txn)
         return FAILED
-
-    txn.write_buffer[k]=v
-    //set value of k to v
+    txn.write_buffer[k] = v
     return SUCCEEDED
 
-procedure lock(k, mode, txn):
-    if txn.status == aborted || txn.status == must_abort:
-        return MUST_ABORT   // txn was cascade-aborted while running
 
-    target_node = null
-
-    if txn.locks_acquired[k] contains (mode, *):
-        return ALREADY_HELD
-    else if txn.locks_acquired[k] contains (EXCLUSIVE, *):
-        return ALREADY_HELD
-    else if txn.locks_acquired[k] contains (SHARED, *) and mode == EXCLUSIVE:
-        return upgrade(k, txn)
+procedure lock(k, mode, txn, reads_key = false):
+    held = txn.locks_acquired[k]
+    if held != null:
+        if held.mode == EXCLUSIVE or mode == SHARED:
+            return ALREADY_HELD if txn.status == started else MUST_ABORT
+        return upgrade(k, txn)   // holds k SHARED, wants it EXCLUSIVE
 
     atomic(locks_map) {
-        if txn.status in {aborted, must_abort}:
-            // re-check under the latch: a foreign abort_transaction() (coordinator abort(), or
-            // prepare() on a txn that is still started) may have released this txn's locks after
-            // the check at the top. Appending a node now would leave one nobody ever removes
+        // checked under the latch: a foreign abort_transaction may have released txn's locks, and a node
+        // appended now would never be removed
+        if txn.status != started:
             return MUST_ABORT
-
-        if k not in locks_map:
-            locks_map[k] = new chain
-
-        chain = locks_map[k]
-        last_node = chain.last_node()
-
-        if last_node == null:
-            target_node = LockNode{mode, holders={txn}, predecessor=null, next=null}
-            append target_node to chain
-        else if mode == SHARED and last_node.mode == SHARED:
-            last_node.holders.add(txn)
-            target_node = last_node
+        chain = locks_map[k], created if absent
+        if mode == SHARED and chain.tail != null and chain.tail.mode == SHARED:
+            node = chain.tail
+            node.holders.add(txn)
         else:
-            target_node = LockNode{mode, holders={txn}, predecessor=last_node, next=null}
-            last_node.next=target_node
-            append target_node to chain
-
-        txn.locks_acquired[k] = (mode, target_node)
+            node = LockNode{mode, holders = {txn}, granted = {}, upgraded = reads_key}
+            append node to chain
+        txn.locks_acquired[k] = (mode, node)
     }
-
-    deadline = now() + lock_timeout   // one deadline for the whole acquisition, not reset by the re-read iterations
-    loop:
-        atomic(locks_map) {
-            pred = target_node.predecessor
-        }
-        if pred == null:
-            break
-
-        // pred can be spliced out from under us (by commit()/abort_transaction()
-        // on one of its holders) while we wait; re-read target_node.predecessor
-        // under the latch on every iteration instead of trusting this captured
-        // reference once resolved
-        wait until (∀ t in pred.holders,
-                t.status in {committed, executed, prepared, committing})
-                or txn.status == aborted or txn.status == must_abort
-                or pred != target_node.predecessor
-                or now() >= deadline
-
-        if pred != target_node.predecessor:
-            continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
-
-        // no abort on an aborted / doomed predecessor holder here: such a holder does not satisfy the
-        // wait above, so this txn waits until it is spliced out (pred != target_node.predecessor).
-        // Whether this txn depends on the aborted holder is decided by the cascade, which marks
-        // exactly the dependents must_abort before the splice (see abort_transaction)
-        if txn.status in {aborted, must_abort}:
-            return MUST_ABORT
-
-        if not (∀ t in pred.holders,
-                t.status in {committed, executed, prepared, committing}):
-            // the wait ended on the deadline: assume a deadlock (or a predecessor that never
-            // finishes executing). Always safe: this txn has not executed and voted nothing, so it
-            // just aborts. Costs liveness only, never CO or 2PC atomicity
-            abort_transaction(txn)
-            return MUST_ABORT
-
-        break   // every holder of pred reached the speculation point
-
-    // Deadlocks between running txns (T1 holds X and waits for Y while T2 holds Y and waits for X) are
-    // broken by lock_timeout above; no wait-for graph is kept
-
-    return LOCK_ACQUIRED
+    return await_grant(k, txn, node)
 
 
 procedure upgrade(k, txn):
-    must_wait = false
-    node = null
-    return_value=MUST_ABORT
-
+    // SHARED -> EXCLUSIVE. Invariant: txn only moves across readers, never across a writer (its read would
+    // be stale by the time its own write takes effect: lost update)
     atomic(locks_map) {
-        if txn.status in {aborted, must_abort}:
-            return MUST_ABORT   // re-check under the latch, same reason as in lock()
-
-        node = txn.locks_acquired[k].target_node
-        chain = locks_map[k]
-
-        // Invariant: an upgrade may move this txn's position only across readers, never across a writer
-        // (otherwise the value this txn read is stale by the time its own write takes effect).
-        // Everything queued behind node is blocked, not running: its holders wait in lock() until every
-        // holder of node, this txn included, is executed. So what is behind node is either
-        //   - SHARED nodes: only possible after an aborted writer was spliced out of the chain. Their readers
-        //     are crossed: the new node goes behind them (skipped by the loop below);
-        //   - an EXCLUSIVE node with upgraded == false: a blind write that never read k. Ordering it after our
-        //     write is what it wanted anyway, so we go in front of it (it will also wait for us);
-        //   - an EXCLUSIVE node with upgraded == true: its holder read k as well. Going in front of it would
-        //     make it write a value computed from a stale read (lost update): this txn aborts.
+        if txn.status != started:
+            return MUST_ABORT
+        node = txn.locks_acquired[k].node
         p = node
-        while p.next != null and p.next.mode == SHARED:
+        while p.next != null and p.next.mode == SHARED:   // skip the readers queued behind node
             p = p.next
         after = p.next   // EXCLUSIVE or null
-
         if after != null and after.upgraded:
-            // case 3b: read-modify-write against read-modify-write on k: exactly one of the two upgraders
-            // has to abort, this one loses. return_value stays MUST_ABORT
-            pass
-
-        else if p == node and node.holders == {txn}:
-            // case 1: sole holder, at most a blind writer behind: upgrade in place
-            node.mode = EXCLUSIVE
+            return MUST_ABORT   // read-modify-write against read-modify-write: this one loses
+        if p == node and node.holders == {txn}:
+            node.mode = EXCLUSIVE   // sole holder, at most a blind writer behind: flip in place
             node.upgraded = true
             txn.locks_acquired[k] = (EXCLUSIVE, node)
-            return_value = UPGRADED
-
-        else:
-            // cases 2 and 3a: leave node and take a new EXCLUSIVE node right behind p: at the tail if nothing
-            // is behind p (case 2), otherwise in front of the blind writer `after` (case 3a)
-            node.holders.remove(txn)
-            new_node = LockNode{EXCLUSIVE, holders={txn}, predecessor=p, next=after, upgraded=true}
-            p.next = new_node
-            if after != null:
-                after.predecessor = new_node   // its wait loops re-read predecessor, so it now also waits for us
-            else:
-                append new_node to chain
-            if node.holders is empty:   // only possible when p != node
-                if node.predecessor != null:
-                    node.predecessor.next=node.next
-                if node.next != null:
-                    node.next.predecessor=node.predecessor
-                remove node from chain
-            txn.locks_acquired[k] = (EXCLUSIVE, new_node)
-            must_wait = true
-            return_value = UPGRADED
+            return LOCK_ACQUIRED
+        // leave node, take a new EXCLUSIVE node right behind p: at the tail, or in front of the blind
+        // writer `after` (which then also waits for txn)
+        new_node = LockNode{EXCLUSIVE, holders = {txn}, upgraded = true,
+                            granted = {txn} if txn in node.granted else {}}   // it read k: a cascade must reach it
+        remove txn from node.holders (and node.granted); splice node out if it is now empty
+        insert new_node between p and after
+        txn.locks_acquired[k] = (EXCLUSIVE, new_node)
     }
+    return await_grant(k, txn, new_node)   // wait for the readers it was queued behind
 
-    if must_wait:
-        deadline = now() + lock_timeout
-        loop:
-            atomic(locks_map) {
-                pred = new_node.predecessor
-            }
-            if pred == null:
-                break
 
-            // pred (the readers we are queued behind) can be spliced out from
-            // under us while we wait; re-read
-            // new_node.predecessor under the latch on every iteration instead
-            // of trusting a captured reference once resolved
-            wait until (∀ t in pred.holders,
-                        t.status in {committed, executed, prepared, committing})
-                        or txn.status == aborted or txn.status == must_abort
-                        or pred != new_node.predecessor
-                        or now() >= deadline
-
-            if pred != new_node.predecessor:
-                continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
-
-            // no abort on an aborted / doomed predecessor holder, same as in lock(): wait for its splice
+procedure await_grant(k, txn, node):
+    // the wait of lock()/upgrade(): until every holder ahead reached the speculation point and the grant
+    // fits the fanout cap. Wound-wait keeps it deadlock-free: an older txn never waits for a younger running
+    // one, it aborts it instead, so every wait-for edge between running txns goes from younger to older
+    deadline = now() + lock_timeout
+    loop:
+        victims = {}
+        atomic(locks_map) {
             if txn.status in {aborted, must_abort}:
                 return MUST_ABORT
+            pred = node.predecessor   // re-read every time: nodes ahead are spliced out / inserted meanwhile
+            if pred == null or ∀ t in pred.holders: t.status in SPEC_READY:
+                if admit_fanout(txn, node):
+                    node.granted.add(txn)
+                    return LOCK_ACQUIRED
+                // refused: wait, as without speculation, for the full writer to commit or lose dependents
+            else:
+                // wound-wait: the holders ahead that block txn (not yet executed, not already leaving)
+                blocking = {t ∈ pred.holders : t.status not in SPEC_READY ∪ {must_abort, aborted}}
+                if blocking != {} and ∀ t in blocking: t.status == started and t.ts > txn.ts:
+                    for t in blocking:
+                        // a victim is still started: nobody read its buffer, it voted nothing
+                        if CAS(t.status, started, must_abort):
+                            victims.add(t)
+                // an older holder (or a younger one already executed/prepared) is simply waited for
+        }
+        if victims != {}:
+            for t in victims:
+                abort_transaction(t)   // outside the latch; its release splices its node out
+            continue
+        wait until something changes on chain k or now() >= deadline
+        if now() >= deadline:
+            return MUST_ABORT   // backstop only (e.g. a stalled holder)
 
-            if not (∀ t in pred.holders,
-                        t.status in {committed, executed, prepared, committing}):
-                abort_transaction(txn)   // deadline reached: same reasoning as in lock()
-                return MUST_ABORT
 
-            break   // every holder of pred reached the speculation point
+procedure risky_ahead(node) -> list of txn:
+    // the txns whose abort would cascade to node's holder: the undecided holders of the EXCLUSIVE nodes
+    // ahead of it, back to the first blind write (a blind write depends on nobody's value)
+    if node.mode == EXCLUSIVE and not node.upgraded:
+        return {}
+    risky = {}
+    for n = node.predecessor; n != null; n = n.predecessor:
+        if n.mode == EXCLUSIVE:
+            w = the holder of n
+            if w.status not in {committing, committed}:
+                risky.add(w)
+            if not n.upgraded:
+                break
+    return risky
 
-        // the wait above is bounded by lock_timeout, like in lock(): e.g. two readers of the same
-        // shared node, one upgrading and waiting for the other, which waits on this txn via another key
 
-    return return_value
+procedure admit_fanout(txn, node) -> bool:
+    // fanout cap: each writer has at most fanout_cap running dependents, i.e. txns whose grant reads on top
+    // of it (a dependent counts once, through however many keys). Bounds how many txns one abort can doom.
+    // Under the latch, all or nothing: returns true if txn may be granted
+    risky = risky_ahead(node) \ txn.depends_on
+    for w in risky:
+        if w.fanout_cap is unset:
+            w.fanout_cap = floor(F) + (1 with probability F - floor(F))   // drawn once: F on average
+    full = {w ∈ risky : w.dependents >= w.fanout_cap}
+    if full != {} and ∀ w in full: w.ts < txn.ts:
+        return false   // refused: txn waits for an older writer, like without speculation
+    // admitted, or forced: a refused grant would wait for a younger txn's commit, which may itself wait
+    // (in prepare() on another shim) for this txn: a cycle. Then it is granted past the cap
+    for w in risky:
+        w.dependents++
+        txn.depends_on.add(w)
+    return true
+
+
+procedure release_dependencies(txn):
+    // txn is resolved: it no longer counts as a dependent. Wakes the grants refused on those writers
+    for w in txn.depends_on:
+        w.dependents--
+    txn.depends_on = {}
 
 
 procedure prepare(txn_id):
     txn = transactions_map[txn_id]
     if txn == null:
-        // unknown/already-evicted txn_id: treat as a duplicate/late
-        // prepare for a txn that was already resolved and cleaned up
         send no to 2PC controller
         return
-
     if txn.status in {prepared, committing, committed}:
-        // duplicate/late prepare (coordinator messages are idempotent): the txn already voted YES
-        // and every predecessor was resolved before that, so just re-send the vote
-        send yes to 2PC controller
+        send yes to 2PC controller   // duplicate prepare: re-send the vote
         return
-
-    if txn.status not in {executed, prepared}:
-        // covers the already-aborted case too: cascade abort sets
-        // txn.status directly, so no predecessor dereference is needed here.
-        // Also the branch a tombstoned id takes (status aborted): NO, and abort_transaction is a no-op
-        send no to 2PC controller
+    if txn.status != executed:
+        send no to 2PC controller   // still running, aborted or doomed
         abort_transaction(txn)
         return
 
+    // CO: vote only once every txn ahead of txn on every one of its keys has committed
     for each (k, mode, node) in txn.locks_acquired:
         loop:
             atomic(locks_map) {
-                pred = node.predecessor
+                pred = node.predecessor   // re-read every time: nodes ahead are spliced out meanwhile
+                ready = pred == null or ∀ t in pred.holders: t.status == committed
+                // wait-die: with speculation two shims can order the same two txns oppositely, and each
+                // prepare then waits for the other's commit, i.e. for the other's vote. Waiting only for
+                // older txns (global ages: the same order on every shim) makes such a cycle impossible.
+                // Holders that are committing or already leaving resolve without waiting: waited for
+                die = txn.status in {aborted, must_abort}   // cascade-doomed while waiting
+                      or (not ready and ∃ t in pred.holders:
+                              t.ts > txn.ts and t.status not in {committing, committed, must_abort, aborted})
             }
-            if pred == null:
-                break
-
-            // pred can be spliced out from under us while we wait; re-read
-            // node.predecessor under the latch on every iteration instead of
-            // trusting this captured reference once resolved
-            // an aborted / doomed holder does not satisfy this wait either: wait until it is spliced out
-            // (pred != node.predecessor). If this txn depended on it, the cascade already marked it
-            // must_abort before the splice, which the status check below catches; if it did not (a
-            // blind writer behind an aborted writer, anyone behind an aborted reader), it goes on
-            // and still waits for whatever is now ahead of it
-            wait until (∀ t in pred.holders, t.status == committed)
-                        or txn.status == aborted or txn.status == must_abort
-                        or pred != node.predecessor
-            // txn may have been cascade-aborted by a different key's
-            // predecessor while waiting here
-
-            if txn.status in {aborted, must_abort}:
+            if die:
                 send no to 2PC controller
-
-                if txn.status == must_abort:
-                    abort_transaction(txn)
+                abort_transaction(txn)
                 return
+            if ready:
+                break
+            wait until something changes on chain k
 
-            if pred != node.predecessor:
-                continue   // pred was spliced out mid-wait; loop back and re-read fresh under the latch
-
-            break   // every holder of pred committed
-
-    if not CAS(txn.status, {executed, prepared}, prepared):
+    if not CAS(txn.status, executed, prepared):
         if txn.status in {prepared, committing, committed}:
-            // a concurrent duplicate prepare already CASed to prepared and voted YES (and the
-            // coordinator may even have moved on to commit). Voting NO now would contradict that
-            // vote, so just re-send it
-            send yes to 2PC controller
+            send yes to 2PC controller   // a concurrent duplicate prepare already voted YES
             return
-        // status moved out from under us (e.g. a late cascade mark_must_abort
-        // landed after the wait loop finished) --- the txn never became
-        // prepared, so it is always safe to abort it here and release its
-        // locks rather than leaking them
         send no to 2PC controller
         abort_transaction(txn)
         return
-
-    send yes to 2PC controller
+    send yes to 2PC controller   // prepared is final: no cascade or wound can take txn anymore
 
 
 procedure commit(txn_id):
     txn = transactions_map[txn_id]
-    if txn == null:
-        return   // unknown/already-evicted txn_id: no-op
-
-    // committing (not committed) while the store is being written: a coordinator abort can no
-    // longer take the txn (abort_transaction's CAS excludes it), and a successor's prepare cannot
-    // pass before the writes are applied, since this txn is only spliced out of the chains below
-    if not CAS(txn.status, prepared, committing):
-        return   // includes a tombstoned id (status aborted): no-op
-
-    for (key,value) in txn.write_buffer:
-        store.write(key, value)
-
+    if txn == null or not CAS(txn.status, prepared, committing):
+        return   // unknown, duplicate, or a tombstone
+    // committing: decided, so txn no longer counts in risky_ahead (wakes the grants it held back)
+    for (k, v) in txn.write_buffer:
+        store.write(k, v)
     atomic(locks_map) {
-        for each (k, mode, target_node) in txn.locks_acquired:
-            chain = locks_map[k]
-            remove txn from target_node.holders
-            if target_node.holders is empty:
-                if target_node.predecessor != null:
-                    target_node.predecessor.next=target_node.next
-                if target_node.next != null:
-                    target_node.next.predecessor=target_node.predecessor
-                remove target_node from chain
-                if chain is empty:
-                    remove k from locks_map   // under the latch: a concurrent lock(k) sees the chain or none
+        for each (k, mode, node) in txn.locks_acquired:
+            remove txn from node; splice node out if it is now empty; remove k from locks_map if empty
     }
-    txn.status=committed
-    transactions_map.remove(txn.txn_id)
-    // resolved: the volatile state is dropped, nothing in locks_map references the txn anymore.
-    // Whatever comes for this txn_id afterwards is handled by the unknown-id branches
-    // (assumption 3: the coordinator owns the txn_id lifecycle)
+    txn.status = committed
+    release_dependencies(txn)
+    commits++   // for fanout_controller()
+    transactions_map.remove(txn_id)
 
 
 procedure abort_transaction(txn):
-    if not CAS(txn.status, {executed, prepared, must_abort, started}, aborted):
-        return
-
-    doomed_finished = {}   // cascade victims (txn objects) that had already finished executing
+    if not CAS(txn.status, {started, executed, must_abort, prepared}, aborted):
+        return   // already aborted, or committing/committed
+    doomed_finished = {}
     atomic(locks_map) {
-        for each (k, mode, target_node) in txn.locks_acquired:
-            chain = locks_map[k]
-
-            if mode == EXCLUSIVE:
-                successor_node = target_node.next
-                while successor_node != null:
-                    if successor_node.mode == EXCLUSIVE and not successor_node.upgraded:
-                        break   // blind write
-                    for each t in successor_node.holders:
+        for each (k, mode, node) in txn.locks_acquired:
+            // cascade before splice: the dependents are marked before txn leaves the chain, so none of
+            // them can get past txn's node and vote YES on its rolled-back write.
+            // Only a txn that reached executed can have been read by a successor (lock() waits for that);
+            // so a wounded txn, or one the coordinator aborted while it ran, dooms nobody
+            if mode == EXCLUSIVE and txn.reached_executed:
+                for s = node.next; s != null; s = s.next:
+                    if s.mode == EXCLUSIVE and not s.upgraded:
+                        break   // blind write: does not depend on txn's value, nor do the nodes behind it
+                    for t in s.granted:   // holders still blocked in lock() read nothing: spared
                         if mark_must_abort(t):
                             doomed_finished.add(t)
-                    successor_node = successor_node.next
-
-            remove txn from target_node.holders
-            if target_node.holders is empty:
-                if target_node.predecessor != null:
-                    target_node.predecessor.next=target_node.next
-                if target_node.next != null:
-                    target_node.next.predecessor=target_node.predecessor
-                remove target_node from chain
-                if chain is empty:
-                    remove k from locks_map   // same conditional removal as in commit()
+            remove txn from node; splice node out if it is now empty; remove k from locks_map if empty
     }
-
-
+    release_dependencies(txn)
     transactions_map.remove(txn.txn_id)
-    // resolved: evicted like in commit(). Successors observe txn.status directly (they hold a
-    // reference, not a map lookup). A duplicate/late abort for the evicted id releases nothing: it only
-    // leaves a tombstone (see abort())
-
-    // eager cleanup, outside the latch (so at most one key latch is ever held): a doomed txn that
-    // already finished executing has no thread left that would ever abort it, and waiting for the
-    // coordinator would leave its nodes in the chain (every new writer behind it aborts, and its own
-    // successors are not doomed until it aborts). We hold these as the live txn objects gathered
-    // during the cascade above (not ids): calling abort_transaction(t) directly is safe even if t
-    // has since been resolved by another concurrent cascade or by the coordinator, because its
-    // leading CAS simply fails on an already-{aborted,committed} status and returns, the same
-    // idempotent no-op as any other duplicate abort. Aborting it now releases its locks and cascades
-    // transitively; its later prepare/commit/abort hit the unknown-id branches (prepare votes NO)
-    for each t in doomed_finished:
+    // a doomed txn that already executed has no thread left to abort it: do it now (cascades transitively)
+    for t in doomed_finished:
         abort_transaction(t)
-
-procedure abort(txn_id):
-    // known txn: unchanged (abort_transaction, eviction). Unknown id: leave a tombstone. The
-    // coordinator does not guarantee that its abort comes after the start (assumption 3): without the
-    // tombstone this abort would be a no-op, the late start would register the txn, it would execute,
-    // vote YES and hold its locks forever although the global transaction was rolled back.
-    // computeIfAbsent makes "look the txn up, else insert the tombstone" one atomic step on the map
-    // entry, atomic with start()'s putIfAbsent (see start())
-    txn = transactions_map.computeIfAbsent(txn_id,
-              new txn with txn_id, locks_acquired={}, status=aborted, write_buffer={}, read_buffer={},
-                           expires_at=now() + tombstone_ttl)
-    if txn is the tombstone just inserted:
-        return
-    // a registered txn, or an older tombstone (duplicate abort: its expires_at is not refreshed). On a
-    // tombstone abort_transaction is a no-op: its leading CAS fails on aborted, so it neither touches a
-    // chain nor evicts the tombstone
-    abort_transaction(txn)
-
-    // A tombstone is never removed by a request, only by gc_tombstones(): a start that hits it fails and
-    // leaves it in place, and most tombstones never meet a start at all: a retried abort of a txn that
-    // was already aborted and evicted, or the abort the coordinator sends after a failed phase 1 to a
-    // shim that voted NO (and evicted the txn) leave one too, since an evicted id cannot be told from a
-    // never-started one. tombstone_ttl is what bounds all of them.
-    // Invariants: a tombstone is only ever created for an id with no entry, so it never replaces or
-    // aborts a registered txn (prepared stays final); it holds no lock and sits in no chain, so there is
-    // nothing to cascade or splice and no node can leak
-
-
-procedure gc_tombstones():   // runs periodically, in the background
-    for each (txn_id, t) in transactions_map:
-        if t.expires_at != null and now() >= t.expires_at:
-            transactions_map.remove(txn_id, t)   // conditional on the entry still being this tombstone
-    // Not definitive: once the tombstone is gone, a start for that id is accepted although the global
-    // transaction was rolled back (the txn then holds its locks until the coordinator contacts it
-    // again, if ever). Choosing tombstone_ttl >= the coordinator's maximum global transaction timeout
-    // only makes this unlikely: a start delayed for longer than that is not excluded by an
-    // asynchronous network
 
 
 procedure mark_must_abort(txn) -> bool:
-    // returns true iff txn was executed: nobody runs it anymore, so the caller has to clean it up
-    // itself (see abort_transaction). Never touches prepared. Takes the txn object directly (like
-    // abort_transaction()): mark_must_abort is only ever called from within a cascade that already
-    // holds a live reference to the victim (via successor_node.holders), never from the coordinator,
-    // so there is no id-based external entry point for it to be consistent with
-    // A started victim is still running: the thread handling its connection aborts it at its next
-    // get/put (lock() / upgrade() see must_abort) or at the CAS in end()
-    before=CAS_returning(txn.status, {executed, started}, must_abort)
-    return before==executed
+    // never touches prepared (a YES vote is final). A started victim aborts itself at its next request
+    before = CAS_returning(txn.status, {started, executed}, must_abort)
+    return before == executed
+
+
+procedure abort(txn_id):
+    // known txn: abort it. Unknown id: leave a tombstone (status aborted, no locks), atomically with
+    // start()'s putIfAbsent, so that a start arriving after the abort fails instead of running
+    txn = transactions_map.computeIfAbsent(txn_id, new txn with status = aborted, expires_at = now() + tombstone_ttl)
+    abort_transaction(txn)   // a no-op on a tombstone
+
+
+procedure gc_tombstones():   // background
+    remove from transactions_map every tombstone past its expires_at
+
+
+procedure fanout_controller():   // background, one per shim
+    // hill-climbs the fractional fanout cap F on the shim's commit rate. One step changes the rate by
+    // less than the noise, so each period is compared with an anchor (the last F that made a clear
+    // difference) rather than with the previous period: small effects add up until they show
+    direction = random ±1
+    anchor_F, anchor_rate = F, commit rate of the first period
+    every period:
+        rate = commits per second over the period, without its first moments (still under the old F)
+        if rate > anchor_rate * (1 + eps):
+            anchor_F, anchor_rate = F, rate
+            F = step(F, direction, big)     // clearly better: go on, faster
+        else if rate < anchor_rate * (1 - eps):
+            F = anchor_F                    // clearly worse: back to the anchor, turn around
+            direction = -direction
+        else if too many small steps since the anchor:
+            anchor_F, anchor_rate = F, rate // F barely matters here: re-anchor, turn around
+            direction = -direction
+        else:
+            F = step(F, direction, small)   // no clear effect yet: go on, slowly
+    // step(F, d, s) = F * (1 + s) if d > 0 else F / (1 + s), at most F_max; below F_min it becomes 0
+    // (no speculation but the forced grants), and a step up from 0 goes back to F_min
