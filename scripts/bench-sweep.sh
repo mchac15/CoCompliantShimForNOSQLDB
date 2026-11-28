@@ -68,7 +68,7 @@ done
 n_threads=$(wc -w <<< "$THREADS_LIST")
 per_thread_s=$((ADAPTIVE_WARMUP_S + ADAPTIVE_MEASURE_S + 2 * (BASE_WARMUP_S + BASE_MEASURE_S) + 3 * 45))
 total_min=$((${#selected[@]} * n_threads * per_thread_s / 60))
-echo "sweep: ${#selected[@]} configurations x $n_threads thread counts ($THREADS_LIST) x 3 systems," \
+echo "sweep: ${#selected[@]} configurations x $n_threads thread counts ($THREADS_LIST) x 3 systems, skew $SKEWS," \
     "about $((total_min / 60)) h $((total_min % 60)) min -> $sweep_out"
 echo
 
