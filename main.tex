@@ -16,7 +16,7 @@ Crash recovery is out of scope. The shim is assumed not to crash: in particular 
 The underlying NoSQL store is a black box offering only \texttt{read} and \texttt{write}: \texttt{write} is a blind put and no atomicity across keys is assumed. Store operations are blocking and are retried until they succeed, so the protocol has no error path for store failures.
 
 \paragraph{Deadlocks.}
-The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) are bounded by a timeout: when it expires the subtransaction aborts, which is always safe since it has not executed and voted nothing. This costs liveness only, never CO or 2PC atomicity. The waits in \texttt{prepare} have no timeout: a cross-shim cycle there (T1 before T2 on one shim, T2 before T1 on another) is a 2PC-level deadlock and is left to the coordinator, e.g.\ its vote timeout.
+Every subtransaction has an age \texttt{ts}, taken from its global transaction id, so all shims agree on it; a retry is a new global transaction and is therefore younger. The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) follow \emph{wound-wait}: an older subtransaction never waits for a younger one that is still running; it marks it \texttt{must\_abort} and aborts it instead (the victim has not executed, so nobody read its buffer and it voted nothing). A younger subtransaction waits for an older one. Every wait-for edge between running subtransactions thus goes from younger to older, and no cycle can form. With speculation, two shims can also order the same two subtransactions oppositely, and each \texttt{prepare} then waits for the other's commit, i.e.\ for the other's vote. \texttt{prepare} therefore follows \emph{wait-die}: it votes NO instead of waiting for a younger, still undecided predecessor. Since the ages are global, prepare waits too only go from younger to older on every shim. A timeout on the execution-phase waits remains as a backstop only.
 
 \paragraph{Coordinator Assumptions.}
 \texttt{txn\_id}s are assigned by the coordinator. It calls \texttt{start} at most once per \texttt{txn\_id}, sends \texttt{end} at most once, and sends no \texttt{get}/\texttt{put}/\texttt{end}/\texttt{prepare}/\texttt{commit} for a \texttt{txn\_id} before its \texttt{start} has been delivered. The \texttt{get}/\texttt{put}/\texttt{end} requests of one subtransaction are sent one at a time, each only after the response to the previous one, so they never overlap and \texttt{end} comes after the last \texttt{get}/\texttt{put} has returned. The shim does not check this: if \texttt{end} overtook a running \texttt{put}, a successor could read the key before the write is in the buffer, and the write could land after the YES vote. The client driver enforces it by serializing the requests of a connection; a client that bypasses the driver is outside this assumption. \texttt{abort}, \texttt{prepare} and \texttt{commit} are not covered and may arrive while a \texttt{get}/\texttt{put} is running. An \texttt{abort}, however, may arrive before the \texttt{start} (e.g.\ a global timeout right after the branch was registered). The shim then records a \emph{tombstone} for that \texttt{txn\_id}, so that the late \texttt{start} fails instead of running, voting YES and holding its locks for a global transaction that was rolled back. The shim drops a subtransaction from \texttt{transactions\_map} once it is committed or aborted, and later or duplicate messages for that \texttt{txn\_id} find no entry (\texttt{prepare} votes NO, \texttt{commit} is a no-op, \texttt{get}/\texttt{put}/\texttt{end} fail, \texttt{abort} leaves a tombstone).
@@ -25,7 +25,13 @@ The waits of the execution phase (\Call{lock}{} and \Call{upgrade}{}) are bounde
 A tombstone is an entry of \texttt{transactions\_map} with status \texttt{aborted}, no locks and an expiry time. It is kept in the same map as the subtransactions so that \texttt{abort}'s ``known subtransaction, or else tombstone'' and \texttt{start}'s ``no entry, tombstone included'' are each one atomic operation on the same map entry: either the \texttt{start} registers first and the \texttt{abort} finds and aborts the subtransaction, or the \texttt{abort} leaves its tombstone first and the \texttt{start} finds it and fails. There is no window in which the \texttt{abort} misses the subtransaction and the \texttt{start} misses the tombstone; an implementation with a separate tombstone map must preserve this with a per-\texttt{txn\_id} critical section. Every other request on a tombstoned \texttt{txn\_id} needs no new branch, since it finds an aborted subtransaction without locks: \texttt{prepare} votes NO, \texttt{commit} is a no-op, \texttt{get}/\texttt{put}/\texttt{end} fail. A tombstone is only ever created for a \texttt{txn\_id} without an entry, so it never replaces or aborts a registered subtransaction (\texttt{prepared} stays final), and it sits in no chain, so there is nothing to cascade or splice. Tombstones are garbage-collected by the shim after \texttt{tombstone\_ttl}, to be chosen at least as large as the coordinator's maximum global transaction timeout. This is not definitive: if a \texttt{start} arrives after its tombstone expired, the subtransaction is accepted although the global transaction was rolled back; the TTL only makes this unlikely. A tombstone is never removed by a request. Most never meet a \texttt{start} at all: a retried \texttt{abort} of an already evicted subtransaction, or the \texttt{abort} sent after a failed phase 1 to a shim that voted NO, leave one too, since an evicted \texttt{txn\_id} cannot be told from a never-started one. The TTL is what bounds them.
 
 \paragraph{Execution Model.}
-The shim never receives or runs client code: a subtransaction reaches it as a sequence of requests over a connection, \texttt{start(txn\_id)}, then one \texttt{get}/\texttt{put} request per operation, then \texttt{end(txn\_id)} once the client sent its last operation, followed by the coordinator's \texttt{prepare} and \texttt{commit} or \texttt{abort}. Each \texttt{get}/\texttt{put} request acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution at \texttt{prepare}, where it waits until every predecessor has committed or has been removed from the chain by an abort. A waiter never aborts merely because it sees an aborted predecessor: the cascade of the aborting transaction dooms exactly its dependents before it is removed, walking the chain behind each of its writes and stopping at the next blind writer, which did not read the aborted value and whose own successors read the blind write instead. A later write to an already-read key triggers a lock upgrade: in place if the subtransaction is the sole reader, otherwise onto a new exclusive node behind the readers. An upgrade may move a subtransaction only across readers, never across a writer, since the value it read would be stale by the time its own write takes effect. If a blind writer (one that never read the key) is already queued behind, the new node goes in front of it; if the node behind is itself an upgrade, i.e.\ its holder read the key too, exactly one of the two read-modify-write subtransactions must abort, and it is the later upgrader. The execution phase of a subtransaction spans its requests from \texttt{start} (status \texttt{started}) to \texttt{end}, which flips the status to \texttt{executed} --- but it is not uninterruptible in the scheduling sense: an individual \texttt{get}/\texttt{put} request can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{FAILED} result from any \texttt{get}/\texttt{put} (a \texttt{MUST\_ABORT} from \Call{lock}{} or from \Call{upgrade}{}'s case 3b) means the subtransaction has already been aborted and its locks released, so the client sends no further operations for it. A cascade or a coordinator abort can also land between two requests or after the last one; \texttt{end} then finds the status no longer \texttt{started}, fails its CAS and calls the idempotent \Call{abort\_transaction}{} itself, since no running request would otherwise release the locks. Requests on an unknown or already evicted \texttt{txn\_id} fail, and a \texttt{get}/\texttt{put} arriving after \texttt{end} is refused without touching the subtransaction. The client may not access the store or acquire locks except through \texttt{get}/\texttt{put} requests. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. The value returned is also recorded in a per-transaction \texttt{read\_buffer}, and a repeated \texttt{get} on the same key returns it without walking the chain or reading the store again. The cache needs no invalidation: while the subtransaction holds its lock on the key, the version it may see cannot change, since a predecessor writer that commits leaves the same value in the store, one that aborts dooms the reader, and an upgrade never places a writer in front of an existing reader. A single cache shared by all subtransactions would not work, because readers at different positions in a chain must see different versions. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
+The shim never receives or runs client code: a subtransaction reaches it as a sequence of requests over a connection, \texttt{start(txn\_id)}, then one \texttt{get}/\texttt{put} request per operation, then \texttt{end(txn\_id)} once the client sent its last operation, followed by the coordinator's \texttt{prepare} and \texttt{commit} or \texttt{abort}. Each \texttt{get}/\texttt{put} request acquires a lock on its key dynamically, at the point of access, rather than declaring its full read/write set upfront. A subtransaction proceeds speculatively past a conflicting predecessor once that predecessor reaches \texttt{executed} --- its value is fixed even though undecided --- and only blocks on full resolution at \texttt{prepare}, where it waits until every predecessor has committed or has been removed from the chain by an abort. A waiter never aborts merely because it sees an aborted predecessor: the cascade of the aborting transaction dooms exactly its dependents before it is removed, walking the chain behind each of its writes and stopping at the next blind writer, which did not read the aborted value and whose own successors read the blind write instead. Only the holders that were \emph{granted} (that got past the wait in \Call{lock}{}) are doomed: one still blocked there has read nothing and just keeps waiting. A subtransaction that never reached \texttt{executed} (wounded, or aborted by the coordinator while running) dooms nobody, since no successor can have read its buffer. A later write to an already-read key triggers a lock upgrade: in place if the subtransaction is the sole reader, otherwise onto a new exclusive node behind the readers. An upgrade may move a subtransaction only across readers, never across a writer, since the value it read would be stale by the time its own write takes effect. If a blind writer (one that never read the key) is already queued behind, the new node goes in front of it; if the node behind is itself an upgrade, i.e.\ its holder read the key too, exactly one of the two read-modify-write subtransactions must abort, and it is the later upgrader. The execution phase of a subtransaction spans its requests from \texttt{start} (status \texttt{started}) to \texttt{end}, which flips the status to \texttt{executed} --- but it is not uninterruptible in the scheduling sense: an individual \texttt{get}/\texttt{put} request can block on \Call{lock}{} waiting for another subtransaction, and a \texttt{FAILED} result from any \texttt{get}/\texttt{put} (a \texttt{MUST\_ABORT} from \Call{lock}{} or from \Call{upgrade}{}'s case 3b) means the subtransaction has already been aborted and its locks released, so the client sends no further operations for it. A cascade or a coordinator abort can also land between two requests or after the last one; \texttt{end} then finds the status no longer \texttt{started}, fails its CAS and calls the idempotent \Call{abort\_transaction}{} itself, since no running request would otherwise release the locks. Requests on an unknown or already evicted \texttt{txn\_id} fail, and a \texttt{get}/\texttt{put} arriving after \texttt{end} is refused without touching the subtransaction. The client may not access the store or acquire locks except through \texttt{get}/\texttt{put} requests. Writes are buffered per-transaction (\texttt{write\_buffer}) and applied to the store only at \texttt{commit}, rather than in place at \texttt{put}-time; the buffer is final once the subtransaction is \texttt{executed}. A \texttt{get} first returns the subtransaction's own buffered write to that key, if any. Otherwise, when it is speculating on a predecessor, it reads the value from that predecessor's \texttt{write\_buffer} rather than from the store: it walks back from its own node to the nearest EXCLUSIVE node ahead whose holder wrote the key (never a successor's) and takes the value from that holder's buffer, which is safe because \Call{lock}{} returns only once every predecessor holder is at least \texttt{executed}. If no such node remains, the writer has already committed and applied its buffer to the store, so the store holds the correct value. The value returned is also recorded in a per-transaction \texttt{read\_buffer}, and a repeated \texttt{get} on the same key returns it without walking the chain or reading the store again. The cache needs no invalidation: while the subtransaction holds its lock on the key, the version it may see cannot change, since a predecessor writer that commits leaves the same value in the store, one that aborts dooms the reader, and an upgrade never places a writer in front of an existing reader. A single cache shared by all subtransactions would not work, because readers at different positions in a chain must see different versions. A subtransaction votes YES once every predecessor has resolved and its status has been CASed to \texttt{prepared}. On \texttt{commit} the status moves to \texttt{committing}, the buffer is applied to the store and the locks are released; only then is the status \texttt{committed}. The intermediate \texttt{committing} state keeps a coordinator abort from taking a subtransaction whose commit has been decided, and keeps a successor's prepare from passing before the writes are applied.
+
+\paragraph{Get-for-update.}
+\texttt{get\_for\_update(k)} (\texttt{SELECT ... FOR UPDATE}) is a \texttt{get} that takes the EXCLUSIVE lock right away, its node marked as one whose holder read the key. The later \texttt{put(k)} then needs no upgrade, and two read-modify-writes of a key queue one behind the other instead of one of them aborting in \Call{upgrade}{}. Such a holder is not a blind writer: a cascade does not stop at it. A speculative read skips it if it did not write the key.
+
+\paragraph{Fanout Cap.}
+Speculation costs cascading aborts. To bound how many subtransactions one abort can doom, each writer may have at most \texttt{fanout\_cap} running \emph{dependents}, i.e.\ subtransactions granted on top of it. A dependent counts once, however many keys it depends on it through. A grant that would exceed the cap waits, as without speculation, until the writer commits or loses dependents. To stay deadlock-free, a refused grant that would wait for a younger subtransaction's commit is taken anyway, past the cap. The cap is the shim's fractional value $F$ (each writer draws $\lfloor F \rfloor$ or $\lfloor F \rfloor + 1$, $F$ on average), tuned at run time by a hill-climb on the shim's commit rate.
 
 \paragraph{Architecture.}
 There is one shim per data source, where a data source is a node together with a database name. The shim node is colocated with the store or runs standalone next to it. One server can host several databases, each with its own shim, i.e.\ its own \texttt{locks\_map} and \texttt{transactions\_map}; nothing is shared between shims. A shim manages all the tables of its database. Each shim accepts many concurrent connections, only from the coordinator side (the 2PC participants). A connection carries one subtransaction at a time, while many subtransactions run concurrently on different connections; each request runs on the thread handling its connection and blocks only that thread. A subtransaction is identified by its \texttt{txn\_id}, not by a connection, so its requests may arrive on different connections; that they never overlap comes from the coordinator assumptions (one request at a time, enforced by the client driver), not from the connection. Given that, the only foreign threads that touch a running subtransaction are cascades and the coordinator's \texttt{abort}/\texttt{prepare}. A subtransaction is bound to a single data source by definition --- access to several databases is expressed as multiple subtransactions within one Sonata global transaction, coordinated by Sonata's outer 2PC, not by any single subtransaction spanning data sources. The shim's \texttt{locks\_map} is therefore scoped to one data source, with a single point of serialization; no cross-node lock coordination is needed within the shim itself.
@@ -43,65 +49,71 @@ The shim locks at the granularity of a single record, identified by its table an
 
 \State \textbf{Data Structures:}
 \State $\text{lock\_mode} \in \{\text{SHARED}, \text{EXCLUSIVE}\}$
-\State $\text{LockNode}: \{\text{mode}, \text{holders}: \text{set of txn}, \text{predecessor}, \text{next}, \text{upgraded}\}$ \Comment{upgraded (default false): the holder read $k$ before writing it; set by \Call{upgrade}{}}
-
-\State $\text{chain}: \{\text{head}, \text{tail}\}$ \Comment{doubly linked through predecessor/next, arrival order $=$ required commit order; last\_node() $=$ tail}
-\State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, chain>}$ \Comment{one chain per key, generations of holders; a key $k$ stands for (table, key)}
-\State $\text{txn}: \{\text{txn\_id}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{target\_node}) \text{ (built dynamically)}, \text{status}, \text{write\_buffer}: \text{key} \to \text{value}, \text{read\_buffer}: \text{key} \to \text{value}, \text{expires\_at}\}$ \Comment{expires\_at: only set on a tombstone, null otherwise. read\_buffer: the value each \Call{get}{} returned, so a repeated \Call{get}{k} skips the chain walk and the store; private to the txn, never applied to the store}
+\State $\text{LockNode}: \{\text{mode}, \text{holders}: \text{set of txn}, \text{granted}: \text{set of txn}, \text{predecessor}, \text{next}, \text{upgraded}\}$ \Comment{one generation of holders of a key: consecutive SHARED requests share a node, every EXCLUSIVE request (or a SHARED one behind an EXCLUSIVE node) gets a new one, so an EXCLUSIVE node has one holder}
+\State \Comment{granted $\subseteq$ holders: the holders that got past the wait in \Call{lock}{}, i.e.\ that may have read the key; a holder still blocked there read nothing, so a cascade spares it}
+\State \Comment{upgraded: the holder read $k$ before writing it (\Call{upgrade}{} or get\_for\_update); a node from a plain \Call{put}{k} is a blind write: it depends on no earlier value of $k$}
+\State $\text{chain}: \{\text{head}, \text{tail}\}$ \Comment{doubly linked through predecessor/next; order $=$ required commit order}
+\State $\text{locks\_map}\colon \texttt{ConcurrentHashMap<key, chain>}$ \Comment{one chain per key; a key $k$ stands for (table, key)}
+\State $\text{txn}: \{\text{txn\_id}, \text{ts}, \text{status}, \text{locks\_acquired}: \text{key} \to (\text{mode}, \text{node}), \text{write\_buffer}: \text{key} \to \text{value}, \text{read\_buffer}: \text{key} \to \text{value}, \text{reached\_executed}, \text{depends\_on}: \text{set of txn}, \text{dependents}, \text{fanout\_cap}\}$
+\State \Comment{ts: the txn's age (smaller $=$ older), taken from the global transaction id, so every shim agrees on it; a retry is a new global transaction, hence younger}
+\State \Comment{read\_buffer: the value each \Call{get}{} returned, so a repeated \Call{get}{k} returns the same value}
+\State \Comment{reached\_executed: the txn was executed at some point, so a successor may have read its write\_buffer}
+\State \Comment{depends\_on / dependents / fanout\_cap: the fanout cap's bookkeeping (see \Call{admit\_fanout}{})}
 \State $\text{status} \in \{\text{started}, \text{executed}, \text{prepared}, \text{committing}, \text{committed}, \text{aborted}, \text{must\_abort}\}$
-\State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$ \Comment{also holds the tombstones: a txn entry with status aborted, no locks, empty write\_buffer and read\_buffer, and expires\_at set, recording that the coordinator aborted the id before its start; same map so that \Call{abort}{} and \Call{start}{} are each one atomic operation on the entry and other requests need no new branch}
-\State $\text{tombstone\_ttl}$: duration \Comment{lifetime of a tombstone, $\geq$ the coordinator's maximum global transaction timeout}
-\State $\text{lock\_timeout}$: duration \Comment{bounds every wait of the execution phase (\Call{lock}{}, \Call{upgrade}{}); prepare has none}
-\State \Comment{atomic(locks\_map) is one critical section; per-key latches are fine if the status re-check and the update of locks\_acquired stay atomic w.r.t. \Call{abort\_transaction}{} reading locks\_acquired}
+\State $\text{SPEC\_READY} = \{\text{executed}, \text{prepared}, \text{committing}, \text{committed}\}$ \Comment{the speculation point: from executed on, a txn's write\_buffer no longer changes, so successors may read on top of it}
+\State \Comment{the non-speculative baseline is the same protocol with $\text{SPEC\_READY} = \{\text{committed}\}$ (no successor ever reads an uncommitted value, no abort ever cascades, no fanout cap)}
+\State $\text{transactions\_map}\colon \texttt{ConcurrentHashMap<txn\_id, txn>}$ \Comment{also holds the tombstones: an aborted txn with no locks and an expires\_at, left by an abort that came before the start (see \Call{abort}{}), removed after tombstone\_ttl}
+\State $F$: real $\geq 0$ \Comment{the shim's adaptive fanout cap, tuned by \Call{fanout\_controller}{}}
+\State $\text{lock\_timeout}$ \Comment{backstop on the waits of \Call{lock}{}/\Call{upgrade}{}; deadlocks are prevented by wound-wait}
+\State \Comment{atomic(locks\_map) is one critical section over the chains (an implementation may use a latch per key, one at a time); ``wait until'' sleeps until something changes on the chain it reads}
 
 \Statex
-\State \textbf{Store:} black box NoSQL store, nothing more is assumed than the following
+\State \textbf{Store:}
 \State \Call{store.read}{k} $\to$ value
-\State \Call{store.write}{k, v} \Comment{blind put; no atomicity across keys assumed}
-\State \Comment{store.write is blocking and retried until it succeeds; crash recovery is out of scope (the shim is assumed not to crash between voting YES and the decision)}
-
-\Statex
-\State \textbf{Requests:} \Comment{the shim never receives or runs client code}
-\State \Comment{one shim per data source ($=$ node $+$ database name), colocated with the store or standalone; several databases on one server each have their own shim (own locks\_map / transactions\_map); a shim manages all the tables of its database}
-\State \Comment{each shim accepts many concurrent connections, only from the coordinator side (the 2PC participants); a connection carries one txn at a time: \Call{start}{txn\_id}, one \Call{get}{}/\Call{put}{} per operation, then \Call{end}{txn\_id}; prepare/commit/abort carry the coordinator's decision}
-\State \Comment{each request runs on the thread handling its connection; a txn is identified by its txn\_id, not by a connection, and its get/put/end never overlap by assumption 3 (enforced by the client driver); only cascades and the coordinator's abort/prepare touch a running txn from another thread}
+\State \Call{store.write}{k, v} \Comment{blind put, blocking, no atomicity across keys}
+\State \textbf{Assumptions:}
+\State \Comment{1. No crashes: crash recovery is out of scope (nothing is logged).}
+\State \Comment{2. The coordinator assigns txn\_ids, calls start once per txn\_id, and sends get/put/end of one txn one at a time (the client driver serializes them). abort/prepare/commit may arrive at any time, an abort even before the start (the shim then leaves a tombstone).}
+\State \Comment{3. Deadlocks: execution-phase waits are made acyclic by wound-wait, prepare-phase waits by wait-die (both on the global ages ts). lock\_timeout only remains as a backstop.}
 
 \Statex
 \Procedure{start}{txn\_id}
-    \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{locks\_acquired}=\{\}$, $\text{status}=\text{started}$, $\text{write\_buffer}=\{\}$, $\text{read\_buffer}=\{\}$, $\text{expires\_at}=\text{null}$
-    \If{$\Call{transactions\_map.putIfAbsent}{txn.\text{txn\_id}, txn} \neq \text{null}$}
-        \State \textbf{return} FAILED \Comment{txn\_id already registered (collision / duplicate) or tombstoned: the coordinator already aborted it. putIfAbsent is atomic with the computeIfAbsent of \Call{abort}{}: no window where the abort misses the txn and the start misses the tombstone}
+    \State $txn \gets$ new txn with $\text{txn\_id}$, $\text{ts} = \Call{age}{txn\_id}$, $\text{status}=\text{started}$, everything else empty
+    \If{$\Call{transactions\_map.putIfAbsent}{txn\_id, txn} \neq \text{null}$}
+        \State \textbf{return} FAILED \Comment{duplicate, or tombstoned: the coordinator already aborted this id}
     \EndIf
     \State \textbf{return} SUCCEEDED
 \EndProcedure
 
 \Statex
-\Procedure{end}{txn\_id} \Comment{the client sent its last get/put: the write buffer is final from here on}
+\Procedure{end}{txn\_id} \Comment{the client sent its last get/put: the write\_buffer is final from here on}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
-        \State \textbf{return} FAILED \Comment{unknown txn\_id: never started, or already aborted and evicted; a tombstoned id fails the CAS below instead}
+        \State \textbf{return} FAILED
     \EndIf
     \If{\textbf{not} \Call{CAS}{txn.\text{status}, \text{started}, \text{executed}}}
         \If{$txn.\text{status} \in \{\text{executed}, \text{prepared}, \text{committing}, \text{committed}\}$}
-            \State \textbf{return} SUCCEEDED \Comment{duplicate/late end: never abort here, a prepared txn voted YES}
+            \State \textbf{return} SUCCEEDED \Comment{duplicate end}
         \EndIf
-        \State \Comment{aborted or must\_abort: a FAILED get/put already aborted it, but a cascade or foreign abort may have landed after the last get/put and nobody released the locks yet}
-        \State \Call{abort\_transaction}{txn} \Comment{idempotent}
+        \State \Call{abort\_transaction}{txn} \Comment{doomed while running: release its locks (idempotent)}
         \State \textbf{return} FAILED
     \EndIf
+    \State $txn.\text{reached\_executed} \gets \text{true}$
     \State \textbf{return} SUCCEEDED
 \EndProcedure
 
 \Statex
-\Procedure{get}{txn\_id, k}
+\Procedure{get}{txn\_id, k, for\_update $=$ false}
+    \State \Comment{for\_update $=$ get\_for\_update($k$), i.e.\ SELECT ... FOR UPDATE: the txn will write $k$ after reading it, so it takes the EXCLUSIVE lock right away. The later \Call{put}{k} then needs no upgrade, and two read-modify-writes of $k$ queue one behind the other instead of one of them aborting in \Call{upgrade}{}}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
-    \If{$txn == \text{null}$}
-        \State \textbf{return NULL, FAILED} \Comment{unknown txn\_id: never started, or already aborted and evicted; a tombstoned id fails in \Call{lock}{} before touching any chain}
+    \If{$txn == \text{null}$ \textbf{or} $txn.\text{status} \in \{\text{executed}, \text{prepared}, \text{committing}, \text{committed}\}$}
+        \State \textbf{return NULL, FAILED} \Comment{unknown txn\_id, or a request after \Call{end}{}}
     \EndIf
-    \If{$txn.\text{status} \in \{\text{executed}, \text{prepared}, \text{committing}, \text{committed}\}$}
-        \State \textbf{return NULL, FAILED} \Comment{request after \Call{end}{}: the buffer is final, refuse without aborting; the only FAILED not coming from \Call{abort\_transaction}{}}
+    \If{$for\_update$}
+        \State $result \gets$ \Call{lock}{k, \text{EXCLUSIVE}, txn, reads\_key $=$ true}
+    \Else
+        \State $result \gets$ \Call{lock}{k, \text{SHARED}, txn}
     \EndIf
-    \State $result \gets$ \Call{lock}{k, \text{SHARED}, txn}
     \If{$result == \text{MUST\_ABORT}$}
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return NULL, FAILED}
@@ -109,48 +121,39 @@ The shim locks at the granularity of a single record, identified by its table an
     \If{$k \in txn.\text{write\_buffer}$}
         \State \textbf{return} $txn.\text{write\_buffer}[k]$, SUCCEEDED \Comment{own write first}
     \EndIf
-    \State $actual\_value \gets \text{null}$ \Comment{null $=$ no predecessor version; values are assumed non-null}
-    \Statex \Comment{speculative read: nearest EXCLUSIVE node at or before own node; its buffer is final since \Call{lock}{} waits for \texttt{executed}. If none, the writer committed and the store is correct}
-    \State $doomed \gets \text{false}$
+    \State $value \gets \text{null}$ \Comment{null $=$ no predecessor version (values are non-null)}
     \State \textbf{atomic}(locks\_map) \{
     \If{$txn.\text{status} \in \{\text{aborted}, \text{must\_abort}\}$}
-        \State $doomed \gets \text{true}$ \Comment{re-check under the latch, as in \Call{lock}{}: a foreign abort since \Call{lock}{} returned may have spliced the own node out; its stale predecessor can be an emptied node with no holder. abort\_transaction CASes to aborted before splicing, so any other status means the node is still in the chain}
+        \State \indent $doomed \gets \text{true}$ \Comment{a foreign abort released this txn's locks since \Call{lock}{} returned}
     \ElsIf{$k \in txn.\text{read\_buffer}$}
-        \State $actual\_value \gets txn.\text{read\_buffer}[k]$ \Comment{already read: same value as a fresh walk, since the visible version cannot change while the lock on $k$ is held: a predecessor writer that commits applies the same value to the store, one that aborts marks this txn must\_abort (checked above), and \Call{upgrade}{} never inserts an EXCLUSIVE node in front of an existing reader. Checked after write\_buffer, so a read after the own put returns the write; a cached null (k absent from the store) falls through to \Call{store.read}{k} again}
-    \ElsIf{$k \in \text{locks\_map}$}
-        \State $current\_node \gets txn.\text{locks\_acquired}[k].\text{target\_node}$
-        \While{$current\_node \neq \text{null}$ \textbf{and} $current\_node.\text{mode} \neq \text{EXCLUSIVE}$}
-            \State $current\_node \gets current\_node.\text{predecessor}$
-        \EndWhile
-        \If{$current\_node \neq \text{null}$}
-            \State $actual\_value \gets (\text{sole holder of } current\_node).\text{write\_buffer}[k]$
-        \EndIf
+        \State \indent $value \gets txn.\text{read\_buffer}[k]$ \Comment{the version visible to txn cannot change while it holds $k$}
+    \Else
+        \State \indent \Comment{speculative read: the write of the nearest EXCLUSIVE node ahead of txn's own node whose holder wrote $k$ (a get\_for\_update holder that did not write $k$ holds no version of it). Its write\_buffer is final: \Call{lock}{} only returned once every holder ahead was executed}
+        \For{$n \gets txn.\text{locks\_acquired}[k].\text{node.predecessor}$; $n \neq \text{null}$; $n \gets n.\text{predecessor}$}
+            \If{$n.\text{mode} == \text{EXCLUSIVE}$ \textbf{and} $k \in (\text{the holder of } n).\text{write\_buffer}$}
+                \State \indent $value \gets (\text{the holder of } n).\text{write\_buffer}[k]$; \textbf{break}
+            \EndIf
+        \EndFor
     \EndIf
-    \}
+    \State \}
     \If{$doomed$}
-        \State \Call{abort\_transaction}{txn} \Comment{outside the latch; idempotent, releases the locks of a must\_abort txn}
+        \State \Call{abort\_transaction}{txn}
         \State \textbf{return NULL, FAILED}
     \EndIf
-    \If{$actual\_value \neq \text{null}$}
-        \State $txn.\text{read\_buffer}[k] \gets actual\_value$
-        \State \textbf{return} $actual\_value$, SUCCEEDED
+    \If{$value == \text{null}$}
+        \State $value \gets$ \Call{store.read}{k} \Comment{no uncommitted version ahead: the store holds the latest committed one}
     \EndIf
-    \State $actual\_value \gets$ \Call{store.read}{k}
-    \State $txn.\text{read\_buffer}[k] \gets actual\_value$
-    \State \textbf{return} $actual\_value$, SUCCEEDED
+    \State $txn.\text{read\_buffer}[k] \gets value$
+    \State \textbf{return} $value$, SUCCEEDED
 \EndProcedure
 
 \Statex
 \Procedure{put}{txn\_id, k, v}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
-    \If{$txn == \text{null}$}
-        \State \textbf{return FAILED} \Comment{unknown txn\_id, as in \Call{get}{}}
+    \If{$txn == \text{null}$ \textbf{or} $txn.\text{status} \in \{\text{executed}, \text{prepared}, \text{committing}, \text{committed}\}$}
+        \State \textbf{return FAILED}
     \EndIf
-    \If{$txn.\text{status} \in \{\text{executed}, \text{prepared}, \text{committing}, \text{committed}\}$}
-        \State \textbf{return FAILED} \Comment{request after \Call{end}{}, as in \Call{get}{}}
-    \EndIf
-    \State $result \gets$ \Call{lock}{k, \text{EXCLUSIVE}, txn}
-    \If{$result == \text{MUST\_ABORT}$}
+    \If{\Call{lock}{k, \text{EXCLUSIVE}, txn} $== \text{MUST\_ABORT}$}
         \State \Call{abort\_transaction}{txn}
         \State \textbf{return FAILED}
     \EndIf
@@ -169,134 +172,146 @@ The shim locks at the granularity of a single record, identified by its table an
 \small
 \begin{algorithmic}[1]
 
-
-\Statex
-\Procedure{lock}{k, mode, txn}
-    \If{$\text{txn.status} == \text{aborted}$ \textbf{or} $\text{txn.status} == \text{must\_abort}$}
-        \State \textbf{return} MUST\_ABORT \Comment{txn was cascade-aborted while running}
-    \EndIf
-    \State $target\_node \gets \text{null}$
-    \If{$\text{txn.locks\_acquired}[k]$ contains $(mode, *)$}
-        \State \textbf{return} ALREADY\_HELD
-    \ElsIf{$\text{txn.locks\_acquired}[k]$ contains $(\text{EXCLUSIVE}, *)$}
-        \State \textbf{return} ALREADY\_HELD
-    \ElsIf{$\text{txn.locks\_acquired}[k]$ contains $(\text{SHARED}, *)$ \textbf{and} $mode == \text{EXCLUSIVE}$}
-        \State \textbf{return} \Call{upgrade}{k, txn}
+\Procedure{lock}{k, mode, txn, reads\_key $=$ false}
+    \State $held \gets txn.\text{locks\_acquired}[k]$
+    \If{$held \neq \text{null}$}
+        \If{$held.\text{mode} == \text{EXCLUSIVE}$ \textbf{or} $mode == \text{SHARED}$}
+            \State \textbf{return} ALREADY\_HELD \textbf{if} $txn.\text{status} == \text{started}$ \textbf{else} MUST\_ABORT
+        \EndIf
+        \State \textbf{return} \Call{upgrade}{k, txn} \Comment{holds $k$ SHARED, wants it EXCLUSIVE}
     \EndIf
     \State \textbf{atomic}(locks\_map) \{
-        \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
-            \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the latch: a foreign \Call{abort\_transaction}{} may have released our locks after the check above}
+        \If{$txn.\text{status} \neq \text{started}$}
+            \State \indent \textbf{return} MUST\_ABORT \Comment{checked under the latch: a foreign \Call{abort\_transaction}{} may have released txn's locks, and a node appended now would never be removed}
         \EndIf
-        \If{$k \notin \text{locks\_map}$}
-            \State \indent $\text{locks\_map}[k] = \text{new chain}$
-        \EndIf
-        \State \indent $chain \gets \text{locks\_map}[k]$
-        \State \indent $last\_node \gets chain.\text{last\_node}()$
-        \If{$last\_node == \text{null}$}
-            \State \indent $target\_node \gets \text{LockNode}\{mode, \text{holders}=\{txn\}, \text{predecessor}=\text{null}, \text{next}=\text{null}\}$
-            \State \indent append $target\_node$ to $chain$
-        \ElsIf{$mode == \text{SHARED}$ \textbf{and} $last\_node.\text{mode} == \text{SHARED}$}
-            \State \indent $last\_node.\text{holders.add}(txn)$
-            \State \indent $target\_node \gets last\_node$
+        \State \indent $chain \gets \text{locks\_map}[k]$, created if absent
+        \If{$mode == \text{SHARED}$ \textbf{and} $chain.\text{tail} \neq \text{null}$ \textbf{and} $chain.\text{tail.mode} == \text{SHARED}$}
+            \State \indent $node \gets chain.\text{tail}$; $node.\text{holders.add}(txn)$
         \Else
-            \State \indent $target\_node \gets \text{LockNode}\{mode, \text{holders}=\{txn\}, \text{predecessor}=last\_node, \text{next}=\text{null}\}$
-            \State \indent $last\_node.\text{next} \gets target\_node$
-            \State \indent append $target\_node$ to $chain$
+            \State \indent $node \gets \text{LockNode}\{mode, \text{holders}=\{txn\}, \text{granted}=\{\}, \text{upgraded}=reads\_key\}$
+            \State \indent append $node$ to $chain$
         \EndIf
-        \State \indent $\text{txn.locks\_acquired}[k] = (mode, target\_node)$
-    \}
-    \State $deadline \gets \text{now}() + \text{lock\_timeout}$
-    \Loop
-        \State \textbf{atomic}(locks\_map) \{ $pred \gets target\_node.\text{predecessor}$ \}
-        \If{$pred == \text{null}$}
-            \State \textbf{break}
-        \EndIf
-        \State \Comment{pred may be spliced out while waiting: re-read it under the latch each iteration}
-        \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{executed}, \text{prepared}, \text{committing}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq target\_node.\text{predecessor}$ \textbf{or} $\text{now}() \geq deadline$
-        \If{$pred \neq target\_node.\text{predecessor}$}
-            \State \textbf{continue} \Comment{pred spliced out mid-wait, re-read}
-        \EndIf
-        \State \Comment{no abort on an aborted/doomed predecessor holder: it does not satisfy the wait, so this txn waits for its splice; whether it depends on it is decided by the cascade, which marks exactly the dependents must\_abort before the splice}
-        \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
-            \State \textbf{return} MUST\_ABORT
-        \EndIf
-        \If{\textbf{not} \big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{executed}, \text{prepared}, \text{committing}\}\big)}
-            \State \Call{abort\_transaction}{txn} \Comment{deadline reached: assume a deadlock, safe since nothing was voted}
-            \State \textbf{return} MUST\_ABORT
-        \EndIf
-        \State \textbf{break}
-    \EndLoop
-    \State \Comment{deadlocks between running txns are broken by lock\_timeout, no wait-for graph is kept}
-    \State \textbf{return} LOCK\_ACQUIRED
+        \State \indent $txn.\text{locks\_acquired}[k] \gets (mode, node)$
+    \State \}
+    \State \textbf{return} \Call{await\_grant}{k, txn, node}
 \EndProcedure
 
 \Statex
-\Procedure{upgrade}{k, txn}
-    \State $must\_wait \gets \text{false}$
-    \State $node \gets \text{null}$
-    \State $return\_value \gets \text{MUST\_ABORT}$
+\Procedure{upgrade}{k, txn} \Comment{SHARED $\to$ EXCLUSIVE; invariant: txn only moves across readers, never across a writer (its read would be stale by the time its own write takes effect: lost update)}
     \State \textbf{atomic}(locks\_map) \{
-        \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
-            \State \indent \textbf{return} MUST\_ABORT \Comment{re-check under the latch, as in \Call{lock}{}}
+        \If{$txn.\text{status} \neq \text{started}$}
+            \State \indent \textbf{return} MUST\_ABORT
         \EndIf
-        \State \indent $node \gets \text{txn.locks\_acquired}[k].\text{target\_node}$
-        \State \indent $chain \gets \text{locks\_map}[k]$
-        \State \indent \Comment{an upgrade may move this txn only across readers, never across a writer; what is queued behind node is blocked in \Call{lock}{} until node's holders (this txn included) are executed}
-        \State \indent $p \gets node$
-        \While{$p.\text{next} \neq \text{null}$ \textbf{and} $p.\text{next}.\text{mode} == \text{SHARED}$}
-            \State \indent $p \gets p.\text{next}$ \Comment{readers left by a spliced-out aborted writer}
+        \State \indent $node \gets txn.\text{locks\_acquired}[k].\text{node}$; $p \gets node$
+        \While{$p.\text{next} \neq \text{null}$ \textbf{and} $p.\text{next.mode} == \text{SHARED}$}
+            \State \indent $p \gets p.\text{next}$ \Comment{skip the readers queued behind node}
         \EndWhile
         \State \indent $after \gets p.\text{next}$ \Comment{EXCLUSIVE or null}
         \If{$after \neq \text{null}$ \textbf{and} $after.\text{upgraded}$}
-            \State \indent \Comment{case 3b: its holder read $k$ too (read-modify-write vs read-modify-write): this txn loses, return\_value stays MUST\_ABORT}
-        \ElsIf{$p == node$ \textbf{and} $node.\text{holders} == \{txn\}$}
-            \State \indent $node.\text{mode} \gets \text{EXCLUSIVE}$; $node.\text{upgraded} \gets \text{true}$ \Comment{case 1: in place, at most a blind writer behind}
-            \State \indent $\text{txn.locks\_acquired}[k] = (\text{EXCLUSIVE}, node)$
-            \State \indent $return\_value \gets \text{UPGRADED}$
-        \Else
-            \State \indent $node.\text{holders.remove}(txn)$ \Comment{cases 2, 3a: new node right behind $p$, at the tail or in front of the blind writer $after$}
-            \State \indent $new\_node \gets \text{LockNode}\{\text{EXCLUSIVE}, \text{holders}=\{txn\}, \text{predecessor}=p, \text{next}=after, \text{upgraded}=\text{true}\}$
-            \State \indent $p.\text{next} \gets new\_node$
-            \If{$after \neq \text{null}$}
-                \State \indent $after.\text{predecessor} \gets new\_node$ \Comment{it now also waits for this txn}
-            \Else
-                \State \indent append $new\_node$ to $chain$
-            \EndIf
-            \If{$node.\text{holders}$ is empty} \Comment{only possible when $p \neq node$}
-                \State \indent \textbf{if} $node.\text{predecessor} \neq \text{null}$\textbf{:} $node.\text{predecessor.next} \gets node.\text{next}$
-                \State \indent \textbf{if} $node.\text{next} \neq \text{null}$\textbf{:} $node.\text{next.predecessor} \gets node.\text{predecessor}$
-                \State \indent remove $node$ from $chain$
-            \EndIf
-            \State \indent $\text{txn.locks\_acquired}[k] = (\text{EXCLUSIVE}, new\_node)$
-            \State \indent $must\_wait \gets \text{true}$
-            \State \indent $return\_value \gets \text{UPGRADED}$
+            \State \indent \textbf{return} MUST\_ABORT \Comment{read-modify-write against read-modify-write: this one loses}
         \EndIf
-    \}
-    \If{$must\_wait$}
-        \State $deadline \gets \text{now}() + \text{lock\_timeout}$
-        \Loop
-            \State \textbf{atomic}(locks\_map) \{ $pred \gets new\_node.\text{predecessor}$ \}
-            \If{$pred == \text{null}$}
+        \If{$p == node$ \textbf{and} $node.\text{holders} == \{txn\}$}
+            \State \indent $node.\text{mode} \gets \text{EXCLUSIVE}$; $node.\text{upgraded} \gets \text{true}$ \Comment{sole holder, at most a blind writer behind: flip in place}
+            \State \indent $txn.\text{locks\_acquired}[k] \gets (\text{EXCLUSIVE}, node)$
+            \State \indent \textbf{return} LOCK\_ACQUIRED
+        \EndIf
+        \State \indent \Comment{leave node, take a new EXCLUSIVE node right behind $p$: at the tail, or in front of the blind writer $after$ (which then also waits for txn)}
+        \State \indent $new\_node \gets \text{LockNode}\{\text{EXCLUSIVE}, \text{holders}=\{txn\}, \text{upgraded}=\text{true}, \text{granted}=\{txn\} \text{ if } txn \in node.\text{granted} \text{ else } \{\}\}$ \Comment{it read $k$: a cascade must reach it}
+        \State \indent remove $txn$ from $node.\text{holders}$ (and $node.\text{granted}$); splice $node$ out if it is now empty
+        \State \indent insert $new\_node$ between $p$ and $after$
+        \State \indent $txn.\text{locks\_acquired}[k] \gets (\text{EXCLUSIVE}, new\_node)$
+    \State \}
+    \State \textbf{return} \Call{await\_grant}{k, txn, new\_node} \Comment{wait for the readers it was queued behind}
+\EndProcedure
+
+\Statex
+\Procedure{await\_grant}{k, txn, node}
+    \State \Comment{the wait of \Call{lock}{}/\Call{upgrade}{}: until every holder ahead reached the speculation point and the grant fits the fanout cap. Wound-wait keeps it deadlock-free: an older txn never waits for a younger running one, it aborts it instead, so every wait-for edge between running txns goes from younger to older}
+    \State $deadline \gets \text{now}() + \text{lock\_timeout}$
+    \Loop
+        \State $victims \gets \{\}$
+        \State \textbf{atomic}(locks\_map) \{
+            \If{$txn.\text{status} \in \{\text{aborted}, \text{must\_abort}\}$}
+                \State \indent \textbf{return} MUST\_ABORT
+            \EndIf
+            \State \indent $pred \gets node.\text{predecessor}$ \Comment{re-read every time: nodes ahead are spliced out / inserted meanwhile}
+            \If{$pred == \text{null}$ \textbf{or} $\forall t \in pred.\text{holders}: t.\text{status} \in \text{SPEC\_READY}$}
+                \If{\Call{admit\_fanout}{txn, node}}
+                    \State \indent $node.\text{granted.add}(txn)$
+                    \State \indent \textbf{return} LOCK\_ACQUIRED
+                \EndIf
+                \State \indent \Comment{refused: wait, as without speculation, for the full writer to commit or lose dependents}
+            \Else
+                \State \indent \Comment{wound-wait: the holders ahead that block txn (not yet executed, not already leaving)}
+                \State \indent $blocking \gets \{t \in pred.\text{holders} : t.\text{status} \notin \text{SPEC\_READY} \cup \{\text{must\_abort}, \text{aborted}\}\}$
+                \If{$blocking \neq \{\}$ \textbf{and} $\forall t \in blocking: t.\text{status} == \text{started}$ \textbf{and} $t.\text{ts} > txn.\text{ts}$}
+                    \For{\textbf{each} $t \in blocking$}
+                        \If{\Call{CAS}{t.\text{status}, \text{started}, \text{must\_abort}}} \Comment{a victim is still started: nobody read its buffer, it voted nothing}
+                            \State \indent $victims.\text{add}(t)$
+                        \EndIf
+                    \EndFor
+                \EndIf
+                \State \indent \Comment{an older holder (or a younger one already executed/prepared) is simply waited for}
+            \EndIf
+        \State \}
+        \If{$victims \neq \{\}$}
+            \State \textbf{for each} $t \in victims$\textbf{:} \Call{abort\_transaction}{t} \Comment{outside the latch; its release splices its node out}
+            \State \textbf{continue}
+        \EndIf
+        \State \textbf{wait until} something changes on chain $k$ \textbf{or} $\text{now}() \geq deadline$
+        \If{$\text{now}() \geq deadline$}
+            \State \textbf{return} MUST\_ABORT \Comment{backstop only (e.g.\ a stalled holder)}
+        \EndIf
+    \EndLoop
+\EndProcedure
+
+\Statex
+\Procedure{risky\_ahead}{node} $\to$ list of txn
+    \State \Comment{the txns whose abort would cascade to node's holder: the undecided holders of the EXCLUSIVE nodes ahead of it, back to the first blind write (a blind write depends on nobody's value)}
+    \If{$node.\text{mode} == \text{EXCLUSIVE}$ \textbf{and not} $node.\text{upgraded}$}
+        \State \textbf{return} $\{\}$
+    \EndIf
+    \State $risky \gets \{\}$
+    \For{$n \gets node.\text{predecessor}$; $n \neq \text{null}$; $n \gets n.\text{predecessor}$}
+        \If{$n.\text{mode} == \text{EXCLUSIVE}$}
+            \State $w \gets$ the holder of $n$
+            \If{$w.\text{status} \notin \{\text{committing}, \text{committed}\}$}
+                \State $risky.\text{add}(w)$
+            \EndIf
+            \If{\textbf{not} $n.\text{upgraded}$}
                 \State \textbf{break}
             \EndIf
-            \State \Comment{same re-read of the predecessor as in \Call{lock}{}}
-            \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{executed}, \text{prepared}, \text{committing}\}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq new\_node.\text{predecessor}$ \textbf{or} $\text{now}() \geq deadline$
-            \If{$pred \neq new\_node.\text{predecessor}$}
-                \State \textbf{continue}
-            \EndIf
-            \State \Comment{no abort on an aborted/doomed predecessor holder, as in \Call{lock}{}: wait for its splice}
-            \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
-                \State \textbf{return} MUST\_ABORT
-            \EndIf
-            \If{\textbf{not} \big(\forall t \in pred.\text{holders}, t.\text{status} \in \{\text{committed}, \text{executed}, \text{prepared}, \text{committing}\}\big)}
-                \State \Call{abort\_transaction}{txn} \Comment{deadline reached, as in \Call{lock}{}}
-                \State \textbf{return} MUST\_ABORT
-            \EndIf
-            \State \textbf{break}
-        \EndLoop
-        \State \Comment{bounded by lock\_timeout, like the wait in \Call{lock}{}}
+        \EndIf
+    \EndFor
+    \State \textbf{return} $risky$
+\EndProcedure
+
+\Statex
+\Procedure{admit\_fanout}{txn, node} $\to$ bool
+    \State \Comment{fanout cap: each writer has at most fanout\_cap running dependents, i.e.\ txns whose grant reads on top of it (a dependent counts once, through however many keys). Bounds how many txns one abort can doom. Under the latch, all or nothing: returns true if txn may be granted}
+    \State $risky \gets \Call{risky\_ahead}{node} \setminus txn.\text{depends\_on}$
+    \For{\textbf{each} $w \in risky$}
+        \If{$w.\text{fanout\_cap}$ is unset}
+            \State $w.\text{fanout\_cap} \gets \lfloor F \rfloor + (1 \text{ with probability } F - \lfloor F \rfloor)$ \Comment{drawn once: $F$ on average}
+        \EndIf
+    \EndFor
+    \State $full \gets \{w \in risky : w.\text{dependents} \geq w.\text{fanout\_cap}\}$
+    \If{$full \neq \{\}$ \textbf{and} $\forall w \in full: w.\text{ts} < txn.\text{ts}$}
+        \State \textbf{return} false \Comment{refused: txn waits for an older writer, like without speculation}
     \EndIf
-    \State \textbf{return} $return\_value$
+    \State \Comment{admitted, or forced: a refused grant would wait for a younger txn's commit, which may itself wait (in \Call{prepare}{} on another shim) for this txn: a cycle. Then it is granted past the cap}
+    \For{\textbf{each} $w \in risky$}
+        \State $w.\text{dependents}\texttt{++}$; $txn.\text{depends\_on.add}(w)$
+    \EndFor
+    \State \textbf{return} true
+\EndProcedure
+
+\Statex
+\Procedure{release\_dependencies}{txn} \Comment{txn is resolved: it no longer counts as a dependent; wakes the grants refused on those writers}
+    \For{\textbf{each} $w \in txn.\text{depends\_on}$}
+        \State $w.\text{dependents}\texttt{--}$
+    \EndFor
+    \State $txn.\text{depends\_on} \gets \{\}$
 \EndProcedure
 
 \end{algorithmic}
@@ -313,154 +328,134 @@ The shim locks at the granularity of a single record, identified by its table an
 \Procedure{prepare}{txn\_id}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
     \If{$txn == \text{null}$}
-        \State \Comment{unknown txn\_id: late/duplicate prepare of a resolved txn}
-        \State \textbf{Send no to 2PC controller}
-        \State \textbf{return}
+        \State \textbf{Send no to 2PC controller}; \textbf{return}
     \EndIf
     \If{$txn.\text{status} \in \{\text{prepared}, \text{committing}, \text{committed}\}$}
-        \State \Comment{duplicate/late prepare: the txn already voted YES, re-send it}
-        \State \textbf{Send yes to 2PC controller}
-        \State \textbf{return}
+        \State \textbf{Send yes to 2PC controller}; \textbf{return} \Comment{duplicate prepare: re-send the vote}
     \EndIf
-    \If{$txn.\text{status} \notin \{\text{executed}, \text{prepared}\}$}
-        \State \Comment{covers aborted and must\_abort, and a tombstoned id (status aborted)}
-        \State \textbf{Send no to 2PC controller}
-        \State \Call{abort\_transaction}{txn}
-        \State \textbf{return}
+    \If{$txn.\text{status} \neq \text{executed}$}
+        \State \textbf{Send no to 2PC controller} \Comment{still running, aborted or doomed}
+        \State \Call{abort\_transaction}{txn}; \textbf{return}
     \EndIf
-
-    \For{\textbf{each} $(k, mode, node) \in \text{txn.locks\_acquired}$}
+    \State \Comment{CO: vote only once every txn ahead of txn on every one of its keys has committed}
+    \For{\textbf{each} $(k, mode, node) \in txn.\text{locks\_acquired}$}
         \Loop
-            \State \textbf{atomic}(locks\_map) \{ $pred \gets node.\text{predecessor}$ \}
-            \If{$pred == \text{null}$}
+            \State \textbf{atomic}(locks\_map) \{
+                \State \indent $pred \gets node.\text{predecessor}$ \Comment{re-read every time: nodes ahead are spliced out meanwhile}
+                \State \indent $ready \gets pred == \text{null}$ \textbf{or} $\forall t \in pred.\text{holders}: t.\text{status} == \text{committed}$
+                \State \indent \Comment{wait-die: with speculation two shims can order the same two txns oppositely, and each prepare then waits for the other's commit, i.e.\ for the other's vote. Waiting only for older txns (global ages: the same order on every shim) makes such a cycle impossible. Holders that are committing or already leaving resolve without waiting: waited for}
+                \State \indent $die \gets txn.\text{status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $\big(\textbf{not } ready$ \textbf{and} $\exists t \in pred.\text{holders}: t.\text{ts} > txn.\text{ts}$ \textbf{and} $t.\text{status} \notin \{\text{committing}, \text{committed}, \text{must\_abort}, \text{aborted}\}\big)$
+            \State \}
+            \If{$die$}
+                \State \textbf{Send no to 2PC controller}
+                \State \Call{abort\_transaction}{txn}; \textbf{return}
+            \EndIf
+            \If{$ready$}
                 \State \textbf{break}
             \EndIf
-            \State \Comment{an aborted/doomed holder does not satisfy this wait: wait until it is spliced out. If this txn depended on it, the cascade already marked it must\_abort before the splice (caught by the status check below); if not (a blind writer behind an aborted writer, anyone behind an aborted reader) it goes on and still waits for whatever is now ahead of it}
-            \State \textbf{wait until} $\big(\forall t \in pred.\text{holders}, t.\text{status} == \text{committed}\big)$ \textbf{or} $\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$ \textbf{or} $pred \neq node.\text{predecessor}$
-            \State \Comment{may have been cascade-aborted via another key}
-            \If{$\text{txn.status} \in \{\text{aborted}, \text{must\_abort}\}$}
-                \State \textbf{Send no to 2PC controller}
-                \If{$\text{txn.status} == \text{must\_abort}$}
-                    \State \Call{abort\_transaction}{txn}
-                \EndIf
-                \State \textbf{return}
-            \EndIf
-            \If{$pred \neq node.\text{predecessor}$}
-                \State \textbf{continue}
-            \EndIf
-            \State \textbf{break}
+            \State \textbf{wait until} something changes on chain $k$
         \EndLoop
     \EndFor
-
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{executed, prepared\}, prepared}}
+    \If{\textbf{not} \Call{CAS}{txn.\text{status}, \text{executed}, \text{prepared}}}
         \If{$txn.\text{status} \in \{\text{prepared}, \text{committing}, \text{committed}\}$}
-            \State \Comment{a concurrent duplicate prepare already voted YES: voting NO now would contradict it, re-send YES}
-            \State \textbf{Send yes to 2PC controller}
-            \State \textbf{return}
+            \State \textbf{Send yes to 2PC controller}; \textbf{return} \Comment{a concurrent duplicate prepare already voted YES}
         \EndIf
-        \State \Comment{late cascade mark: the txn never prepared, so abort it and release its locks}
         \State \textbf{Send no to 2PC controller}
-        \State \Call{abort\_transaction}{txn}
-        \State \textbf{return}
+        \State \Call{abort\_transaction}{txn}; \textbf{return}
     \EndIf
-    \State \textbf{Send yes to 2PC controller}
+    \State \textbf{Send yes to 2PC controller} \Comment{prepared is final: no cascade or wound can take txn anymore}
 \EndProcedure
 
 \Statex
 \Procedure{commit}{txn\_id}
     \State $txn \gets \text{transactions\_map}[txn\_id]$
-    \If{$txn == \text{null}$}
-        \State \textbf{return} \Comment{unknown/already-evicted txn\_id: no-op}
+    \If{$txn == \text{null}$ \textbf{or not} \Call{CAS}{txn.\text{status}, \text{prepared}, \text{committing}}}
+        \State \textbf{return} \Comment{unknown, duplicate, or a tombstone}
     \EndIf
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \text{prepared}, \text{committing}}}
-        \State \textbf{return} \Comment{includes a tombstoned id: no-op}
-    \EndIf
-    \State \Comment{committing, not committed, while the store is written: a coordinator abort can no longer take the txn, and a successor's prepare cannot pass before the writes are applied}
-    \For{\textbf{each} $(key, value) \in txn.\text{write\_buffer}$}
-        \State $\text{store.write}(key, value)$
+    \State \Comment{committing: decided, so txn no longer counts in \Call{risky\_ahead}{} (wakes the grants it held back)}
+    \For{\textbf{each} $(k, v) \in txn.\text{write\_buffer}$}
+        \State \Call{store.write}{k, v}
     \EndFor
     \State \textbf{atomic}(locks\_map) \{
-        \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
-            \State \indent $chain \gets \text{locks\_map}[k]$
-            \State \indent remove $txn$ from $target\_node.\text{holders}$
-            \If{$target\_node.\text{holders}$ is empty}
-                \State \indent\indent \textbf{if} $target\_node.\text{predecessor} \neq \text{null}$\textbf{:} $target\_node.\text{predecessor.next} \gets target\_node.\text{next}$
-                \State \indent\indent \textbf{if} $target\_node.\text{next} \neq \text{null}$\textbf{:} $target\_node.\text{next.predecessor} \gets target\_node.\text{predecessor}$
-                \State \indent\indent remove $target\_node$ from $chain$
-                \State \indent\indent \textbf{if} $chain$ is empty\textbf{:} remove $k$ from $\text{locks\_map}$ \Comment{under the latch}
-            \EndIf
-        \EndFor
-    \}
-    \State $\text{txn.status} \gets \text{committed}$
-    \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: volatile state dropped; the coordinator owns the txn\_id lifecycle}
+    \For{\textbf{each} $(k, mode, node) \in txn.\text{locks\_acquired}$}
+        \State \indent remove $txn$ from $node$; splice $node$ out if it is now empty; remove $k$ from locks\_map if empty
+    \EndFor
+    \State \}
+    \State $txn.\text{status} \gets \text{committed}$
+    \State \Call{release\_dependencies}{txn}
+    \State $commits\texttt{++}$ \Comment{for \Call{fanout\_controller}{}}
+    \State \Call{transactions\_map.remove}{txn\_id}
 \EndProcedure
 
 \Statex
 \Procedure{abort\_transaction}{txn}
-    \If{\textbf{not} \Call{CAS}{\text{txn.status}, \{\text{executed}, \text{prepared}, \text{must\_abort}, \text{started}\}, \text{aborted}}}
-        \State \textbf{return}
+    \If{\textbf{not} \Call{CAS}{txn.\text{status}, \{\text{started}, \text{executed}, \text{must\_abort}, \text{prepared}\}, \text{aborted}}}
+        \State \textbf{return} \Comment{already aborted, or committing/committed}
     \EndIf
-
-    \State $doomed\_finished \gets \{\}$ \Comment{cascade victims (txn objects) that had already finished executing}
+    \State $doomed\_finished \gets \{\}$
     \State \textbf{atomic}(locks\_map) \{
-        \For{\textbf{each} $(k, mode, target\_node) \in \text{txn.locks\_acquired}$}
-            \State \indent $chain \gets \text{locks\_map}[k]$
-            \If{$mode == \text{EXCLUSIVE}$}
-                \State \indent\indent $successor\_node \gets target\_node.\text{next}$
-                \While{$successor\_node \neq \text{null}$}
-                    \If{$successor\_node.\text{mode} == \text{EXCLUSIVE}$ \textbf{and not} $successor\_node.\text{upgraded}$}
-                        \State \indent\indent\indent\indent \textbf{break} \Comment{blind write}
+    \For{\textbf{each} $(k, mode, node) \in txn.\text{locks\_acquired}$}
+        \State \indent \Comment{cascade before splice: the dependents are marked before txn leaves the chain, so none of them can get past txn's node and vote YES on its rolled-back write. Only a txn that reached executed can have been read by a successor (\Call{lock}{} waits for that); so a wounded txn, or one the coordinator aborted while it ran, dooms nobody}
+        \If{$mode == \text{EXCLUSIVE}$ \textbf{and} $txn.\text{reached\_executed}$}
+            \For{$s \gets node.\text{next}$; $s \neq \text{null}$; $s \gets s.\text{next}$}
+                \If{$s.\text{mode} == \text{EXCLUSIVE}$ \textbf{and not} $s.\text{upgraded}$}
+                    \State \indent \textbf{break} \Comment{blind write: does not depend on txn's value, nor do the nodes behind it}
+                \EndIf
+                \For{\textbf{each} $t \in s.\text{granted}$} \Comment{holders still blocked in \Call{lock}{} read nothing: spared}
+                    \If{\Call{mark\_must\_abort}{t}}
+                        \State \indent $doomed\_finished.\text{add}(t)$
                     \EndIf
-                    \State \indent\indent\indent \textbf{for each} $t \in successor\_node.\text{holders}$\textbf{:} \textbf{if} \Call{mark\_must\_abort}{t}\textbf{:} $doomed\_finished\text{.add}(t)$
-                    \State \indent\indent\indent $successor\_node \gets successor\_node.\text{next}$
-                \EndWhile
-            \EndIf
-            \State \indent remove $txn$ from $target\_node.\text{holders}$
-            \If{$target\_node.\text{holders}$ is empty}
-                \State \indent\indent \textbf{if} $target\_node.\text{predecessor} \neq \text{null}$\textbf{:} $target\_node.\text{predecessor.next} \gets target\_node.\text{next}$
-                \State \indent\indent \textbf{if} $target\_node.\text{next} \neq \text{null}$\textbf{:} $target\_node.\text{next.predecessor} \gets target\_node.\text{predecessor}$
-                \State \indent\indent remove $target\_node$ from $chain$
-                \State \indent\indent \textbf{if} $chain$ is empty\textbf{:} remove $k$ from $\text{locks\_map}$
-            \EndIf
-        \EndFor
-    \}
-    \State \Call{transactions\_map.remove}{txn.\text{txn\_id}} \Comment{resolved: evicted like in \Call{commit}{}; successors hold a reference and observe txn.status directly, a late abort for the id releases nothing, it only leaves a tombstone}
+                \EndFor
+            \EndFor
+        \EndIf
+        \State \indent remove $txn$ from $node$; splice $node$ out if it is now empty; remove $k$ from locks\_map if empty
+    \EndFor
+    \State \}
+    \State \Call{release\_dependencies}{txn}
+    \State \Call{transactions\_map.remove}{txn.\text{txn\_id}}
+    \State \textbf{for each} $t \in doomed\_finished$\textbf{:} \Call{abort\_transaction}{t} \Comment{a doomed txn that already executed has no thread left to abort it: do it now (cascades transitively)}
+\EndProcedure
 
-    \State \textbf{for each} $t \in doomed\_finished$\textbf{:} \Call{abort\_transaction}{t} \Comment{eager cleanup, outside the latch: a doomed txn already \texttt{executed} has no thread left to abort it; safe even if $t$ was already resolved elsewhere, since its leading CAS is an idempotent no-op on a status that no longer matches}
+\Statex
+\Procedure{mark\_must\_abort}{txn} $\to$ bool \Comment{never touches prepared (a YES vote is final); a started victim aborts itself at its next request}
+    \State $before \gets$ \Call{CAS\_returning}{txn.\text{status}, \{\text{started}, \text{executed}\}, \text{must\_abort}}
+    \State \textbf{return} $before == \text{executed}$
 \EndProcedure
 
 \Statex
 \Procedure{abort}{txn\_id}
-    \State \Comment{unknown id: leave a tombstone, since the abort may precede the start; otherwise the late start would run, vote YES and hold its locks although the global transaction was rolled back}
-    \State $txn \gets$ \Call{transactions\_map.computeIfAbsent}{txn\_id, tombstone} \Comment{tombstone $=$ new txn with txn\_id, locks\_acquired$=\{\}$, status$=$aborted, write\_buffer$=\{\}$, read\_buffer$=\{\}$, expires\_at$=$now()$+$tombstone\_ttl}
-    \If{$txn$ is the tombstone just inserted}
-        \State \textbf{return} \Comment{atomic with the putIfAbsent of \Call{start}{}}
-    \EndIf
-    \State \Call{abort\_transaction}{txn} \Comment{a registered txn (unchanged), or an older tombstone: a no-op, its CAS fails on aborted, expires\_at is not refreshed}
-    \State \Comment{a tombstone is never removed by a request, only by \Call{gc\_tombstones}{}; most never meet a start (retried abort of an evicted txn, abort after a failed phase 1): tombstone\_ttl bounds them. It is only created for an id with no entry and holds no lock: prepared stays final, nothing to cascade or splice, no node can leak}
+    \State \Comment{known txn: abort it. Unknown id: leave a tombstone (status aborted, no locks), atomically with \Call{start}{}'s putIfAbsent, so that a start arriving after the abort fails instead of running}
+    \State $txn \gets$ \Call{transactions\_map.computeIfAbsent}{txn\_id, \text{new txn with status} = \text{aborted}, \text{expires\_at} = \text{now}() + \text{tombstone\_ttl}}
+    \State \Call{abort\_transaction}{txn} \Comment{a no-op on a tombstone}
 \EndProcedure
 
 \Statex
-\Procedure{gc\_tombstones}{} \Comment{runs periodically, in the background}
-    \For{\textbf{each} $(txn\_id, t) \in \text{transactions\_map}$}
-        \If{$t.\text{expires\_at} \neq \text{null}$ \textbf{and} $\text{now}() \geq t.\text{expires\_at}$}
-            \State \Call{transactions\_map.remove}{txn\_id, t} \Comment{only if the entry is still this tombstone}
+\Procedure{gc\_tombstones}{} \Comment{background}
+    \State remove from transactions\_map every tombstone past its expires\_at
+\EndProcedure
+
+\Statex
+\Procedure{fanout\_controller}{} \Comment{background, one per shim}
+    \State \Comment{hill-climbs the fractional fanout cap $F$ on the shim's commit rate. One step changes the rate by less than the noise, so each period is compared with an anchor (the last $F$ that made a clear difference) rather than with the previous period: small effects add up until they show}
+    \State $direction \gets$ random $\pm 1$
+    \State $anchor\_F, anchor\_rate \gets F$, commit rate of the first period
+    \Loop \ \textbf{every} period
+        \State $rate \gets$ commits per second over the period, without its first moments (still under the old $F$)
+        \If{$rate > anchor\_rate \cdot (1 + \varepsilon)$}
+            \State $anchor\_F, anchor\_rate \gets F, rate$; $F \gets \Call{step}{F, direction, \text{big}}$ \Comment{clearly better: go on, faster}
+        \ElsIf{$rate < anchor\_rate \cdot (1 - \varepsilon)$}
+            \State $F \gets anchor\_F$; $direction \gets -direction$ \Comment{clearly worse: back to the anchor, turn around}
+        \ElsIf{too many small steps since the anchor}
+            \State $anchor\_F, anchor\_rate \gets F, rate$; $direction \gets -direction$ \Comment{$F$ barely matters here: re-anchor, turn around}
+        \Else
+            \State $F \gets \Call{step}{F, direction, \text{small}}$ \Comment{no clear effect yet: go on, slowly}
         \EndIf
-    \EndFor
-    \State \Comment{not definitive: a start arriving after its tombstone expired is accepted although the global transaction was rolled back; tombstone\_ttl only makes this unlikely}
-\EndProcedure
-
-\Statex
-\Procedure{mark\_must\_abort}{txn} \Comment{returns true iff txn was \texttt{executed}: the caller must clean it up itself. Takes the txn object directly, like \Call{abort\_transaction}{}: only ever called from a cascade already holding a live reference to the victim, never from the coordinator}
-    \State \Comment{a started victim is still running: the thread handling its connection aborts it at its next get/put (\Call{lock}{}/\Call{upgrade}{} see must\_abort) or at the CAS in \Call{end}{}}
-    \State $before \gets \Call{CAS\_returning}{\text{txn.status}, \{\text{executed}, \text{started}\}, \text{must\_abort}}$
-    \State \textbf{return} $before == \text{executed}$
+    \EndLoop
+    \State \Comment{step($F, d, s$) $= F \cdot (1 + s)$ if $d > 0$ else $F / (1 + s)$, at most $F_{max}$; below $F_{min}$ it becomes 0 (no speculation but the forced grants), and a step up from 0 goes back to $F_{min}$}
 \EndProcedure
 
 \end{algorithmic}
 \vspace{2pt}\hrule
 \endgroup
-\bigskip
-\newpage
 
 \end{document}
