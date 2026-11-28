@@ -8,8 +8,11 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 /**
- * Parameters of one {@link MicroBench} run. The defaults are the "simple test": Acta's Micro workload
- * with read-modify-write writes, skew 0.9, 50 workers, 2 branches per global transaction.
+ * Parameters of one {@link MicroBench} run. The defaults are Acta's Micro workload with
+ * read-modify-write writes, skew 0.9, 50 workers, in the setting where speculation pays off: 4
+ * branches per global transaction run pipelined, about 5 reads and 5 writes per branch in a random
+ * order, 10 ms on average between two operations, and get-for-update for the reads of keys the branch
+ * writes.
  *
  * <p>The shim variant (speculative or not) and its lock timeout are set on the shim nodes
  * ({@code CoShimNode --shim ... --lock-timeout-ms ...}), not here: the benchmark only reaches them
@@ -60,7 +63,7 @@ import java.util.stream.Collectors;
  *                         writes at that op or later (a read-modify-write's own read, or a pure read followed by a
  *                         write of its key) becomes a get-for-update: the shims lock the key EXCLUSIVE right away
  *                         instead of SHARED, then upgrading at the write. Other reads stay plain gets; SQL
- *                         participants still run a plain select. false (default): every read is a plain get
+ *                         participants still run a plain select. false: every read is a plain get
  * @param pipelinedBranches the branches run one after the other, but each one starts as soon as the previous one
  *                         finished its operations: the previous one's end + prepare (Seata's close of its XA
  *                         connection) runs in the background meanwhile, instead of the next branch waiting for its
@@ -105,8 +108,9 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
 
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
-                10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false, false, List.of(), Set.of(), 0);
+                10_000, 4, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
+                false, false, 5, 1.5, 10, 10_000, 5_000, 1000, KeyDist.HOTSPOT, 1.0, true, true, List.of(), Set.of(),
+                0);
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */

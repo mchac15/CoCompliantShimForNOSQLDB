@@ -1033,6 +1033,51 @@ class LocksMapTest {
 
   // ---- a cascade dooms only the holders that may have read the key ----
 
+  // ---- prepare()'s wait-die (cross-shim deadlock prevention) ----
+
+  @Test
+  void prepareWaitDieDiesForAnExecutedYoungerPredecessorAndWaitsForAnOlderOne() throws Exception {
+    LocksMap<String, String> wd = new LocksMap<>(true, DeadlockPolicy.WOUND_WAIT, null, true);
+    Transaction<String, String> young = txn("young", 2);
+    Transaction<String, String> old = txn("old", 1);
+    Transaction<String, String> older = txn("older", 0);
+    wd.enqueue("x", young, LockMode.EXCLUSIVE);
+    wd.enqueue("x", old, LockMode.EXCLUSIVE);
+    set(wd, young, Status.EXECUTED);
+    set(wd, old, Status.EXECUTED);
+    assertEquals(LocksMap.PrepareWait.DIE, wd.awaitPredecessorsCommitted(old),
+        "young's commit may wait for old's vote on another shim");
+
+    Transaction<String, String> mid = txn("mid", 3);
+    wd.enqueue("y", older, LockMode.EXCLUSIVE);
+    wd.enqueue("y", mid, LockMode.EXCLUSIVE);
+    set(wd, older, Status.PREPARED);
+    set(wd, mid, Status.EXECUTED);
+    CompletableFuture<LocksMap.PrepareWait> f =
+        CompletableFuture.supplyAsync(() -> wd.awaitPredecessorsCommitted(mid));
+    assertBlocked(f);   // waits for the older txn
+    set(wd, older, Status.COMMITTING);
+    wd.release(older);
+    assertEquals(LocksMap.PrepareWait.READY, f.get(2, TimeUnit.SECONDS));
+  }
+
+  // ---- get-for-update ----
+
+  @Test
+  void aGetForUpdateHolderThatDidNotWriteHoldsNoVersion() {
+    Transaction<String, String> w = txn("w");
+    Transaction<String, String> g = txn("g");
+    Transaction<String, String> r = txn("r");
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", w, LockMode.EXCLUSIVE, LONG));
+    w.addToWriteSet("x", "1");
+    set(w, Status.EXECUTED);
+    assertEquals(LockResult.ACQUIRED, locks.lockForUpdate("x", g, LONG));
+    assertEquals("1", locks.read("x", g).value(), "g reads w's write, not its own (empty) node");
+    set(g, Status.EXECUTED);   // never wrote x
+    assertEquals(LockResult.ACQUIRED, locks.lock("x", r, LockMode.SHARED, LONG));
+    assertEquals("1", locks.read("x", r).value(), "g holds no version of x: r reads w's");
+  }
+
   @Test
   void aCascadeSparesAGetForUpdateWaiterThatReadNothing() throws Exception {
     // X(a, executed) <- X(b, gfu: granted on a) <- X(c, gfu: waits for b): c's node is marked as read

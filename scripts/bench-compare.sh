@@ -24,10 +24,11 @@
 # Needs a running Seata TC (default 127.0.0.1:8091; pass --tc host:port otherwise), see README.md,
 # and Docker for the Sonata variants.
 #
-# With no option it runs the "simple test" (50 threads, table size 10000, 2 branches, 2 reads +
-# 2 rmw writes per branch, skew 0.9, 10 s warm-up + 30 s measured) on 2 participants.
+# With no option it runs MicroBench's defaults (50 threads, table size 10000, 4 pipelined branches of
+# about 5 reads + 5 rmw writes, 10 ms between ops, skew 0.9, 10 s warm-up + 30 s measured) on 2
+# participants.
 # Examples: scripts/bench-compare.sh --reps 3 --skew 0.99 --threads 100
-#           SHIMS=4 scripts/bench-compare.sh --parallel-branches true --txn-timeout-ms 500
+#           SHIMS=4 scripts/bench-compare.sh --pipelined-branches false --parallel-branches true --txn-timeout-ms 500
 #           VARIANTS="speculative sonata-mysql sonata-pg" scripts/bench-compare.sh
 # Env: SHIMS (2), NODE_PORT (7000), LOCK_TIMEOUT_MS (1000), STATS_INTERVAL_S (0: the nodes log their
 #      counters at shutdown only; N: also every N s), PREPARE_DEADLOCK (none | wait-die: the nodes'
@@ -57,7 +58,7 @@ cd "$root"
 
 tc="127.0.0.1:8091"
 threads=50
-branches=2
+branches=4   # MicroBench's default
 table_size=10000
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do

@@ -1,5 +1,6 @@
 package ch.epfl.coshim.bench;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -73,7 +74,7 @@ class MicroBenchTest {
     @Test
     void plansFollowActasRules() {
         BenchConfig c = config("--table-size", "1000", "--branches", "3", "--reads", "2", "--writes", "3",
-                "--skew", "0.9", "--dist", "acta");
+                "--skew", "0.9", "--ops-mean", "0", "--dist", "acta");
         for (int i = 0; i < 1000; i++) {
             List<MicroBench.Branch> plan = MicroBench.randomPlan(c, 4);
             assertEquals(3, plan.size());
@@ -109,7 +110,7 @@ class MicroBenchTest {
         }
         double mean = (double) ops / branches / 2;
         assertTrue(Math.abs(mean - 3) < 0.15, "mean ops per kind " + mean);
-        assertEquals(0, config().drawThinkNanos(), "no think time by default");
+        assertEquals(0, config("--think-mean-us", "0").drawThinkNanos(), "no think time with a mean of 0");
         BenchConfig think = config("--think-mean-us", "2000", "--think-sd-us", "1000");
         for (int i = 0; i < 1000; i++) {
             assertTrue(think.drawThinkNanos() >= 0);
@@ -180,6 +181,34 @@ class MicroBenchTest {
         BenchConfig c = config("--threads", "64", "--shims", "h1:7000/a, h2:7001/b,h3:7002/c", "--csv", "x.csv");
         assertEquals(64, c.threads());
         assertEquals(List.of("h1:7000/a", "h2:7001/b", "h3:7002/c"), c.shims());
+        assertThrows(IllegalArgumentException.class, () -> config("--parallel-branches", "true"),
+                "parallel and the default pipelined branches exclude each other");
+    }
+
+    @Test
+    void defaultsAreTheSettingWhereSpeculationPaysOff() {
+        BenchConfig c = config();
+        assertEquals(4, c.branches());
+        assertEquals(5, c.opsMean());
+        assertEquals(10_000, c.thinkMeanUs());
+        assertEquals(BenchConfig.KeyDist.HOTSPOT, c.dist());
+        assertTrue(c.getForUpdate());
+        assertTrue(c.pipelinedBranches());
+        for (int i = 0; i < 1000; i++) {
+            for (MicroBench.Branch b : MicroBench.randomPlan(c, 2)) {
+                assertTrue(b.ops().size() >= 1 && b.ops().size() <= 20);
+                assertEquals(b.readKeys().size() + b.writeKeys().size(), b.ops().size());
+            }
+        }
+    }
+
+    @Test
+    void getForUpdateMarksTheReadsOfKeysWrittenAtThatOpOrLater() {
+        List<MicroBench.Op> ops = List.of(new MicroBench.Op(1, false), new MicroBench.Op(2, false),
+                new MicroBench.Op(1, true), new MicroBench.Op(1, false));
+        assertArrayEquals(new boolean[] {true, false, true, false}, MicroBench.readsForUpdate(ops, true));
+        assertArrayEquals(new boolean[] {true, false, false, false}, MicroBench.readsForUpdate(ops, false),
+                "a blind write reads nothing");
     }
 
     @Test
@@ -210,10 +239,11 @@ class MicroBenchTest {
         assertEquals("other:IllegalStateException", MicroBench.failureCause(new SQLException(new IllegalStateException())));
     }
 
-    /** 20 hot keys per table, 8 workers, every txn writes 4 of them; both variants, both branch modes. */
+    /** 20 hot keys per table, 8 workers, every txn writes 4 keys; both variants, every branch mode. */
     @ParameterizedTest
-    @CsvSource({"true,false", "true,true", "false,false", "false,true"})
-    void auditHoldsThroughTheTcAndTcp(boolean speculative, boolean parallelBranches) throws Exception {
+    @CsvSource({"true,order", "true,parallel", "true,pipelined", "false,order", "false,parallel",
+            "false,pipelined"})
+    void auditHoldsThroughTheTcAndTcp(boolean speculative, String mode) throws Exception {
         String tc = System.getProperty("bench.tc", "127.0.0.1:8091");
         assumeTrue(reachable(tc), "no Seata TC at " + tc);
 
@@ -229,7 +259,9 @@ class MicroBenchTest {
             BenchConfig c = config("--variant", speculative ? "speculative" : "nonspeculative",
                     "--shims", host + "/a," + host + "/b", "--tc", tc, "--threads", "8", "--table-size", "200",
                     "--branches", "2", "--reads", "1", "--writes", "2", "--skew", "0.9", "--warmup-s", "0",
-                    "--measure-s", "2", "--txn-timeout-ms", "1000", "--parallel-branches", String.valueOf(parallelBranches));
+                    "--measure-s", "2", "--txn-timeout-ms", "1000", "--ops-mean", "0", "--think-mean-us", "0",
+                    "--parallel-branches", String.valueOf(mode.equals("parallel")),
+                    "--pipelined-branches", String.valueOf(mode.equals("pipelined")));
             BenchResult result;
             try (MicroBench bench = new MicroBench(c, TOKEN)) {
                 result = bench.run();

@@ -39,10 +39,10 @@ import java.util.concurrent.TimeUnit;
  *     --deadlock          deadlock prevention of speculative/nonspeculative: wait-die (an older txn
  *                         dies instead of waiting for a younger one) | wound-wait (it aborts the
  *                         younger running one instead) | none (just wait until lock_timeout: only for
- *                         workloads that cannot deadlock, e.g. ordered locking); default wait-die
+ *                         workloads that cannot deadlock, e.g. ordered locking); default wound-wait
  *     --prepare-deadlock  cross-shim deadlock prevention in prepare(): none | wait-die (prepare() votes
  *                         NO instead of waiting for a younger txn; the ages then come from the Seata
- *                         global transaction id, the same on every shim); default none
+ *                         global transaction id, the same on every shim); default wait-die
  *     --spec-max-depth    speculative only: at most D uncommitted txns ahead whose abort would doom a
  *                         lock grant on its key, or the grant waits for them to commit (0: no
  *                         speculation); default none (no cap)
@@ -85,8 +85,8 @@ public final class CoShimNode {
             // name. With no argument it hosts a single database called "default".
             String databases = "default";
             long lockTimeoutMs = 200;
-            DeadlockPolicy deadlock = DeadlockPolicy.WAIT_DIE;
-            boolean prepareWaitDie = false;
+            DeadlockPolicy deadlock = DeadlockPolicy.WOUND_WAIT;
+            boolean prepareWaitDie = true;
             int maxDepth = SpeculationLimits.NO_LIMIT;
             int maxFanout = SpeculationLimits.NO_LIMIT;
             boolean autoFanout = false;

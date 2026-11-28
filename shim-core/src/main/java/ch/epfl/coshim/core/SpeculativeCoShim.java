@@ -76,11 +76,13 @@ public class SpeculativeCoShim<K, V> implements CoShim<K, V> {
   }
 
   /**
+   * With the default deadlock prevention: wound-wait in lock()/upgrade(), wait-die in prepare().
+   *
    * @param speculative false for the non-speculative baseline (see the class comment)
    */
   public SpeculativeCoShim(
       KvStore<K, V> store, Duration lockTimeout, Duration tombstoneTtl, boolean speculative) {
-    this(store, lockTimeout, tombstoneTtl, speculative, DeadlockPolicy.WAIT_DIE);
+    this(store, lockTimeout, tombstoneTtl, speculative, DeadlockPolicy.WOUND_WAIT, true);
   }
 
   /**
