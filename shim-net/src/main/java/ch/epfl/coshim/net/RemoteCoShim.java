@@ -1,5 +1,7 @@
 package ch.epfl.coshim.net;
 
+import java.util.concurrent.TimeUnit;
+import java.time.Duration;
 import ch.epfl.coshim.core.CoShim;
 import ch.epfl.coshim.core.Outcome;
 import ch.epfl.coshim.core.TxnAbortedException;
@@ -38,6 +40,7 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
     private final Codec<V> valueCodec;
     private final ConcurrentLinkedQueue<Connection> idle = new ConcurrentLinkedQueue<>();
     private volatile boolean closed;
+    private volatile long oneWayNanos;   // the emulated network delay of each message, each way
 
     /**
      * @param node the shim node
@@ -50,6 +53,19 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
         this.token = Objects.requireNonNull(token);
         this.keyCodec = Objects.requireNonNull(keyCodec);
         this.valueCodec = Objects.requireNonNull(valueCodec);
+    }
+
+    /**
+     * Emulates a network round trip of {@code rtt} between this client and the shim node: every request
+     * (operations, end, prepare, commit, abort alike) waits half of it before it is sent, and its reply
+     * half of it after it is received, on the calling thread (benchmarks; Duration.ZERO: none).
+     */
+    public RemoteCoShim<K, V> withRoundTrip(Duration rtt) {
+        if (rtt.isNegative()) {
+            throw new IllegalArgumentException("negative round trip " + rtt);
+        }
+        this.oneWayNanos = rtt.toNanos() / 2;
+        return this;
     }
 
     /** Opens and authenticates one connection now, to fail fast on a wrong address or token. */
@@ -109,6 +125,26 @@ public class RemoteCoShim<K, V> implements CoShim<K, V>, AutoCloseable {
     }
 
     private <R> R call(byte op, String txnId, K key, V value, Reader<R> payload) {
+        delay();                         // the request's way there
+        try {
+            return exchange(op, txnId, key, value, payload);
+        } finally {
+            delay();                     // the reply's way back (an abort or an error reply too)
+        }
+    }
+
+    private void delay() {
+        long nanos = oneWayNanos;
+        if (nanos > 0) {
+            try {
+                TimeUnit.NANOSECONDS.sleep(nanos);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private <R> R exchange(byte op, String txnId, K key, V value, Reader<R> payload) {
         if (closed) {
             throw new IllegalStateException("closed");
         }

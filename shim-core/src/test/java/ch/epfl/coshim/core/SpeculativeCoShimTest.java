@@ -21,7 +21,12 @@ class SpeculativeCoShimTest {
     private static final Duration LOCK_TIMEOUT = Duration.ofSeconds(5);
 
     private final InMemoryKvStore<String, String> store = new InMemoryKvStore<>();
-    private final SpeculativeCoShim<String, String> shim = new SpeculativeCoShim<>(store, LOCK_TIMEOUT);
+    /**
+     * Wait-die, as these tests were written for (the default is now wound-wait, under which a lock() also
+     * hands over the running holders a cascade doomed instead of waiting for their own next request).
+     */
+    private final SpeculativeCoShim<String, String> shim = new SpeculativeCoShim<>(store, LOCK_TIMEOUT,
+            SpeculativeCoShim.DEFAULT_TOMBSTONE_TTL, true, DeadlockPolicy.WAIT_DIE);
 
     @Test
     void requestsThenPrepareCommitApplyBufferedWritesOnlyAtCommit() {

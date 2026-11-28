@@ -1,0 +1,200 @@
+==================================================================================
+Adaptive fanout cap: a fractional, self-tuning limit on speculation
+==================================================================================
+
+----------------------------------------------------------------------------------
+0. Why
+----------------------------------------------------------------------------------
+Static fanout caps (server-results/fanout-cap, 2 branches, 100k keys, wound-wait +
+prepare wait-die): the best cap falls with the load, e.g. skew 0.99:
+
+    threads   best static cap     (tps: uncapped / f4 / f2 / f1 / non-spec)
+    100       4 or none           192 / 196 / 185 / 173 / 140
+    400       2..4                184 / 199 / 197 / 194 / 171
+    1000      1                    73 /  86 / 147 / 165 / 164
+
+and at skew 0.9 / 1000 threads even f1 (802) stays below non-spec (1005): a cap
+below 1 can help there. No single static cap is right, so the cap F adapts.
+
+Lessons from the earlier attempts (they decide the design):
+  - signals built from speculation's own statistics (cascade rate, saved vs lost,
+    reach) put the switch point at the wrong place for some skew;
+  - comparing speculating and non-speculating txns side by side misses the cost
+    speculation's cascades put on the others;
+  - per-branch efficiency (commits / branch time) matched the best cap in only 5 of
+    18 cells: a cascade's real cost (global retry, the sibling branch on the other
+    shim) is not in one shim's branch times;
+  - the shim's commit rate is the reliable objective, BUT it follows the demand:
+    when demand drops, commits/s drops for every F, and below saturation commits/s
+    simply equals the arrival rate for every F.
+
+So: steer F by the commit rate, but (a) by DIFFERENCES measured close together in
+time (demand drift cancels), and (b) only when the shim is saturated (when it is not,
+F does not change the commit rate, and a high F only helps latency).
+
+----------------------------------------------------------------------------------
+1. The fractional cap
+----------------------------------------------------------------------------------
+F is a real number, F in [F_MIN, F_MAX]. F = x.y means: every writer may take x
+speculative dependents, plus one more with probability y.
+
+The coin is drawn ONCE PER WRITER (not per request: a refused request re-checks on
+every wake-up, and would get through by retrying the coin):
+
+cap_of(W)                                   // W: the txn others want to speculate on
+{
+    if (W.cap == unset)                     // first time someone asks to depend on W
+        W.cap = floor(F) + (random() < frac(F) ? 1 : 0)
+    return W.cap                            // fixed for W's life: expected value = F
+}
+
+admit(T, ahead)                             // in lock(), at the speculation point
+{
+    for W in ahead:                         // the txns whose abort would doom T here
+        if (W.dependents >= cap_of(W))
+            refuse: T waits for commits     // as today (spec-limits)
+    count T as a dependent of each W        // as today
+}
+
+Everything else stays as on spec-limits + the deadlock fix (#103): a refused grant
+that would wait for a YOUNGER txn's commit is taken anyway (forced).
+
+Bounds:
+    F_MAX = 8        above it the cap practically never binds (= uncapped)
+    F_MIN = 0.25     below 1 is allowed (skew 0.9 / 1000 threads), 0 is not: F = 0 is
+                     the non-speculative shim, which we can always run on its own
+
+----------------------------------------------------------------------------------
+2. What each shim measures (per window of W_MS = 1000 ms)
+----------------------------------------------------------------------------------
+window_stats
+{
+    commits         // txns committed in the window
+    cascades        // txns aborted by a cascade in the window
+    inflight        // txns started and not resolved, sampled at the window's end
+}
+
+From them:
+    rate      = commits / window
+    residence = mean(inflight) / rate        // Little's law: mean time a txn spends
+                                             // in the shim
+
+----------------------------------------------------------------------------------
+3. Saturation gate: is it worth steering at all?
+----------------------------------------------------------------------------------
+When the shim is not saturated, every txn gets through whatever F: the commit rate
+equals the demand and tells nothing about F. Then keep F high (speculation's latency
+benefit) and do not steer.
+
+Saturation shows as txns piling up: the residence time grows above what it is under
+light load. Keep the lowest residence seen recently as the light-load reference:
+
+saturated()
+{
+    base = slowly_rising_min(residence)    // the min over the last ~60 s, so that a
+                                           // lasting change of workload resets it
+    return residence > SAT_FACTOR * base   // SAT_FACTOR = 2: txns take twice as long
+}                                          // as when nothing waits
+
+(Alternative signal, if residence is too noisy: the share of a branch's time spent
+waiting in lock() / prepare(), from the existing time budget; saturated when > 50 %.)
+
+----------------------------------------------------------------------------------
+4. The controller: paired windows around F (extremum seeking)
+----------------------------------------------------------------------------------
+Instead of comparing F now with F a while ago (demand may have moved in between), run
+F slightly up and slightly down in alternation and compare those two, window by
+window. Order the windows + - - + (ABBA): a demand change that is linear over the 4
+windows cancels exactly out of the difference.
+
+state: F = F_MAX (start: speculation wins at low load), D = 0 (smoothed gradient)
+
+every 4 windows:                            // one ABBA cycle, 4 s
+{
+    run window 1 with F * (1 + DELTA)       // DELTA = 0.15: a perturbation of +-15 %
+    run window 2 with F * (1 - DELTA)
+    run window 3 with F * (1 - DELTA)
+    run window 4 with F * (1 + DELTA)
+
+    if (!saturated())
+    {
+        F = min(F_MAX, F * (1 + UP_IDLE))   // UP_IDLE = 0.05: drift back up when idle
+        D = 0
+        continue
+    }
+
+    up   = rate(w1) + rate(w4)
+    down = rate(w2) + rate(w3)
+    d    = (up - down) / ((up + down) / 2)  // relative gain of a higher F, demand-free
+    D    = (1 - ALPHA) * D + ALPHA * d      // ALPHA = 0.5: smooth over a couple of cycles
+
+    if (D > EPS)       F = F * (1 + STEP)   // a higher F commits more: raise it
+    else if (D < -EPS) F = F * (1 - STEP)   // a lower F commits more: lower it
+                                            // |D| <= EPS: no clear difference, stay
+    F = clamp(F, F_MIN, F_MAX)
+}
+    EPS = 0.03 (3 %: the noise of a 1 s window at ~1000 tps; at ~150 tps a window
+               holds ~150 commits, so D is smoothed over more cycles there)
+    STEP = 0.15 (multiplicative: about +-0.15 near F = 1, +-0.6 near F = 4)
+
+Why this is calmer than TCP congestion control:
+  - F is continuous and steps are small and proportional, never a halving;
+  - a step needs a measured, smoothed difference above the noise, not a single event;
+  - the +-15 % perturbation itself costs little: near the optimum the throughput is
+    flat in F (that is what an optimum is).
+
+----------------------------------------------------------------------------------
+5. Optional brake (switchable): react to a collapse within a window
+----------------------------------------------------------------------------------
+The paired comparison needs a few seconds. A cascade storm can halve the throughput
+faster than that, so:
+
+after every window:
+{
+    if (saturated() && (cascades > BRAKE_CASCADES * commits      // BRAKE_CASCADES = 0.5
+                        || rate < (1 - BRAKE_DROP) * ewma_rate))  // BRAKE_DROP = 0.2
+    {
+        F = max(F_MIN, F * 0.7)             // gentler than TCP's halving
+        D = 0                               // start the comparison over
+        restart the ABBA cycle
+    }
+}
+
+It reuses a cascade signal (the kind that misjudged before), so it only ever LOWERS F
+quickly; the controller of section 4 raises it back if the brake was wrong.
+
+----------------------------------------------------------------------------------
+6. Logging (every second, node log)
+----------------------------------------------------------------------------------
+fanout_ctl: F, phase (+/-), rate, cascades, inflight, residence, base, saturated,
+            D, step taken (up / down / hold / brake / idle)
+
+so that a sweep can plot F over time next to the best static cap of each cell.
+
+----------------------------------------------------------------------------------
+7. Evaluation
+----------------------------------------------------------------------------------
+Same grid as server-results/fanout-cap (threads 100..1000 x skews 0.9 / 0.95 / 0.99,
+2 branches, 100k keys), variants:
+    non-speculative, uncapped, static f1 / f2 / f4 (with the deadlock fix),
+    adaptive with brake, adaptive without brake
+Success: at every cell, adaptive >= the best static cap of that cell minus a few %.
+Then a less contended workload (fewer hot keys, longer txns): F should stay near
+F_MAX there.
+A step-load test (threads jumping 200 -> 1000 -> 200 within one run) shows how fast
+F follows, and that a demand drop does not drag F down.
+
+----------------------------------------------------------------------------------
+8. Open points
+----------------------------------------------------------------------------------
+  - window length: 1 s (fast, noisy at low tps) vs 2 s (smoother, an ABBA cycle 8 s)
+  - saturation signal: residence (Little) vs lock-wait share of the time budget
+  - the two shims run their own controllers; they are coupled through the global
+    txns. If they disturb each other's measurements, offset their ABBA phases, or
+    let one shim lead and send F to the other.
+  - later: a per-writer scale, cap_of(W) * 1 / (1 + W's own dependencies): a writer
+    that itself speculated is more likely to be cascaded, so it gets fewer
+    dependents (cuts chain reactions at their source).
+  - later, if we want a demand-independent target: the client tags retries (attempt
+    number in the txn id), so the shim can count new arrivals and use
+    completed / arrived and latency.

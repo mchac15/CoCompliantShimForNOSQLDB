@@ -8,8 +8,11 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 /**
- * Parameters of one {@link MicroBench} run. The defaults are the "simple test": Acta's Micro workload
- * with read-modify-write writes, skew 0.9, 50 workers, 2 branches per global transaction.
+ * Parameters of one {@link MicroBench} run. The defaults are Acta's Micro workload with
+ * read-modify-write writes, skew 0.9, 50 workers, in the setting where speculation pays off: 4
+ * branches per global transaction run pipelined, about 5 reads and 5 writes per branch in a random
+ * order, 10 ms on average between two operations, and get-for-update for the reads of keys the branch
+ * writes.
  *
  * <p>The shim variant (speculative or not) and its lock timeout are set on the shim nodes
  * ({@code CoShimNode --shim ... --lock-timeout-ms ...}), not here: the benchmark only reaches them
@@ -60,7 +63,7 @@ import java.util.stream.Collectors;
  *                         writes at that op or later (a read-modify-write's own read, or a pure read followed by a
  *                         write of its key) becomes a get-for-update: the shims lock the key EXCLUSIVE right away
  *                         instead of SHARED, then upgrading at the write. Other reads stay plain gets; SQL
- *                         participants still run a plain select. false (default): every read is a plain get
+ *                         participants still run a plain select. false: every read is a plain get
  * @param pipelinedBranches the branches run one after the other, but each one starts as soon as the previous one
  *                         finished its operations: the previous one's end + prepare (Seata's close of its XA
  *                         connection) runs in the background meanwhile, instead of the next branch waiting for its
@@ -69,6 +72,11 @@ import java.util.stream.Collectors;
  *                         table micro-i, draws its keys with the i-th one, each in [0.5, 1)), e.g. 0.99,0.5 for
  *                         contention on the first branch's table only (0.5: uniform over the table). {@code
  *                         skewness} stays the run's label (result folders, CSVs)
+ * @param rttUs            > 0: an emulated network round trip (µs) between the client and every shim node, on
+ *                         every message alike: the operations, end, prepare and Seata's commit / rollback (which
+ *                         reach the shim through this process's RM), half of it before each request is sent,
+ *                         half after its reply (see RemoteCoShim#withRoundTrip); 0 (default): none. Shim
+ *                         participants only
  * @param readOnlyBranches branch indices (0-based: branch i uses table micro-i) that only read: no writes, at least
  *                         one read. Readers never wait for each other, so no transaction ever waits on those tables:
  *                         with parallel branches, no cross-branch deadlock can form through them. Empty (default): none
@@ -77,7 +85,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         int reads, int writes, double skewness, boolean rmw, Duration warmup, Duration measure, Duration txnTimeout,
         boolean parallelBranches, boolean sonata, double opsMean, double opsSd, int opsMax, double thinkMeanUs,
         double thinkSdUs, int sampleMs, KeyDist dist, double randomness, boolean getForUpdate,
-        boolean pipelinedBranches, List<Double> branchSkews, Set<Integer> readOnlyBranches) {
+        boolean pipelinedBranches, List<Double> branchSkews, Set<Integer> readOnlyBranches, double rttUs) {
 
     /** How the keys of a branch are drawn; see {@code dist}. */
     public enum KeyDist {
@@ -100,8 +108,9 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
 
     public static BenchConfig defaults() {
         return new BenchConfig("unknown", List.of("127.0.0.1:7000/a", "127.0.0.1:7001/b"), "127.0.0.1:8091", 50,
-                10_000, 2, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
-                false, false, 0, 1.5, 10, 0, 1000, 1000, KeyDist.HOTSPOT, 1.0, false, false, List.of(), Set.of());
+                10_000, 4, 2, 2, 0.9, true, Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(10),
+                false, false, 5, 1.5, 10, 10_000, 5_000, 1000, KeyDist.HOTSPOT, 1.0, true, true, List.of(), Set.of(),
+                0);
     }
 
     /** Reads of one branch: {@code reads}, or a draw from the distribution. */
@@ -165,6 +174,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
     /** Same checks as Acta's Micro run endpoint: every txn must find distinct hot and cold keys. */
     public BenchConfig validate() {
         require(!shims.isEmpty(), "--shims needs at least one host:port/database or jdbc: URL");
+        require(rttUs >= 0, "--rtt-us must be >= 0: " + rttUs);
         for (String shim : shims) {
             require(shim.matches("[^:/]+:\\d+/.+") || shim.matches("jdbc:(mysql|postgresql)://.+"),
                     "--shims entries are host:port/database, jdbc:mysql://... or jdbc:postgresql://...: " + shim);
@@ -245,6 +255,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         boolean pipelinedBranches = c.pipelinedBranches;
         List<Double> branchSkews = c.branchSkews;
         Set<Integer> readOnlyBranches = c.readOnlyBranches;
+        double rttUs = c.rttUs;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (flag.equals("--csv") || flag.equals("--label")) {
@@ -284,6 +295,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
                 case "--pipelined-branches" -> pipelinedBranches = Boolean.parseBoolean(v);
                 case "--read-only-branches" -> readOnlyBranches = Arrays.stream(v.split(",")).map(String::trim)
                         .filter(x -> !x.isEmpty()).map(Integer::parseInt).collect(Collectors.toUnmodifiableSet());
+                case "--rtt-us" -> rttUs = Double.parseDouble(v);
                 case "--branch-skews" -> branchSkews = Arrays.stream(v.split(",")).map(String::trim)
                         .filter(x -> !x.isEmpty()).map(Double::parseDouble).toList();
                 default -> throw new IllegalArgumentException("unknown option " + flag);
@@ -291,7 +303,7 @@ public record BenchConfig(String variant, List<String> shims, String tc, int thr
         }
         return new BenchConfig(variant, shims, tc, threads, tableSize, branches, reads, writes, skewness, rmw, warmup,
                 measure, txnTimeout, parallelBranches, sonata, opsMean, opsSd, opsMax, thinkMeanUs, thinkSdUs, sampleMs,
-                dist, randomness, getForUpdate, pipelinedBranches, branchSkews, readOnlyBranches)
+                dist, randomness, getForUpdate, pipelinedBranches, branchSkews, readOnlyBranches, rttUs)
                 .validate();
     }
 
