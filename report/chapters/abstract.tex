@@ -1,0 +1,23 @@
+Many NoSQL stores lack multi-key transactions, so distributed transactions spanning several of them
+are commonly executed through a shim that runs each branch under strict two-phase locking (S2PL)
+and commits it with two-phase commit (2PC). Under 2PC, however, a branch's writes are final as soon
+as it finishes executing, while S2PL holds its locks through the prepare phase, the coordinator's
+round trips and the commit, so conflicting transactions wait for values that will no longer change.
+We present a speculative shim that lets a waiting transaction read these final but uncommitted
+values instead. It enforces commitment ordering, which preserves global serializability across
+shims without any global concurrency control. The cost is cascading aborts: when a transaction
+aborts, every transaction that speculated on it aborts too, and under high contention this cost
+outgrows the waiting saved. To combine the strengths of both approaches, an adaptive variant caps
+how many transactions may speculate on a single uncommitted writer and tunes this cap at run time
+from the shim's commit rate, moving between full speculation and the non-speculative shim. On a
+micro-benchmark, speculation reaches a 10--100\% higher peak throughput than the non-speculative
+shim, with 2--8$\times$ lower latency, and gains most with skewed access and long-running
+transactions. When many branches of a transaction are skewed, the advantage disappears, since each
+skewed branch is another independent chance of a cascading abort; when only one branch is skewed,
+speculation keeps winning, though the gap narrows as branches are added. Uncapped speculation
+degrades past its peak as the number of threads grows, whereas the adaptive shim degrades less and
+follows the better of the two shims across thread counts.
+
+\vspace{1em}
+\noindent\textbf{Keywords:} distributed transactions, NoSQL, two-phase commit, commitment ordering,
+speculative concurrency control, cascading aborts

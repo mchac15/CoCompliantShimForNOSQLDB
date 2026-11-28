@@ -1,0 +1,58 @@
+\section{Motivation}
+\label{sec:motivation}
+
+Many NoSQL stores offer fast single-key operations but no transactions spanning several keys, let
+alone several stores. Applications that need to update data atomically across such stores rely on
+an external coordinator running two-phase commit (2PC), and on a \emph{shim} in front of each data
+source that isolates the branches executing there. The natural choice for this shim is strict
+two-phase locking (S2PL): a branch locks every key it accesses and releases its locks only once
+it has committed.
+
+Under 2PC, however, the lifetime of a branch does not end with its execution. Once it has sent its
+last operation, it still has to be prepared, vote, wait for the votes of the other branches of its
+global transaction, and receive the coordinator's decision before it can commit. Its writes are
+already final when its execution ends: nothing after that point can change them. Yet S2PL keeps its
+locks for the whole window, which spans the prepare round trip, the slowest branch of the global
+transaction and the decision round trip. Every conflicting transaction waits through this window
+for values that will no longer change, and under skewed access long queues form behind the hot
+keys, so throughput is bounded by commit latency rather than by execution.
+
+The shim can instead \emph{speculate}: let a waiting transaction read the final but uncommitted
+values of the transactions ahead of it as soon as they have finished executing, rather than once
+they have committed. Correctness is preserved by \emph{commitment ordering} (CO): a transaction may
+only commit after every conflicting transaction ahead of it has resolved, so commits follow the
+conflict order. Since the local history of every shim is CO, the global history is serializable,
+without any global concurrency control beyond 2PC itself.
+
+Speculation is not free. A transaction that speculated on another one depends on it: if the latter
+aborts, the former must abort too, and so must every transaction that speculated on it in turn.
+These \emph{cascading aborts} grow with the amount of speculation. The more transactions read on top
+of uncommitted ones, the longer the chains of dependents and the more work a single abort destroys.
+Beyond some contention level, the work lost to cascades exceeds the waiting saved, and speculation
+falls behind the non-speculative shim. This raises the question this project addresses:
+\emph{can a shim speculate only as much as it pays off, and so get the best of both worlds?}
+
+\section{Contributions}
+\label{sec:contributions}
+
+\begin{itemize}[leftmargin=*]
+  \item A speculative, CO-compliant shim for NoSQL stores that participates in 2PC as a resource
+        manager, together with a non-speculative S2PL variant built from the same code, so that
+        the two differ only in when a lock is granted.
+  \item A cap on speculation, the number of transactions that may speculate on a single
+        uncommitted writer, and an adaptive controller that tunes it at run time from the shim's
+        commit rate, moving between full speculation and none.
+  \item An evaluation of the three shims on a micro-benchmark, across key skew, transaction length,
+        number of branches and thread counts.
+\end{itemize}
+
+\section{Outline}
+\label{sec:outline}
+
+\Cref{ch:design} presents the design of the speculative shim and of the adaptive cap.
+\Cref{ch:implementation} describes their implementation. \Cref{ch:evaluation} compares the
+speculative, non-speculative and adaptive shims, and \cref{ch:conclusion} concludes and discusses
+future work.
+
+\section{Related Work}
+\label{sec:related-work}

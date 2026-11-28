@@ -6,11 +6,17 @@
 \usepackage{newtxtext,newtxmath}   % Times New Roman, as in the template
 \usepackage[scaled=0.92]{helvet}   % Arial-like sans for the title
 \usepackage{microtype}
+\usepackage{amsmath,amssymb}
 \usepackage{graphicx}
+\usepackage{subcaption}
 \usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
 \usepackage{tikz}
 \usepackage{titlesec}
 \usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}   % after hyperref: \cref{ch:design} -> "Chapter 2"
 
 % Page geometry taken from the template (A4, margins in twips converted to cm)
 \usepackage[a4paper,
@@ -63,18 +69,23 @@
 \tableofcontents
 
 \chapter{Introduction and Related Work}
+\label{ch:introduction}
 \input{chapters/introduction}
 
 \chapter{Algorithm Design}
+\label{ch:design}
 \input{chapters/design}
 
 \chapter{Implementation}
+\label{ch:implementation}
 \input{chapters/implementation}
 
 \chapter{Evaluation and Discussion}
+\label{ch:evaluation}
 \input{chapters/evaluation}
 
 \chapter{Conclusion and Future Work}
+\label{ch:conclusion}
 \input{chapters/conclusion}
 
 \renewcommand{\bibname}{Bibliography}
